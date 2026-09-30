@@ -3,9 +3,12 @@
 import { mkdtempSync, rmSync, readFileSync, existsSync, mkdirSync, writeFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createServer as netCreateServer } from "node:net";
+import { WebSocketServer } from "ws";
 import { MailboxConnection } from "../src/client.ts";
 import { MailboxService } from "../src/service.ts";
 import { ensureService, readRegistry } from "../src/registry.ts";
+import { tryOpenLock, Lock } from "@lickle/lock";
 
 const projectDir = mkdtempSync(join(tmpdir(), "pi-mailbox-smoke-"));
 const assert = (cond, msg) => {
@@ -377,6 +380,119 @@ try {
 	// jsonl exists and is non-empty
 	const raw = readFileSync(join(projectDir, ".pi", "mailbox", "sessionC.jsonl"), "utf8");
 	assert(rawAll.includes(String.raw`"send"`) && rawAll.includes(String.raw`"read"`), "jsonl has send+read events");
+
+	// 8. flock-based election: the leader lock is the lease
+	const busy = netCreateServer(() => {});
+	const busySockets = new Set();
+	busy.on("connection", (s) => busySockets.add(s));
+	await new Promise((r) => busy.listen(0, "127.0.0.1", r));
+	const busyPort = busy.address().port;
+	const projectDir2 = mkdtempSync(join(tmpdir(), "pi-mailbox-smoke2-"));
+	mkdirSync(join(projectDir2, ".pi"), { recursive: true });
+
+	// 8a. stale registry pointing at a busy foreign port does not wedge: the
+	// flock is free, so we host on a fresh port and overwrite the registry
+	writeFileSync(
+		join(projectDir2, ".pi", "mailbox.json"),
+		JSON.stringify({ projectId: "probe-test", service: { port: busyPort, instanceId: "busy-instance" } }),
+	);
+	const eBusy = await ensureService(projectDir2);
+	assert(eBusy.hosted !== null && eBusy.port !== busyPort, "stale busy registry: flock free -> host on a fresh port");
+	await eBusy.hosted.stop();
+
+	// 8b. held leader lock: election defers to the holder until it releases
+	const leaderGuard = await tryOpenLock(join(projectDir2, ".pi", "mailbox.leader"), Lock.Exclusive);
+	assert(leaderGuard !== undefined, "test acquires the leader lock externally");
+	let deferredErr = null;
+	try {
+		await ensureService(projectDir2);
+	} catch (e) {
+		deferredErr = e;
+	}
+	assert(
+		deferredErr && String(deferredErr).includes("leader lock is held"),
+		"held leader lock defers election instead of hosting a duplicate",
+	);
+	await leaderGuard.drop();
+	const eAfter = await ensureService(projectDir2);
+	assert(eAfter.hosted !== null, "released leader lock: election proceeds");
+	await eAfter.hosted.stop();
+
+	// 8c. graceful stop clears the registry while still holding the lock
+	const regAfterStop = await readRegistry(projectDir2);
+	assert(regAfterStop.service === null, "graceful leader stop clears the registry");
+
+	// 8d. foreign responders on the registered port do not satisfy the probe,
+	// but with a free flock election still proceeds
+	const foreign1 = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+	foreign1.on("connection", (ws) => ws.on("message", () => ws.send(JSON.stringify({ t: "hello" }))));
+	await new Promise((r) => foreign1.once("listening", r));
+	writeFileSync(
+		join(projectDir2, ".pi", "mailbox.json"),
+		JSON.stringify({ projectId: "probe-test", service: { port: foreign1.address().port, instanceId: "expected" } }),
+	);
+	const eForeign = await ensureService(projectDir2);
+	assert(eForeign.hosted !== null, "non-pong responder: flock free -> election proceeds");
+	await eForeign.hosted.stop();
+	await new Promise((r) => foreign1.close(r));
+
+	const foreign2 = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+	foreign2.on("connection", (ws) => ws.on("message", () => ws.send(JSON.stringify({ t: "pong", instanceId: "other" }))));
+	await new Promise((r) => foreign2.once("listening", r));
+	writeFileSync(
+		join(projectDir2, ".pi", "mailbox.json"),
+		JSON.stringify({ projectId: "probe-test", service: { port: foreign2.address().port, instanceId: "expected" } }),
+	);
+	const eForeign2 = await ensureService(projectDir2);
+	assert(eForeign2.hosted !== null, "instanceId-mismatched pong: flock free -> election proceeds");
+	await eForeign2.hosted.stop();
+	await new Promise((r) => foreign2.close(r));
+
+	// dead port (nothing listening) with a free flock: election proceeds and hosts
+	const tmpServer = netCreateServer(() => {});
+	await new Promise((r) => tmpServer.listen(0, "127.0.0.1", r));
+	const deadPort = tmpServer.address().port;
+	await new Promise((r) => tmpServer.close(r));
+	writeFileSync(
+		join(projectDir2, ".pi", "mailbox.json"),
+		JSON.stringify({ projectId: "probe-test", service: { port: deadPort, instanceId: "gone" } }),
+	);
+	const election2 = await ensureService(projectDir2);
+	assert(election2.hosted !== null, "dead registered port with free flock: election proceeds");
+	await election2.hosted.stop();
+	for (const s of busySockets) s.destroy();
+	await new Promise((r) => busy.close(r));
+	rmSync(projectDir2, { recursive: true, force: true });
+
+	// 8e. guard-leak regression: a failure after acquiring the flock must
+	// release it (previously a leaked FileHandle kept the lock forever and
+	// crashed the process at GC)
+	const projectDir4 = mkdtempSync(join(tmpdir(), "pi-mailbox-smoke4-"));
+	mkdirSync(join(projectDir4, ".pi"), { recursive: true });
+	// a FILE where the store wants its directory -> service.start() throws EEXIST
+	writeFileSync(join(projectDir4, ".pi", "mailbox"), "not a directory");
+	let firstErr = null;
+	try {
+		await ensureService(projectDir4);
+	} catch (e) {
+		firstErr = e;
+	}
+	assert(firstErr && String(firstErr).includes("EEXIST"), "service start fails on EEXIST");
+	let secondErr = null;
+	try {
+		await ensureService(projectDir4);
+	} catch (e) {
+		secondErr = e;
+	}
+	assert(
+		secondErr && String(secondErr).includes("EEXIST"),
+		"flock released after failure (second attempt retries hosting, not leader-lock-held)",
+	);
+	rmSync(join(projectDir4, ".pi", "mailbox"));
+	const eRecovered = await ensureService(projectDir4);
+	assert(eRecovered.hosted !== null, "recovered hosting after the blocker is removed");
+	await eRecovered.hosted.stop();
+	rmSync(projectDir4, { recursive: true, force: true });
 
 	await b.stop();
 	await c.stop();

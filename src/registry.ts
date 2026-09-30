@@ -1,16 +1,22 @@
 /**
- * Leader election and registry file management.
+ * Leader election via a native OS file lock (@lickle/lock: `flock` on Unix,
+ * `LockFileEx` on Windows).
  *
- * `<project>/.pi/mailbox.json` holds the project UUID and the current service
- * address. The first connector binds a random port and writes the file under a
- * mkdir lock; later connectors probe the address and connect as clients. When
- * the hosting session exits, its socket closes and remaining clients re-run
- * the same election protocol.
+ * The leader holds an exclusive lock on `<project>/.pi/mailbox.leader` for
+ * its service lifetime. The lock is tied to an open file handle, so the OS
+ * releases it automatically when the process dies: leadership handover needs
+ * no stale-timeout heuristics and no liveness inference, and a second
+ * service can never exist while the leader lives (crash-safe lease).
+ *
+ * The registry file (`mailbox.json`) only tells clients where to connect;
+ * only the lock holder writes it. A stale registry plus a free lock is
+ * resolved by the next election winner overwriting the entry.
  */
 
-import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { tryOpenLock, Lock } from "@lickle/lock";
 import { WebSocket } from "ws";
 import { MailboxService, type ServiceHandle } from "./service.ts";
 
@@ -19,15 +25,14 @@ export interface RegistryFile {
 	service: { port: number; instanceId: string } | null;
 }
 
-const LOCK_STALE_MS = 10_000;
 const PROBE_TIMEOUT_MS = 1_500;
 
 function registryPath(projectDir: string): string {
 	return join(projectDir, ".pi", "mailbox.json");
 }
 
-function lockPath(projectDir: string): string {
-	return join(projectDir, ".pi", "mailbox.lock");
+function leaderLockPath(projectDir: string): string {
+	return join(projectDir, ".pi", "mailbox.leader");
 }
 
 export async function readRegistry(projectDir: string): Promise<RegistryFile> {
@@ -68,7 +73,11 @@ function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** Probe a claimed service address. Returns true if a matching mailbox service answers. */
+/**
+ * Probe a claimed service address: true only when a mailbox service with the
+ * expected instanceId answers. Used by clients to decide whether to connect;
+ * election safety does not depend on it (the flock is the lease).
+ */
 async function probeService(port: number, expectedInstanceId: string): Promise<boolean> {
 	return new Promise((resolve) => {
 		let settled = false;
@@ -77,8 +86,11 @@ async function probeService(port: number, expectedInstanceId: string): Promise<b
 			if (settled) return;
 			settled = true;
 			clearTimeout(timer);
+			// terminate, not close: during a pending handshake close() may leave
+			// the underlying socket open, which keeps the remote server's
+			// connections (and its close callback) alive forever
 			try {
-				ws.close();
+				ws.terminate();
 			} catch {
 				// ignore
 			}
@@ -101,60 +113,81 @@ async function probeService(port: number, expectedInstanceId: string): Promise<b
 	});
 }
 
-async function acquireLock(projectDir: string): Promise<string> {
-	const ownerId = `${process.pid}-${randomUUID()}`;
-	for (let attempt = 0; ; attempt++) {
-		try {
-			await mkdir(lockPath(projectDir), { recursive: true });
-			// record ownership so a stale-holder's release cannot delete a newer lock
-			await writeFile(join(lockPath(projectDir), "owner"), ownerId, "utf8");
-			return ownerId;
-		} catch (err) {
-			if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-			// stale lock: hosting process died inside the critical section
-			const age = Date.now() - (await stat(lockPath(projectDir))).mtimeMs;
-			if (age > LOCK_STALE_MS) {
-				await rm(lockPath(projectDir), { recursive: true, force: true });
-				continue;
-			}
-			if (attempt > 20) throw new Error("mailbox lock contention timeout");
-			await sleep(100 + Math.floor(Math.random() * 200));
-		}
-	}
-}
-
-async function releaseLock(projectDir: string, ownerId: string): Promise<void> {
-	try {
-		const current = await readFile(join(lockPath(projectDir), "owner"), "utf8");
-		if (current.trim() !== ownerId) return; // lock was taken over; not ours
-	} catch {
-		// owner file unreadable (taker is mid-setup); do not touch the lock
-		return;
-	}
-	await rm(lockPath(projectDir), { recursive: true, force: true });
-}
-
 export interface ElectionResult {
-	/** Service we are now hosting, if we won the election. null for clients. */
+	/** Service we are now hosting, if we won leadership. null for clients. */
 	hosted: ServiceHandle | null;
-	/** Address of the live service (ours or the existing one). */
+	/** Address of the live service (ours or the existing leader's). */
 	port: number;
 	instanceId: string;
 	projectId: string;
 }
 
 /**
- * Ensure a mailbox service exists for the project: connect to the live one, or
- * host it ourselves under the lock. Safe to call repeatedly (re-election).
- * `options.sessionsDir` (pi session directory for this cwd) enables
- * orphan-mailbox GC when we end up hosting; pass undefined to skip GC.
+ * Ensure a mailbox service exists for the project. Try to become the leader
+ * via the flock; if another process leads, connect to its registered service.
+ * Safe to call repeatedly (re-election). A held lock with an unreachable or
+ * not-yet-registered service throws, so callers retry until the leader is
+ * either reachable or dead. `options.sessionsDir` (pi session directory for
+ * this cwd) enables orphan-mailbox GC when we host.
  */
 export async function ensureService(
 	projectDir: string,
 	options?: { sessionsDir?: string; gcDelayMs?: number; gcGraceMs?: number },
 ): Promise<ElectionResult> {
-	// fast path: probe without locking
-	let registry = await readRegistry(projectDir);
+	await mkdir(join(projectDir, ".pi"), { recursive: true });
+
+	const guard = await tryOpenLock(leaderLockPath(projectDir), Lock.Exclusive);
+	if (guard) {
+		// we are the leader: host, then publish our address. The guard must be
+		// released on every failure path — a leaked FileHandle keeps the lock
+		// held forever (and Node terminates the process when GC finds it)
+		const registry = await readRegistry(projectDir);
+		let service: MailboxService | null = null;
+		let committed = false;
+		try {
+			service = new MailboxService(projectDir, registry.projectId, options);
+			await service.start();
+			const started = service;
+			const handle: ServiceHandle = {
+				instanceId: started.instanceId,
+				port: started.port,
+				stop: async () => {
+					// clear the registry while we still hold the lock (only the
+					// lock holder writes it), then stop serving, then release
+					// leadership — the lock is released even if stopping fails
+					try {
+						await clearService(projectDir, started.instanceId).catch(() => undefined);
+						await started.stop();
+					} finally {
+						await guard.drop().catch(() => undefined);
+					}
+				},
+			};
+			await writeRegistry(projectDir, {
+				projectId: registry.projectId,
+				service: { port: started.port, instanceId: started.instanceId },
+			});
+			committed = true;
+			return {
+				hosted: handle,
+				port: started.port,
+				instanceId: started.instanceId,
+				projectId: registry.projectId,
+			};
+		} finally {
+			if (!committed) {
+				try {
+					await service?.stop();
+				} catch {
+					// best effort: the process is already in a failure path
+				}
+				await guard.drop().catch(() => undefined);
+			}
+		}
+	}
+
+	// another process leads: connect if its service is reachable
+	const registry = await readRegistry(projectDir);
 	if (registry.service && (await probeService(registry.service.port, registry.service.instanceId))) {
 		return {
 			hosted: null,
@@ -163,59 +196,18 @@ export async function ensureService(
 			projectId: registry.projectId,
 		};
 	}
-
-	const ownerId = await acquireLock(projectDir);
-	try {
-		// re-check under the lock: someone else may have won while we waited
-		registry = await readRegistry(projectDir);
-		if (registry.service && (await probeService(registry.service.port, registry.service.instanceId))) {
-			return {
-				hosted: null,
-				port: registry.service.port,
-				instanceId: registry.service.instanceId,
-				projectId: registry.projectId,
-			};
-		}
-
-		const service = new MailboxService(projectDir, registry.projectId, options);
-		await service.start();
-		const handle: ServiceHandle = {
-			instanceId: service.instanceId,
-			port: service.port,
-			stop: () => service.stop(),
-		};
-		// we hold the lock, so the registry cannot have changed since we read it;
-		// write the same projectId back alongside the new service entry
-		await writeRegistry(projectDir, {
-			projectId: registry.projectId,
-			service: { port: service.port, instanceId: service.instanceId },
-		});
-		return {
-			hosted: handle,
-			port: service.port,
-			instanceId: service.instanceId,
-			projectId: registry.projectId,
-		};
-	} finally {
-		await releaseLock(projectDir, ownerId);
-	}
+	// leader may be mid-startup (registry not yet written) or busy; retry soon
+	throw new Error("leader lock is held but the registered service is not reachable yet; retrying");
 }
 
 /**
  * Clear the service entry on graceful host shutdown — but only if it still
- * points at our instance. Between our server stopping and this call taking
- * the lock, another session may have won re-election and written its own
- * entry; clearing unconditionally would orphan that live service and cause
- * a split brain. Stale entries are harmless (election probes liveness).
+ * points at our instance (a new leader may have taken over already). Called
+ * while the leader lock is still held, so no other writer can race.
  */
 export async function clearService(projectDir: string, instanceId: string): Promise<void> {
-	const ownerId = await acquireLock(projectDir);
-	try {
-		const registry = await readRegistry(projectDir);
-		if (registry.service?.instanceId === instanceId) {
-			await writeRegistry(projectDir, { projectId: registry.projectId, service: null });
-		}
-	} finally {
-		await releaseLock(projectDir, ownerId);
+	const registry = await readRegistry(projectDir);
+	if (registry.service?.instanceId === instanceId) {
+		await writeRegistry(projectDir, { projectId: registry.projectId, service: null });
 	}
 }

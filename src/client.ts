@@ -19,7 +19,7 @@ import {
 	type ServerMsg,
 	type SessionInfo,
 } from "./protocol.ts";
-import { ensureService, clearService } from "./registry.ts";
+import { ensureService } from "./registry.ts";
 import type { ServiceHandle } from "./service.ts";
 
 const REQUEST_TIMEOUT_MS = 5_000;
@@ -311,9 +311,6 @@ export class MailboxConnection {
 			const hosted = this.hosted;
 			this.hosted = null;
 			await hosted.stop();
-			if (this.mode === "local") {
-				await clearService(this.projectDir, hosted.instanceId).catch(() => undefined);
-			}
 		}
 	}
 
@@ -338,32 +335,50 @@ export class MailboxConnection {
 
 	private async attempt(generation = this.generation): Promise<void> {
 		if (this.stopped || generation !== this.generation) return;
+		let url: string;
+		const existing = this.hosted; // read once; assigned below without re-reading
 		if (this.mode === "local") {
-			// re-election: probe first, host only if nobody else does
+			if (existing) {
+				// fast path: we already lead — talk to our own service directly.
+				// (ensureService would always see our own flock as held.)
+				try {
+					url = `ws://127.0.0.1:${existing.port}`;
+					await this.openClient(url);
+					this.events.onConnected();
+					return;
+				} catch {
+					// our own service died outside handle.stop: stop the handle
+					// (releasing the leader lock) and re-elect below
+					this.hosted = null;
+					await existing.stop().catch(() => undefined);
+				}
+			}
+			// re-election: try to become the leader via the flock; otherwise
+			// connect to the registered leader (throws while it is unreachable,
+			// the reconnect loop retries)
 			const election = await ensureService(this.projectDir, this.options);
 			if (election.hosted) {
-				if (this.hosted && this.hosted.instanceId !== election.hosted.instanceId) {
-					// two probe timeouts made us re-elect while our old service was
-					// still alive; stop it instead of leaking the handle
-					const stale = this.hosted;
+				if (existing && existing.instanceId !== election.hosted.instanceId) {
+					// an unexpected second service won the election; stop ours
+					// instead of leaking the handle
 					this.hosted = election.hosted;
-					await stale.stop().catch(() => undefined);
+					await existing.stop().catch(() => undefined);
 				} else {
 					this.hosted = election.hosted;
 				}
-			} else if (this.hosted && this.hosted.instanceId !== election.instanceId) {
+			} else if (existing && existing.instanceId !== election.instanceId) {
 				// another instance took over; our old service is dead or orphaned —
 				// release it so stop() does not leak the http server
-				const stale = this.hosted;
 				this.hosted = null;
-				await stale.stop().catch(() => undefined);
-			} else if (this.hosted) {
+				await existing.stop().catch(() => undefined);
+			} else {
 				// probe found our own live service; keep the handle
 			}
-			await this.openClient(`ws://127.0.0.1:${election.port}`);
+			url = `ws://127.0.0.1:${election.port}`;
 		} else {
-			await this.openClient(this.remoteUrl!);
+			url = this.remoteUrl!;
 		}
+		await this.openClient(url);
 		this.events.onConnected();
 	}
 

@@ -19,7 +19,7 @@ import { VERSION, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { hostname, platform } from "node:os";
 import { Type } from "typebox";
 import { MailboxConnection } from "./client.ts";
-import type { MailRecord, MailRef } from "./protocol.ts";
+import type { MailRecord, MailRef, SessionInfo } from "./protocol.ts";
 
 const TOOL_NAMES = ["mailbox_list", "mailbox_read", "mailbox_send", "mailbox_sessions"] as const;
 
@@ -30,6 +30,21 @@ function formatMailList(mails: MailRecord[]): string {
 			const read = m.readAt ? " " : "*";
 			const from = m.from.session.slice(0, 8);
 			return `[${read}] ${m.id}  from ${from}  ${m.subject}`;
+		})
+		.join("\n");
+}
+
+function formatSessions(sessions: SessionInfo[]): string {
+	if (sessions.length === 0) return "no online sessions";
+	return sessions
+		.map((s) => {
+			const name = s.name ? `  name=${s.name}` : "";
+			const tags = s.tags && s.tags.length > 0 ? `  tags=${s.tags.join(",")}` : "";
+			const extra = Object.entries(s.meta ?? {})
+				.filter(([k]) => k !== "name" && k !== "tags")
+				.map(([k, v]) => `  ${k}=${v}`)
+				.join("");
+			return `${s.session}  ${s.agent}${name}${tags}${extra}`;
 		})
 		.join("\n");
 }
@@ -211,13 +226,20 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				metaUpdate = { unset: keys };
-			} else if (arg === "name" || arg === "tag" || arg === "meta") {
-				// show current metadata below
+			} else if (
+				arg === "name" ||
+				arg === "tag" ||
+				arg === "meta" ||
+				arg === "list" ||
+				arg === "list mail" ||
+				arg === "list client"
+			) {
+				// show metadata / online sessions / inbox below; `list` defaults to mail
 			} else if (arg !== "") {
 				const m = /^([A-Za-z0-9.-]+):(\d+)$/.exec(arg);
 				if (!m) {
 					ctx.ui.notify(
-						"Usage: /mailbox [host:port | name <n> | tag <a,b> | set k=v | unset k | read <id> | more <cursor> | off | status]",
+						"Usage: /mailbox [list [client|mail] | meta | name <n> | tag <a,b> | set k=v | unset k | read <id> | more <cursor> | host:port | off | status]",
 						"warning",
 					);
 					return;
@@ -246,6 +268,11 @@ export default function (pi: ExtensionAPI) {
 								.join(", ")
 						: `unset ${metaUpdate.unset!.join(", ")}`;
 					ctx.ui.notify(`mailbox: ${desc}`, "info");
+					return;
+				}
+				if (arg === "list client") {
+					const sessions = await c.mailbox.sessions();
+					ctx.ui.notify(`mailbox: ${sessions.length} online\n${formatSessions(sessions)}`, "info");
 					return;
 				}
 				if (arg === "name" || arg === "tag" || arg === "meta") {
@@ -388,22 +415,8 @@ export default function (pi: ExtensionAPI) {
 		exposure: "deferred",
 		async execute(_toolCallId) {
 			const sessions = await requireConnection().mailbox.sessions();
-			const text =
-				sessions.length === 0
-					? "no online sessions"
-					: sessions
-						.map((s) => {
-							const name = s.name ? `  name=${s.name}` : "";
-							const tags = s.tags && s.tags.length > 0 ? `  tags=${s.tags.join(",")}` : "";
-							const extra = Object.entries(s.meta ?? {})
-								.filter(([k]) => k !== "name" && k !== "tags")
-								.map(([k, v]) => `  ${k}=${v}`)
-								.join("");
-							return `${s.session}  ${s.agent}${name}${tags}${extra}`;
-						})
-						.join("\n");
 			return {
-				content: [{ type: "text", text }],
+				content: [{ type: "text", text: formatSessions(sessions) }],
 				details: { sessions },
 			};
 		},

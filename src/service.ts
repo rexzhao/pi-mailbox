@@ -107,6 +107,7 @@ export class MailboxService {
 	private readonly gcDelayMs: number;
 	private readonly gcGraceMs: number;
 	private gcTimer: NodeJS.Timeout | null = null;
+	private stopped = false;
 	private readonly conns = new Map<WebSocket, ConnInfo>();
 	/** session id -> connection of the registered (online) session */
 	private readonly online = new Map<string, WebSocket>();
@@ -149,6 +150,8 @@ export class MailboxService {
 	}
 
 	async stop(): Promise<void> {
+		if (this.stopped) return;
+		this.stopped = true;
 		if (this.gcTimer) {
 			clearTimeout(this.gcTimer);
 			this.gcTimer = null;

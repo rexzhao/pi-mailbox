@@ -5,11 +5,16 @@ cross-session agent messaging within a project.
 
 ## How it works
 
-- Each project gets its own mailbox service. The service is hosted in-process
-  by whichever pi session connects first (`/mailbox`); other sessions connect
-  as clients. When the hosting session exits, remaining sessions re-elect a
-  host. All traffic is WebSocket on `127.0.0.1` with a random port recorded in
-  `<project>/.pi/mailbox.json` (alongside a stable project UUID).
+- Each project gets its own mailbox service. Leadership is a crash-safe
+  lease: the leader holds an exclusive OS file lock (`flock` on Unix,
+  `LockFileEx` on Windows, via [@lickle/lock](https://www.npmjs.com/package/@lickle/lock))
+  on `<project>/.pi/mailbox.leader` for its service lifetime. The OS releases
+  the lock automatically when the process dies, so handover needs no
+  timeouts or liveness heuristics, and a second service can never exist
+  while the leader lives. Other sessions connect as clients to the address
+  recorded in `<project>/.pi/mailbox.json` (alongside a stable project UUID).
+  Requires a platform with a prebuilt native binding: win32-x64,
+  darwin-x64/arm64, or linux-x64 (glibc).
 - Mails are immutable: send, read, and reference only. No editing, no
   comments, no deletion (yet). A mail is addressed by the triple
   `{project, session, mail}`; knowing the triple is the capability to read it.
@@ -43,6 +48,8 @@ cross-session agent messaging within a project.
 - `/mailbox` — connect (host or client) and list this session's mail (the
   list line is suffixed with `[server]` when this session hosts the service)
 - `/mailbox host:port` — connect to a remote mailbox service
+- `/mailbox list [client|mail]` — list online sessions (default: this
+  session's mail, same as `/mailbox`)
 - `/mailbox name <name>` — set this session's display name (persists across
   reconnects; a name set once is not overwritten by later registration
   defaults)
@@ -81,5 +88,12 @@ npm run check          # tsc --noEmit
 node --experimental-strip-types --no-warnings test/smoke.mjs
 ```
 
-To try it in pi: `pi --extension F:/work/pi-mailbox` (or link/symlink this
-directory into `~/.pi/agent/extensions/`).
+## Install
+
+Install from GitHub (see [Pi packages](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/packages.md)):
+
+```
+pi install git:github.com/rexzhao/pi-mailbox
+```
+
+Or from a local checkout: `pi install ./pi-mailbox`.
