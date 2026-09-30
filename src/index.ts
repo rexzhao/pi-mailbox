@@ -297,9 +297,19 @@ export default function (pi: ExtensionAPI) {
 					}
 					return;
 				}
+				const showList = arg === "list" || arg === "list mail" || moreCursor !== null;
 				const { mails, nextCursor } = await c.mailbox.inbox(undefined, { cursor: moreCursor ?? undefined });
 				const unread = mails.filter((m) => !m.readAt).length;
 				const role = c.isHost ? " [server]" : "";
+				if (!showList) {
+					// plain /mailbox (or a fresh host:port connect): status line only;
+					// the list lives in /mailbox list. Counts are page-scoped.
+					ctx.ui.notify(
+						`mailbox: 页内 ${unread} 未读 / 显示 ${mails.length} 封（/mailbox list 查看）${role}`,
+						"info",
+					);
+					return;
+				}
 				const more = nextCursor ? `\n(older mails: /mailbox more ${nextCursor})` : "";
 				ctx.ui.notify(
 					`mailbox: 页内 ${unread} 未读 / 显示 ${mails.length} 封${role}\n${formatMailList(mails)}${more}`,
