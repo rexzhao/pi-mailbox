@@ -234,6 +234,9 @@ export class MailboxService {
 				}
 				this.conns.set(ws, { session: msg.session, agent: msg.agent });
 				this.online.set(msg.session, ws);
+				// persist the agent identity and create the session file, so the
+				// mailbox exists for offline delivery from now on
+				await this.store.ensureSession(msg.session).catch(() => undefined);
 
 				// merge registration-time meta (best-effort, per-key):
 				// - invalid keys/values are skipped individually, not fatal
@@ -246,11 +249,21 @@ export class MailboxService {
 				// - the hello's system keyset is authoritative: stored system keys
 				//   absent from this hello are unset (bounds accumulation)
 				const state = await this.store.state(msg.session);
+				// the agent identity is persisted as the `_agent` system key, so
+				// offline mailbox listings can still show who a session is
+				// `_agent` must be the first entry so the system-key cap can never
+				// squeeze it out, and re-assigned after the spread so a client cannot
+				// spoof it
+				const metaSource: Record<string, unknown> = { _agent: msg.agent };
 				if (typeof msg.meta === "object" && msg.meta !== null) {
+					Object.assign(metaSource, msg.meta);
+				}
+				metaSource._agent = msg.agent;
+				if (Object.keys(metaSource).length > 0) {
 					const set: Record<string, string> = {};
 					let sysCount = 0;
 					const sysKept = new Set<string>();
-					for (const [key, value] of Object.entries(msg.meta)) {
+					for (const [key, value] of Object.entries(metaSource)) {
 						if (!META_KEY_RE.test(key)) continue;
 						if (typeof value !== "string" || value.length > META_VALUE_MAX) continue;
 						if (key.startsWith("_")) {
@@ -299,14 +312,21 @@ export class MailboxService {
 
 			case "sessions": {
 				const sessions: SessionInfo[] = [];
-				for (const [session, connWs] of this.online) {
-					if (connWs.readyState !== WebSocket.OPEN) continue;
-					const info = this.conns.get(connWs);
-					if (!info) continue;
+				const ids = new Set<string>(this.online.keys());
+				if (msg.includeOffline) {
+					// lazily enumerate every mailbox that ever registered; files are
+					// loaded (and cached) on demand by this query
+					for (const id of await this.store.listSessionIds()) ids.add(id);
+				}
+				for (const session of ids) {
+					const connWs = this.online.get(session);
+					const online = connWs !== undefined && connWs.readyState === WebSocket.OPEN;
+					const info = online && connWs ? this.conns.get(connWs) : undefined;
 					const state = await this.store.state(session);
 					sessions.push({
 						session,
-						agent: info.agent,
+						agent: info?.agent ?? state.meta.values._agent,
+						online,
 						name: state.meta.values.name,
 						tags: state.meta.values.tags !== undefined ? (parseTags(state.meta.values.tags) ?? undefined) : undefined,
 						meta: { ...state.meta.values },
@@ -384,16 +404,6 @@ export class MailboxService {
 					});
 					return;
 				}
-				const targetWs = this.online.get(msg.target.session);
-				if (!targetWs || targetWs.readyState !== WebSocket.OPEN) {
-					this.reply(ws, {
-						t: "error",
-						rid: msg.rid,
-						code: "offline",
-						message: `target session ${msg.target.session} is not online`,
-					});
-					return;
-				}
 				if (typeof msg.subject !== "string" || typeof msg.body !== "string" || msg.subject.length > 256) {
 					this.reply(ws, { t: "error", rid: msg.rid, code: "bad_send", message: "subject and body required" });
 					return;
@@ -427,6 +437,18 @@ export class MailboxService {
 					this.reply(ws, { t: "error", rid: msg.rid, code: "bad_send", message: "invalid refs" });
 					return;
 				}
+				// offline delivery: the target's mailbox must exist (registered at
+				// least once); if it is currently online, push an unread notify
+				if (!(await this.store.hasMailbox(msg.target.session))) {
+					this.reply(ws, {
+						t: "error",
+						rid: msg.rid,
+						code: "no_mailbox",
+						message: `target session ${msg.target.session} has no mailbox (never registered)`,
+					});
+					return;
+				}
+				const targetWs = this.online.get(msg.target.session);
 				const mail: MailRecord = {
 					id: randomUUID(),
 					from: { project: this.projectId, session: from.session },
@@ -439,9 +461,12 @@ export class MailboxService {
 				await this.store.appendSend(msg.target.session, mail);
 				const ref: MailRef = { project: this.projectId, session: msg.target.session, mail: mail.id };
 				this.reply(ws, { t: "sent", rid: msg.rid, mail: ref });
-				// push updated unread count to the recipient
-				const inbox = await this.store.inbox(msg.target.session);
-				this.reply(targetWs, { t: "notify", unread: MailStore.unreadCount(inbox) });
+				// push updated unread count to the recipient (only when online;
+				// offline recipients get the unread backfill on their next hello)
+				if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+					const inbox = await this.store.inbox(msg.target.session);
+					this.reply(targetWs, { t: "notify", unread: MailStore.unreadCount(inbox) });
+				}
 				return;
 			}
 

@@ -21,7 +21,7 @@ import { Type } from "typebox";
 import { MailboxConnection } from "./client.ts";
 import type { MailRecord, MailRef, SessionInfo } from "./protocol.ts";
 
-const TOOL_NAMES = ["mailbox_list", "mailbox_read", "mailbox_send", "mailbox_sessions"] as const;
+const TOOL_NAMES = ["mailbox_list", "mailbox_read", "mailbox_send", "mailbox_reply", "mailbox_sessions"] as const;
 
 function formatMailList(mails: MailRecord[]): string {
 	if (mails.length === 0) return "mailbox is empty";
@@ -35,16 +35,18 @@ function formatMailList(mails: MailRecord[]): string {
 }
 
 function formatSessions(sessions: SessionInfo[]): string {
-	if (sessions.length === 0) return "no online sessions";
+	if (sessions.length === 0) return "no sessions";
 	return sessions
 		.map((s) => {
+			const mark = s.online ? "*" : "-";
+			const agent = s.agent ? `  ${s.agent}` : "";
 			const name = s.name ? `  name=${s.name}` : "";
 			const tags = s.tags && s.tags.length > 0 ? `  tags=${s.tags.join(",")}` : "";
 			const extra = Object.entries(s.meta ?? {})
-				.filter(([k]) => k !== "name" && k !== "tags")
+				.filter(([k]) => k !== "name" && k !== "tags" && k !== "_agent")
 				.map(([k, v]) => `  ${k}=${v}`)
 				.join("");
-			return `${s.session}  ${s.agent}${name}${tags}${extra}`;
+			return `[${mark}] ${s.session}${agent}${name}${tags}${extra}`;
 		})
 		.join("\n");
 }
@@ -232,14 +234,15 @@ export default function (pi: ExtensionAPI) {
 				arg === "meta" ||
 				arg === "list" ||
 				arg === "list mail" ||
-				arg === "list client"
+				arg === "list client" ||
+				arg === "list client all"
 			) {
-				// show metadata / online sessions / inbox below; `list` defaults to mail
+				// show metadata / sessions / inbox below; `list` defaults to mail
 			} else if (arg !== "") {
 				const m = /^([A-Za-z0-9.-]+):(\d+)$/.exec(arg);
 				if (!m) {
 					ctx.ui.notify(
-						"Usage: /mailbox [list [client|mail] | meta | name <n> | tag <a,b> | set k=v | unset k | read <id> | more <cursor> | host:port | off | status]",
+						"Usage: /mailbox [list [client [all]|mail] | meta | name <n> | tag <a,b> | set k=v | unset k | read <id> | more <cursor> | host:port | off | status]",
 						"warning",
 					);
 					return;
@@ -270,9 +273,12 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(`mailbox: ${desc}`, "info");
 					return;
 				}
-				if (arg === "list client") {
-					const sessions = await c.mailbox.sessions();
-					ctx.ui.notify(`mailbox: ${sessions.length} online\n${formatSessions(sessions)}`, "info");
+				if (arg === "list client" || arg === "list client all") {
+					const sessions = await c.mailbox.sessions(arg === "list client all");
+					const online = sessions.filter((s) => s.online).length;
+					const scope =
+						arg === "list client all" ? `${online} online / ${sessions.length} total` : `${online} online`;
+					ctx.ui.notify(`mailbox: ${scope}\n${formatSessions(sessions)}`, "info");
 					return;
 				}
 				if (arg === "name" || arg === "tag" || arg === "meta") {
@@ -387,11 +393,13 @@ export default function (pi: ExtensionAPI) {
 		name: "mailbox_send",
 		label: "Mailbox send",
 		description:
-			"Send a mail to another session in this project. The target must be online " +
-			"(use mailbox_sessions to find online sessions). Returns the new mail's triple. " +
-			"Reply to a mail by including its triple in refs.",
+			"Send a mail to another session in this project. The target must have " +
+			"registered at least once (its mailbox exists); it does not need to be " +
+			"online — offline mail is delivered as unread on its next connection " +
+			"(use mailbox_sessions to find sessions). Returns the new mail's triple. " +
+			"To reply to a mail, prefer mailbox_reply.",
 		parameters: Type.Object({
-			session: Type.String({ description: "Target session id (must be online)" }),
+			session: Type.String({ description: "Target session id (must have registered once)" }),
 			subject: Type.String({ description: "Subject line" }),
 			body: Type.Optional(Type.String({ description: "Mail body" })),
 			refs: Type.Optional(
@@ -418,13 +426,58 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
+		name: "mailbox_reply",
+		label: "Mailbox reply",
+		description:
+			"Reply to a mail: sends a new mail to the original sender, referencing the " +
+			"original (subject 'Re: <original subject>'). Prefer this over mailbox_send " +
+			"when answering a specific mail.",
+		parameters: Type.Object({
+			mail: Type.String({ description: "Mail UUID being replied to" }),
+			body: Type.String({ description: "Reply body" }),
+			session: Type.Optional(Type.String({ description: "Owner session of the mail (defaults to this session)" })),
+			project: Type.Optional(Type.String({ description: "Project UUID (defaults to this project)" })),
+			subject: Type.Optional(Type.String({ description: "Override the 'Re: <subject>' default" })),
+		}),
+		exposure: "deferred",
+		async execute(_toolCallId, params) {
+			const c = requireConnection();
+			const own = { project: c.mailbox.project!, session: c.session };
+			const ref: MailRef = {
+				project: params.project ?? own.project,
+				session: params.session ?? own.session,
+				mail: params.mail,
+			};
+			const original = await c.mailbox.read(ref);
+			if (!original) throw new Error(`mail ${params.mail} not found`);
+			if (original.from.project !== own.project) {
+				throw new Error("cannot reply across projects");
+			}
+			let subject = params.subject ?? original.subject;
+			if (!params.subject && !/^Re: /u.test(subject)) subject = `Re: ${subject}`;
+			subject = subject.slice(0, 256);
+			const sent = await c.mailbox.sendMail(original.from, subject, params.body, [ref]);
+			return {
+				content: [{ type: "text", text: `replied: ${sent.project}/${sent.session}/${sent.mail}` }],
+				details: { ref: sent },
+			};
+		},
+	});
+
+	pi.registerTool({
 		name: "mailbox_sessions",
 		label: "Mailbox sessions",
-		description: "List sessions currently online in this project's mailbox, with their name, tags, and other meta (model, host, ...).",
-		parameters: Type.Object({}),
+		description:
+			"List sessions in this project's mailbox with their name, tags, and other " +
+			"meta (model, host, ...). By default only online sessions; set " +
+			"includeOffline to also list sessions that registered before but are " +
+			"currently disconnected (marked '-' vs '*').",
+		parameters: Type.Object({
+			includeOffline: Type.Optional(Type.Boolean({ description: "Also list offline (registered but disconnected) sessions" })),
+		}),
 		exposure: "deferred",
-		async execute(_toolCallId) {
-			const sessions = await requireConnection().mailbox.sessions();
+		async execute(_toolCallId, params) {
+			const sessions = await requireConnection().mailbox.sessions(params.includeOffline);
 			return {
 				content: [{ type: "text", text: formatSessions(sessions) }],
 				details: { sessions },

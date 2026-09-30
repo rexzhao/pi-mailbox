@@ -7,7 +7,7 @@
  * Files are lazy-loaded on first access by their owning session and cached.
  */
 
-import { appendFile, mkdir, readFile, readdir, rename, stat } from "node:fs/promises";
+import { appendFile, access, mkdir, readFile, readdir, rename, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { SESSION_ID_RE, type MailRecord } from "./protocol.ts";
 
@@ -115,6 +115,30 @@ export class MailStore {
 
 	async inbox(sessionId: string): Promise<Map<string, MailRecord>> {
 		return (await this.state(sessionId)).mails;
+	}
+
+	/** True when the session has registered at least once (its file exists). */
+	async hasMailbox(sessionId: string): Promise<boolean> {
+		try {
+			await access(sessionFile(this.dir, sessionId));
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	/** Create the session's file on first registration (offline delivery target). */
+	async ensureSession(sessionId: string): Promise<void> {
+		await appendFile(sessionFile(this.dir, sessionId), "");
+	}
+
+	/** All session ids that have a mailbox file (online or offline). */
+	async listSessionIds(): Promise<string[]> {
+		const entries = await readdir(this.dir, { withFileTypes: true });
+		return entries
+			.filter((e) => e.isFile() && e.name.endsWith(".jsonl"))
+			.map((e) => e.name.slice(0, -".jsonl".length))
+			.filter((id) => SESSION_ID_RE.test(id));
 	}
 
 	async appendSend(sessionId: string, mail: MailRecord): Promise<void> {

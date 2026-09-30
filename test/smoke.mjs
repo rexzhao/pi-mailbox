@@ -68,7 +68,7 @@ try {
 
 	// 3. send + notify + read
 	let notified = 0;
-	const c = new MailboxConnection("local", projectDir, null, "sessionC", "agent-c", {
+	let c = new MailboxConnection("local", projectDir, null, "sessionC", "agent-c", {
 		onNotify: (unread) => {
 			notified = unread;
 		},
@@ -345,6 +345,39 @@ try {
 		"cursor older than all mails returns empty page with no cursor",
 	);
 
+	// 5e. offline delivery + offline client listing
+	await c.stop();
+	// C is offline but registered: send succeeds and lands as unread
+	const offlineRef = await b.mailbox.sendMail(
+		{ project: reg.projectId, session: "sessionC" },
+		"offline mail",
+		"while away",
+		[],
+	);
+	assert(offlineRef.session === "sessionC", "send to offline registered session accepted");
+	// offline listing: C shows as offline with identity preserved (_agent meta)
+	const withOffline = await b.mailbox.sessions(true);
+	const cOffline = withOffline.find((s) => s.session === "sessionC");
+	assert(cOffline && cOffline.online === false, "offline session listed with online=false");
+	assert(cOffline?.agent === "agent-c", "offline session agent preserved via _agent");
+	assert(cOffline?.name === undefined, "name was unset earlier, stays unset");
+	const onlineOnly = await b.mailbox.sessions();
+	assert(!onlineOnly.some((s) => s.session === "sessionC"), "default listing omits offline sessions");
+	// reconnect: unread backfill + the offline mail is there
+	let backfill = 0;
+	const c2 = new MailboxConnection("local", projectDir, null, "sessionC", "agent-c", {
+		onNotify: (unread) => {
+			backfill = unread;
+		},
+		onConnected: () => {},
+		onDisconnected: () => {},
+	});
+	await c2.start();
+	c = c2;
+	const afterOffline = await c.mailbox.inbox(undefined, { limit: 100 });
+	assert(afterOffline.mails.some((m) => m.subject === "offline mail"), "offline mail delivered on reconnect");
+	assert(backfill > 0, `unread backfill notified on reconnect (unread=${backfill})`);
+
 	// 6. offline target errors
 	let err = null;
 	try {
@@ -352,7 +385,7 @@ try {
 	} catch (e) {
 		err = e;
 	}
-	assert(err && String(err).includes("offline"), "send to offline session errors");
+	assert(err && String(err).includes("no mailbox"), "send to never-registered session errors (no_mailbox)");
 
 	// 7. persistence: stop host, re-elect, data survives
 	await a.stop();
@@ -365,7 +398,7 @@ try {
 	assert(b.connected, "B reconnected after host exit");
 	assert(c.connected, "C reconnected after host exit");
 	const mails2 = (await c.mailbox.inbox(undefined, { limit: 100 })).mails;
-	assert(mails2.length === 4 && mails2[3].readAt !== null, "mail survives host handover");
+	assert(mails2.length === 5 && mails2[0].subject === "offline mail", "mails survive host handover (incl. offline delivery)");
 	const metaAfter = (await c.mailbox.sessions()).find((s) => s.session === "sessionC");
 	assert(metaAfter?.tags?.length === 2, "tags survive host handover");
 

@@ -51,6 +51,8 @@ export interface PingMsg {
 export interface SessionsMsg {
 	t: "sessions";
 	rid: number;
+	/** Include offline mailboxes (sessions that registered at least once). */
+	includeOffline?: boolean;
 }
 
 /** Update this session's meta (key/value, cookie-like). System keys (leading `_`) cannot be set here. */
@@ -117,7 +119,10 @@ export interface PongMsg {
 
 export interface SessionInfo {
 	session: string;
-	agent: string;
+	/** pi session display name; absent for offline sessions that never set `_agent`. */
+	agent?: string;
+	/** True when currently connected. */
+	online: boolean;
 	/** Convenience views of the reserved meta keys. */
 	name?: string;
 	tags?: string[];

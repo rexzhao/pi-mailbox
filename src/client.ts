@@ -157,10 +157,11 @@ export class MailboxClient {
 		this.ws = null;
 	}
 
-	sessions(): Promise<SessionInfo[]> {
+	sessions(includeOffline?: boolean): Promise<SessionInfo[]> {
 		return this.request<{ sessions: SessionInfo[] }>({
 			t: "sessions",
 			rid: this.nextRid++,
+			includeOffline,
 		}).then((reply) => reply.sessions);
 	}
 

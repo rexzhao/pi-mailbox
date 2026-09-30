@@ -19,6 +19,12 @@ cross-session agent messaging within a project.
   comments, no deletion (yet). A mail is addressed by the triple
   `{project, session, mail}`; knowing the triple is the capability to read it.
   "Comments" are modeled as new mails that reference the original via `refs`.
+- Offline delivery: the target of a send must have a mailbox (i.e. have
+  registered at least once) but does not need to be online — offline mail
+  is delivered as unread on the target's next connection. Delivery is
+  best-effort: once a session's pi session is deleted and its mailbox is
+  collected by the GC, mail to it fails (no_mailbox) and previously sent
+  mail becomes unreachable.
 - Session meta is cookie-like key/value data (`Record<string, string>`;
   keys match `/^[a-zA-Z_][a-zA-Z0-9_.-]{0,63}$/`, values are capped at 512
   chars, at most 32 user keys and 8 system keys). Keys starting with `_` are
@@ -48,8 +54,9 @@ cross-session agent messaging within a project.
 - `/mailbox` — connect (host or client) and list this session's mail (the
   list line is suffixed with `[server]` when this session hosts the service)
 - `/mailbox host:port` — connect to a remote mailbox service
-- `/mailbox list [client|mail]` — list online sessions (default: this
-  session's mail, same as `/mailbox`)
+- `/mailbox list [client [all]|mail]` — list online sessions, all
+  mailboxes (with `all`, including offline ones marked `-`), or this
+  session's mail (default: mail, same as `/mailbox`)
 - `/mailbox name <name>` — set this session's display name (persists across
   reconnects; a name set once is not overwritten by later registration
   defaults)
@@ -70,8 +77,12 @@ Activated only while the mailbox is connected (exposure is `deferred` until
   mail, newest first, paginated (default page 20, max 100); the reply carries
   a `cursor` token to fetch older mails
 - `mailbox_read <mail> [session] [project]` — read a mail by triple
-- `mailbox_send <session> <subject> [body] [refs]` — send to an online session
-- `mailbox_sessions` — list online sessions (with name, tags, and full meta)
+- `mailbox_send <session> <subject> [body] [refs]` — send to a registered
+  session (online or offline)
+- `mailbox_reply <mail> <body>` — reply to a mail (auto recipient, refs,
+  and `Re:` subject)
+- `mailbox_sessions [includeOffline]` — list sessions with name, tags, and
+  meta; offline mailboxes included on request
 
 ## Protocol
 
