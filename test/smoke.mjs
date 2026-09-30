@@ -279,6 +279,10 @@ try {
 	}
 	const page1 = await c.mailbox.inbox(undefined, { limit: 2 });
 	assert(page1.mails.length === 2 && page1.nextCursor, "page 1 limited with cursor");
+	assert(
+		page1.total === 4 && page1.totalUnread === 3,
+		"inbox reply carries mailbox-wide totals (not page-scoped)",
+	);
 	const page2 = await c.mailbox.inbox(undefined, { limit: 2, cursor: page1.nextCursor });
 	assert(page2.mails.length === 2 && !page2.nextCursor, "page 2 is last (no cursor when exhausted)");
 	const subjects = [...page1.mails, ...page2.mails].map((m) => m.subject);

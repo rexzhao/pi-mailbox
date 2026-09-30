@@ -95,8 +95,8 @@ export default function (pi: ExtensionAPI) {
 	function inject(unread: number): void {
 		if (!interactive) return;
 		const text = busy
-			? `[mailbox] 你有 ${unread} 封新邮件，请完成当前任务后再用 mailbox_list 查看。`
-			: `[mailbox] 你有 ${unread} 封新邮件，可用 mailbox_list 查看。`;
+				? `[mailbox] You have ${unread} new mail(s). Finish your current task, then check with mailbox_list.`
+				: `[mailbox] You have ${unread} new mail(s); use mailbox_list to read them.`
 		try {
 			pi.sendUserMessage(text, busy ? { deliverAs: "steer" } : undefined);
 		} catch {
@@ -304,21 +304,32 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				const showList = arg === "list" || arg === "list mail" || moreCursor !== null;
-				const { mails, nextCursor } = await c.mailbox.inbox(undefined, { cursor: moreCursor ?? undefined });
+				const { mails, nextCursor, total, totalUnread } = await c.mailbox.inbox(undefined, {
+					cursor: moreCursor ?? undefined,
+				});
 				const unread = mails.filter((m) => !m.readAt).length;
-				const role = c.isHost ? " [server]" : "";
+				const role = c.isHost ? "server" : "client";
 				if (!showList) {
-					// plain /mailbox (or a fresh host:port connect): status line only;
-					// the list lives in /mailbox list. Counts are page-scoped.
+					// plain /mailbox (or a fresh host:port connect): one status line;
+					// the client count is best-effort — omit it if the query fails
+					let onlinePart = "";
+					try {
+						const online = (await c.mailbox.sessions()).filter((s) => s.online).length;
+						onlinePart = `, ${online} clients online`;
+					} catch {
+						// keep the mail counts even when sessions fails
+					}
 					ctx.ui.notify(
-						`mailbox: 页内 ${unread} 未读 / 显示 ${mails.length} 封（/mailbox list 查看）${role}`,
+						`mailbox: ${total} mails (${totalUnread} unread)${onlinePart}, role: ${role} — /mailbox list to view`,
 						"info",
 					);
 					return;
 				}
-				const more = nextCursor ? `\n(older mails: /mailbox more ${nextCursor})` : "";
+				const more = nextCursor ? `
+(older mails: /mailbox more ${nextCursor})` : "";
 				ctx.ui.notify(
-					`mailbox: 页内 ${unread} 未读 / 显示 ${mails.length} 封${role}\n${formatMailList(mails)}${more}`,
+					`mailbox: page: ${unread} unread / ${mails.length} shown (${role})
+${formatMailList(mails)}${more}`,
 					"info",
 				);
 			} catch (err) {

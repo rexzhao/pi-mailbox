@@ -501,7 +501,14 @@ export class MailboxService {
 
 				const limit = Math.min(Math.max(1, msg.limit ?? DEFAULT_INBOX_LIMIT), MAX_INBOX_LIMIT);
 				const page = mails.slice(start, start + limit);
-				const reply: InboxReply = { t: "inbox", rid: msg.rid, mails: page };
+				// totals are mailbox-wide (unfiltered), not page-scoped
+				const reply: InboxReply = {
+					t: "inbox",
+					rid: msg.rid,
+					mails: page,
+					total: inbox.size,
+					totalUnread: MailStore.unreadCount(inbox),
+				};
 				if (start + limit < mails.length && page.length > 0) {
 					reply.nextCursor = encodeInboxCursor(page[page.length - 1]);
 				}

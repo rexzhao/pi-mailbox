@@ -45,9 +45,10 @@ cross-session agent messaging within a project.
   `<project>/.pi/mailbox/.trash/`; unreadable or empty session directories
   disable the GC entirely.
 - Delivery: while the agent is running, a new-mail notice is steered in
-  ("你有 N 封新邮件，请完成当前任务后再用 mailbox_list 查看。"); while idle,
-  the same notice is submitted directly. After reconnect, the unread count
-  is backfilled.
+  ("You have N new mail(s). Finish your current task, then check with
+  mailbox_list."); while idle, a shorter notice is submitted directly
+  ("You have N new mail(s); use mailbox_list to read them."). After
+  reconnect, the unread count is backfilled.
 
 ## Commands
 
@@ -89,7 +90,8 @@ Activated only while the mailbox is connected (exposure is `deferred` until
 See `src/protocol.ts` for the full message set. Requests carry a `rid`;
 responses echo it. `notify` is the only unsolicited push. Send validates
 sizes: subject <= 256 chars, body <= 64 KiB, at most 16 refs. Inbox queries
-are paginated: `limit` (default 20, max 100) plus an opaque `cursor` token.
+are paginated: `limit` (default 20, max 100) plus an opaque `cursor`
+token; every reply also carries mailbox-wide `total` / `totalUnread`.
 
 ## Development
 

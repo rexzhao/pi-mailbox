@@ -203,14 +203,19 @@ export class MailboxClient {
 	inbox(
 		filter?: InboxFilter,
 		opts?: { limit?: number; cursor?: string },
-	): Promise<{ mails: MailRecord[]; nextCursor?: string }> {
-		return this.request<{ mails: MailRecord[]; nextCursor?: string }>({
+	): Promise<{ mails: MailRecord[]; nextCursor?: string; total: number; totalUnread: number }> {
+		return this.request<{ mails: MailRecord[]; nextCursor?: string; total: number; totalUnread: number }>({
 			t: "inbox",
 			rid: this.nextRid++,
 			filter,
 			limit: opts?.limit,
 			cursor: opts?.cursor,
-		}).then((reply) => ({ mails: reply.mails, nextCursor: reply.nextCursor }));
+		}).then((reply) => ({
+			mails: reply.mails,
+			nextCursor: reply.nextCursor,
+			total: reply.total,
+			totalUnread: reply.totalUnread,
+		}));
 	}
 
 	read(mail: MailRef): Promise<MailRecord | null> {

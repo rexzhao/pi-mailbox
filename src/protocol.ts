@@ -153,6 +153,10 @@ export interface InboxReply {
 	mails: MailRecord[];
 	/** Present when more (older) mails are available. Pass back as `cursor`. */
 	nextCursor?: string;
+	/** Total mails in the mailbox (unfiltered, not page-scoped). */
+	total: number;
+	/** Total unread mails in the mailbox. */
+	totalUnread: number;
 }
 
 export interface MailReply {
