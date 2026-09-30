@@ -38,6 +38,8 @@ export interface HelloMsg {
 	rid: number;
 	session: string;
 	agent: string;
+	/** Registration-time meta defaults, best-effort per key: system keys (leading `_`) refresh on every hello; user keys apply only when absent; invalid entries are skipped individually. */
+	meta?: Record<string, string>;
 }
 
 /** Pre-hello liveness probe used by leader election. */
@@ -51,12 +53,12 @@ export interface SessionsMsg {
 	rid: number;
 }
 
-/** Update this session's mailbox metadata: display name and tags. `name: null` clears it. */
+/** Update this session's meta (key/value, cookie-like). System keys (leading `_`) cannot be set here. */
 export interface MetaMsg {
 	t: "meta";
 	rid: number;
-	name?: string | null;
-	tags?: string[];
+	set?: Record<string, string>;
+	unset?: string[];
 }
 
 export interface SendMsg {
@@ -102,6 +104,8 @@ export interface WelcomeMsg {
 	rid: number;
 	project: string;
 	instanceId: string;
+	/** This session's full meta after the registration merge. */
+	meta?: Record<string, string>;
 }
 
 export interface PongMsg {
@@ -114,8 +118,11 @@ export interface PongMsg {
 export interface SessionInfo {
 	session: string;
 	agent: string;
+	/** Convenience views of the reserved meta keys. */
 	name?: string;
 	tags?: string[];
+	/** Full key/value meta map. */
+	meta?: Record<string, string>;
 }
 
 export interface SessionsReply {
@@ -178,6 +185,15 @@ export type ServerMsg =
 // ---------------------------------------------------------------------------
 
 export const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+
+/** Meta keys are cookie-like: short identifiers. Keys starting with `_` are system-reserved. */
+export const META_KEY_RE = /^[a-zA-Z_][a-zA-Z0-9_.-]{0,63}$/;
+export const META_VALUE_MAX = 512;
+/** Cap for user-controlled meta keys per session. */
+export const META_MAX_KEYS = 32;
+/** Separate cap for system keys (`_`-prefixed) set at registration time. */
+export const META_MAX_SYSTEM_KEYS = 8;
+export const TAG_RE = /^[A-Za-z0-9_.-]{1,64}$/;
 
 export function isServerMsg(value: unknown): value is ServerMsg {
 	return typeof value === "object" && value !== null && typeof (value as { t?: unknown }).t === "string";

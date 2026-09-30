@@ -95,14 +95,180 @@ try {
 	const sent = await b.mailbox.read({ project: reg.projectId, session: "sessionC", mail: ref.mail });
 	assert(sent?.body === "world", "sender can read sent mail by triple");
 
-	// 4. name/tag metadata
-	await c.mailbox.setMeta({ name: "worker-c", tags: ["worker", "test"] });
+	// 4. meta: key/value, merge rules, persistence
+	await c.mailbox.setMeta({ set: { name: "worker-c", tags: "worker,test" } });
 	const sessions = await b.mailbox.sessions();
 	const cInfo = sessions.find((s) => s.session === "sessionC");
-	assert(cInfo?.name === "worker-c" && cInfo?.tags?.join(",") === "worker,test", "name and tags visible in sessions");
-	await c.mailbox.setMeta({ name: null });
+	assert(
+		cInfo?.name === "worker-c" && cInfo?.tags?.join(",") === "worker,test",
+		"name and tags visible in sessions",
+	);
+	assert(cInfo?.meta?.name === "worker-c", "full meta map in sessions reply");
+	await c.mailbox.setMeta({ unset: ["name"] });
 	const cleared = (await b.mailbox.sessions()).find((s) => s.session === "sessionC");
-	assert(cleared?.name === undefined && cleared?.tags?.length === 2, "name cleared, tags kept");
+	assert(cleared?.name === undefined && cleared?.tags?.length === 2, "name unset, tags kept");
+
+	// 4b. hello-time meta merge rules
+	const d = new MailboxConnection(
+		"local",
+		projectDir,
+		null,
+		"sessionD",
+		"agent-d",
+		{ onNotify: () => {}, onConnected: () => {}, onDisconnected: () => {} },
+		{ helloMeta: { name: "auto-d", _model: "prov/m1", role: "worker" } },
+	);
+	await d.start();
+	assert(
+		d.mailbox.sessionMeta?.name === "auto-d" && d.mailbox.sessionMeta?._model === "prov/m1",
+		"welcome returns merged hello meta",
+	);
+	// user override, then reconnect with different hello defaults
+	await d.mailbox.setMeta({ set: { name: "manual-d" } });
+	await d.stop();
+	const d2 = new MailboxConnection(
+		"local",
+		projectDir,
+		null,
+		"sessionD",
+		"agent-d",
+		{ onNotify: () => {}, onConnected: () => {}, onDisconnected: () => {} },
+		{ helloMeta: { name: "auto-d2", _model: "prov/m2", role: "boss" } },
+	);
+	await d2.start();
+	const d2meta = d2.mailbox.sessionMeta ?? {};
+	assert(d2meta.name === "manual-d", "user-set name survives reconnect (hello default does not clobber)");
+	assert(d2meta._model === "prov/m2", "system key refreshes on every hello");
+	assert(d2meta.role === "worker", "existing user key not overwritten by hello default");
+	let sysErr = null;
+	try {
+		await d2.mailbox.setMeta({ set: { _evil: "x" } });
+	} catch (e) {
+		sysErr = e;
+	}
+	assert(sysErr && String(sysErr).includes("bad_meta"), "system key cannot be set via meta op");
+
+	// 4c. meta robustness: null set, per-key hello filter, cap, local sync
+	let nullSetErr = null;
+	try {
+		await d2.mailbox.setMeta({ set: null });
+	} catch (e) {
+		nullSetErr = e;
+	}
+	assert(nullSetErr && String(nullSetErr).includes("bad_meta"), "null set rejected as bad_meta (not internal/timeout)");
+	await d2.mailbox.setMeta({ set: { task: "verifying" } });
+	assert(d2.mailbox.sessionMeta?.task === "verifying", "sessionMeta updated locally after setMeta");
+	await d2.stop();
+
+	// hello meta: per-key filtering, Object.hasOwn, cap
+	const e1 = new MailboxConnection(
+		"local",
+		projectDir,
+		null,
+		"sessionE",
+		"agent-e",
+		{ onNotify: () => {}, onConnected: () => {}, onDisconnected: () => {} },
+		{
+			helloMeta: {
+				good: "1",
+				"bad key": "2",
+				_model: "prov/me",
+				constructor: "own-property",
+			},
+		},
+	);
+	await e1.start();
+	const e1meta = e1.mailbox.sessionMeta ?? {};
+	assert(e1meta.good === "1" && e1meta._model === "prov/me", "valid hello meta keys land (per-key filter)");
+	assert(!("bad key" in e1meta), "invalid hello meta key skipped, not fatal");
+	assert(e1meta.constructor === "own-property", "inherited Object.prototype members are not mistaken for existing values");
+	await e1.stop();
+
+	// legacy over-cap state converges: pre-seed 40 system keys on disk, hello
+	// with the same 40 keys -> truncated to 8 (accepted set, not raw msg.meta)
+	mkdirSync(join(projectDir, ".pi", "mailbox"), { recursive: true });
+	{
+		const legacy = { t: "meta", set: {} };
+		for (let i = 0; i < 40; i++) legacy.set[`_p${i}`] = "v";
+		writeFileSync(
+			join(projectDir, ".pi", "mailbox", "sessionH.jsonl"),
+			JSON.stringify(legacy) + "\n",
+		);
+	}
+	const bigSame = {};
+	for (let i = 0; i < 40; i++) bigSame[`_p${i}`] = "v";
+	const e5 = new MailboxConnection(
+		"local",
+		projectDir,
+		null,
+		"sessionH",
+		"agent-h",
+		{ onNotify: () => {}, onConnected: () => {}, onDisconnected: () => {} },
+		{ helloMeta: bigSame },
+	);
+	await e5.start();
+	const e5meta = e5.mailbox.sessionMeta ?? {};
+	assert(
+		Object.keys(e5meta).filter((k) => k.startsWith("_")).length === 8,
+		"legacy over-cap system keys converge to 8 on hello with the same keyset",
+	);
+	await e5.stop();
+
+	// hello meta cap: 40 system keys are truncated to META_MAX_SYSTEM_KEYS
+	const bigSys = {};
+	for (let i = 0; i < 40; i++) bigSys[`_k${i}`] = "v";
+	const e3 = new MailboxConnection(
+		"local",
+		projectDir,
+		null,
+		"sessionG",
+		"agent-g",
+		{ onNotify: () => {}, onConnected: () => {}, onDisconnected: () => {} },
+		{ helloMeta: bigSys },
+	);
+	await e3.start();
+	const e3meta = e3.mailbox.sessionMeta ?? {};
+	assert(
+		Object.keys(e3meta).filter((k) => k.startsWith("_")).length === 8,
+		"system keys capped at META_MAX_SYSTEM_KEYS (first 8 win)",
+	);
+	// system keyset is authoritative: keys absent from a later hello are unset
+	await e3.stop();
+	const e4 = new MailboxConnection(
+		"local",
+		projectDir,
+		null,
+		"sessionG",
+		"agent-g",
+		{ onNotify: () => {}, onConnected: () => {}, onDisconnected: () => {} },
+		{ helloMeta: { _model: "prov/only" } },
+	);
+	await e4.start();
+	const e4meta = e4.mailbox.sessionMeta ?? {};
+	assert(
+		e4meta._model === "prov/only" && !("_k0" in e4meta),
+		"system keys absent from a later hello are unset (no accumulation)",
+	);
+	await e4.stop();
+
+	// hello meta cap: a large user-key payload is dropped entirely (system keys kept)
+	const big = { _model: "prov/big" };
+	for (let i = 0; i < 40; i++) big[`k${i}`] = "v";
+	const e2 = new MailboxConnection(
+		"local",
+		projectDir,
+		null,
+		"sessionF",
+		"agent-f",
+		{ onNotify: () => {}, onConnected: () => {}, onDisconnected: () => {} },
+		{ helloMeta: big },
+	);
+	await e2.start();
+	const e2meta = e2.mailbox.sessionMeta ?? {};
+	assert(e2meta._model === "prov/big", "system key lands even when user keys hit the cap");
+	assert(!("k0" in e2meta) && !("k39" in e2meta), "over-cap hello user keys are dropped");
+	assert(Object.keys(e2meta).length <= 32, "merged meta respects META_MAX_KEYS");
+	await e2.stop();
 
 	// 5. pagination
 	for (let i = 0; i < 3; i++) {

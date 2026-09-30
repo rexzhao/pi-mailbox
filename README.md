@@ -14,10 +14,18 @@ cross-session agent messaging within a project.
   comments, no deletion (yet). A mail is addressed by the triple
   `{project, session, mail}`; knowing the triple is the capability to read it.
   "Comments" are modeled as new mails that reference the original via `refs`.
+- Session meta is cookie-like key/value data (`Record<string, string>`;
+  keys match `/^[a-zA-Z_][a-zA-Z0-9_.-]{0,63}$/`, values are capped at 512
+  chars, at most 32 user keys and 8 system keys). Keys starting with `_` are
+  system-reserved and set automatically at registration time: `_model`
+  (provider/model), `_pi` (pi version), and — local mode only, not sent to
+  remote services — `_host` and `_platform`. User keys set via `/mailbox set`
+  or `name`/`tag` persist server-side and survive reconnects and host
+  handover; registration-time defaults never overwrite an existing user
+  key. The welcome reply returns the session's full merged meta.
 - Storage is a per-session JSONL event log at
   `<project>/.pi/mailbox/<sessionId>.jsonl` (`send` / `read` / `meta` events),
-  lazily loaded, replayed on service start. Session metadata (display name,
-  tags) persists alongside the mails and survives host handover.
+  lazily loaded, replayed on service start.
 - Lifecycle GC: mailboxes are collected only for sessions whose pi session
   file is gone. Three safety layers, because pi session files are lazily
   created: the GC runs ~30s after the service starts (after reconnecting
@@ -25,17 +33,23 @@ cross-session agent messaging within a project.
   collects files idle for over an hour. Collected files land in
   `<project>/.pi/mailbox/.trash/`; unreadable or empty session directories
   disable the GC entirely.
-- Delivery: while the agent is running, new mail steers a short notice
-  ("你有 N 封新邮件"); while idle, the same message is submitted directly.
-  After reconnect, the unread count is backfilled.
+- Delivery: while the agent is running, a new-mail notice is steered in
+  ("你有 N 封新邮件，请完成当前任务后再用 mailbox_list 查看。"); while idle,
+  the same notice is submitted directly. After reconnect, the unread count
+  is backfilled.
 
 ## Commands
 
 - `/mailbox` — connect (host or client) and list this session's mail (the
   list line is suffixed with `[server]` when this session hosts the service)
 - `/mailbox host:port` — connect to a remote mailbox service
-- `/mailbox name <name>` — set this session's display name (`/mailbox name` shows it)
-- `/mailbox tag <a,b,...>` — set this session's tags (`/mailbox tag` shows them)
+- `/mailbox name <name>` — set this session's display name (persists across
+  reconnects; a name set once is not overwritten by later registration
+  defaults)
+- `/mailbox tag <a,b,...>` — set this session's tags
+- `/mailbox set k=v [k2=v2 ...]` — set meta values (cookie-like key/value)
+- `/mailbox unset k [k2 ...]` — remove meta values
+- `/mailbox meta` — show this session's full meta
 - `/mailbox read <mailId>` — view one mail
 - `/mailbox off` — disconnect
 - `/mailbox status` — connection status
@@ -50,7 +64,7 @@ Activated only while the mailbox is connected (exposure is `deferred` until
   a `cursor` token to fetch older mails
 - `mailbox_read <mail> [session] [project]` — read a mail by triple
 - `mailbox_send <session> <subject> [body] [refs]` — send to an online session
-- `mailbox_sessions` — list online sessions (with name and tags)
+- `mailbox_sessions` — list online sessions (with name, tags, and full meta)
 
 ## Protocol
 

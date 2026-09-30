@@ -1,17 +1,22 @@
 /**
  * pi-mailbox extension.
  *
- * /mailbox            connect (host or client) and list this session's mail
- * /mailbox host:port  connect to a remote mailbox service
- * /mailbox read <id>  view one mail
- * /mailbox off        disconnect
- * /mailbox status     connection status
+ * /mailbox                 connect (host or client) and list this session's mail
+ * /mailbox host:port       connect to a remote mailbox service
+ * /mailbox read <id>       view one mail
+ * /mailbox name <name>     set display name (persists across reconnects)
+ * /mailbox tag <a,b,...>   set tags
+ * /mailbox set k=v ...     set meta values (cookie-like key/value)
+ * /mailbox unset k ...     remove meta values
+ * /mailbox off             disconnect
+ * /mailbox status          connection status
  *
  * Agent tools (activated only while connected): mailbox_list, mailbox_read,
  * mailbox_send, mailbox_sessions.
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { VERSION, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { hostname, platform } from "node:os";
 import { Type } from "typebox";
 import { MailboxConnection } from "./client.ts";
 import type { MailRecord, MailRef } from "./protocol.ts";
@@ -72,7 +77,9 @@ export default function (pi: ExtensionAPI) {
 
 	function inject(unread: number): void {
 		if (!interactive) return;
-		const text = `[mailbox] 你有 ${unread} 封新邮件，可用 mailbox_list 查看。`;
+		const text = busy
+			? `[mailbox] 你有 ${unread} 封新邮件，请完成当前任务后再用 mailbox_list 查看。`
+			: `[mailbox] 你有 ${unread} 封新邮件，可用 mailbox_list 查看。`;
 		try {
 			pi.sendUserMessage(text, busy ? { deliverAs: "steer" } : undefined);
 		} catch {
@@ -81,13 +88,27 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	async function startConnection(
-		ctx: { sessionManager: { getSessionId(): string; getCwd(): string; getSessionDir(): string } },
+		ctx: {
+			sessionManager: { getSessionId(): string; getCwd(): string; getSessionDir(): string };
+			model?: { id: string; provider: string } | undefined;
+		},
 		remoteUrl: string | null,
 	): Promise<MailboxConnection> {
 		await conn?.stop();
 		conn = null;
 		const session = ctx.sessionManager.getSessionId();
 		const agent = pi.getSessionName() ?? session.slice(0, 8);
+		// registration-time auto meta: system keys (leading `_`) refresh on every
+		// connect; they cannot be set manually. `_host`/`_platform` are local-only:
+		// remote services should not learn machine details.
+		const helloMeta: Record<string, string> = {
+			_pi: VERSION,
+		};
+		if (!remoteUrl) {
+			helloMeta._host = hostname();
+			helloMeta._platform = platform();
+		}
+		if (ctx.model) helloMeta._model = `${ctx.model.provider}/${ctx.model.id}`;
 		const connection = new MailboxConnection(
 			remoteUrl ? "remote" : "local",
 			ctx.sessionManager.getCwd(),
@@ -99,8 +120,11 @@ export default function (pi: ExtensionAPI) {
 				onConnected: () => activateTools(true),
 				onDisconnected: () => activateTools(false),
 			},
-			// session dir for orphan-mailbox GC (no effect when connecting as client)
-			{ sessionsDir: ctx.sessionManager.getSessionDir() },
+			{
+				// session dir for orphan-mailbox GC (no effect when connecting as client)
+				sessionsDir: ctx.sessionManager.getSessionDir(),
+				helloMeta,
+			},
 		);
 		conn = connection;
 		await connection.start();
@@ -142,27 +166,58 @@ export default function (pi: ExtensionAPI) {
 			let remoteUrl: string | null = null;
 			let readId: string | null = null;
 			let moreCursor: string | null = null;
-			let metaUpdate: { name?: string | null; tags?: string[] } | null = null;
+			let metaUpdate: { set?: Record<string, string>; unset?: string[] } | null = null;
 			if (arg.startsWith("read ")) {
 				readId = arg.slice(5).trim();
 			} else if (arg.startsWith("more ")) {
 				moreCursor = arg.slice(5).trim();
 			} else if (arg.startsWith("name ")) {
-				metaUpdate = { name: arg.slice(5).trim() };
+				metaUpdate = { set: { name: arg.slice(5).trim() } };
 			} else if (arg.startsWith("tag ")) {
 				const tags = arg
 					.slice(4)
 					.split(",")
 					.map((t) => t.trim())
 					.filter((t) => t.length > 0);
-				metaUpdate = { tags };
-			} else if (arg === "name" || arg === "tag") {
+				metaUpdate = { set: { tags: tags.join(",") } };
+			} else if (arg.startsWith("set ")) {
+				const set: Record<string, string> = {};
+				for (const pair of arg.slice(4).trim().split(/\s+/)) {
+					const eq = pair.indexOf("=");
+					if (eq <= 0) {
+						ctx.ui.notify("Usage: /mailbox set k=v [k2=v2 ...]", "warning");
+						return;
+					}
+					const key = pair.slice(0, eq);
+					if (key.startsWith("_")) {
+						ctx.ui.notify("mailbox: keys starting with _ are system-reserved", "warning");
+						return;
+					}
+					set[key] = pair.slice(eq + 1);
+				}
+				metaUpdate = { set };
+			} else if (arg.startsWith("unset ")) {
+				const keys = arg
+					.slice(6)
+					.trim()
+					.split(/\s+/)
+					.filter((k) => k.length > 0);
+				if (keys.length === 0) {
+					ctx.ui.notify("Usage: /mailbox unset k [k2 ...]", "warning");
+					return;
+				}
+				if (keys.some((k) => k.startsWith("_"))) {
+					ctx.ui.notify("mailbox: keys starting with _ are system-reserved", "warning");
+					return;
+				}
+				metaUpdate = { unset: keys };
+			} else if (arg === "name" || arg === "tag" || arg === "meta") {
 				// show current metadata below
 			} else if (arg !== "") {
 				const m = /^([A-Za-z0-9.-]+):(\d+)$/.exec(arg);
 				if (!m) {
 					ctx.ui.notify(
-						"Usage: /mailbox [host:port | name <n> | tag <a,b> | read <id> | more <cursor> | off | status]",
+						"Usage: /mailbox [host:port | name <n> | tag <a,b> | set k=v | unset k | read <id> | more <cursor> | off | status]",
 						"warning",
 					);
 					return;
@@ -185,19 +240,23 @@ export default function (pi: ExtensionAPI) {
 				const c = requireConnection();
 				if (metaUpdate) {
 					await c.mailbox.setMeta(metaUpdate);
-					const desc =
-						metaUpdate.name !== undefined
-							? `name = ${metaUpdate.name ?? "(cleared)"}`
-							: `tags = ${metaUpdate.tags!.join(",") || "(none)"}`;
+					const desc = metaUpdate.set
+						? Object.entries(metaUpdate.set)
+								.map(([k, v]) => `${k} = ${v || "(empty)"}`)
+								.join(", ")
+						: `unset ${metaUpdate.unset!.join(", ")}`;
 					ctx.ui.notify(`mailbox: ${desc}`, "info");
 					return;
 				}
-				if (arg === "name" || arg === "tag") {
-					const own = (await c.mailbox.sessions()).find((s) => s.session === c.session);
-					ctx.ui.notify(
-						`mailbox: name = ${own?.name ?? "(none)"}, tags = ${own?.tags?.join(",") || "(none)"}`,
-						"info",
-					);
+				if (arg === "name" || arg === "tag" || arg === "meta") {
+					const meta = c.mailbox.sessionMeta ?? {};
+					const text =
+						Object.keys(meta).length === 0
+							? "mailbox: no meta set"
+							: `mailbox: ${Object.entries(meta)
+									.map(([k, v]) => `${k}=${v}`)
+									.join("\n         ")}`;
+					ctx.ui.notify(text, "info");
 					return;
 				}
 				if (readId) {
@@ -324,7 +383,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "mailbox_sessions",
 		label: "Mailbox sessions",
-		description: "List sessions currently online in this project's mailbox, with their name and tags.",
+		description: "List sessions currently online in this project's mailbox, with their name, tags, and other meta (model, host, ...).",
 		parameters: Type.Object({}),
 		exposure: "deferred",
 		async execute(_toolCallId) {
@@ -336,7 +395,11 @@ export default function (pi: ExtensionAPI) {
 						.map((s) => {
 							const name = s.name ? `  name=${s.name}` : "";
 							const tags = s.tags && s.tags.length > 0 ? `  tags=${s.tags.join(",")}` : "";
-							return `${s.session}  ${s.agent}${name}${tags}`;
+							const extra = Object.entries(s.meta ?? {})
+								.filter(([k]) => k !== "name" && k !== "tags")
+								.map(([k, v]) => `  ${k}=${v}`)
+								.join("");
+							return `${s.session}  ${s.agent}${name}${tags}${extra}`;
 						})
 						.join("\n");
 			return {

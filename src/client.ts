@@ -28,6 +28,8 @@ export class MailboxClient {
 	private ws: WebSocket | null = null;
 	private nextRid = 1;
 	private readonly pending = new Map<number, { resolve: (msg: ServerMsg) => void; reject: (err: Error) => void }>();
+	/** This session's full meta as of the last successful registration (from the welcome reply). */
+	sessionMeta: Record<string, string> | null = null;
 	/** Project UUID, learned from the welcome reply. */
 	project: string | null = null;
 	/** Set when closed on purpose; suppresses reconnect handling in the caller. */
@@ -36,6 +38,7 @@ export class MailboxClient {
 	private readonly url: string;
 	private readonly session: string;
 	private readonly agent: string;
+	private readonly helloMeta: Record<string, string> | undefined;
 	private readonly onNotify: (unread: number) => void;
 	private readonly onUnexpectedClose: () => void;
 
@@ -45,10 +48,12 @@ export class MailboxClient {
 		agent: string,
 		onNotify: (unread: number) => void,
 		onUnexpectedClose: () => void,
+		helloMeta?: Record<string, string>,
 	) {
 		this.url = url;
 		this.session = session;
 		this.agent = agent;
+		this.helloMeta = helloMeta;
 		this.onNotify = onNotify;
 		this.onUnexpectedClose = onUnexpectedClose;
 	}
@@ -128,13 +133,15 @@ export class MailboxClient {
 	}
 
 	private hello(): Promise<void> {
-		return this.request<{ project: string }>({
+		return this.request<{ project: string; meta?: Record<string, string> }>({
 			t: "hello",
 			rid: this.nextRid++,
 			session: this.session,
 			agent: this.agent,
+			meta: this.helloMeta,
 		}).then((reply) => {
 			this.project = reply.project;
+			this.sessionMeta = reply.meta ?? null;
 		});
 	}
 
@@ -157,12 +164,28 @@ export class MailboxClient {
 		}).then((reply) => reply.sessions);
 	}
 
-	setMeta(update: { name?: string | null; tags?: string[] }): Promise<void> {
+	setMeta(update: { set?: Record<string, string>; unset?: string[] }): Promise<void> {
 		return this.request<unknown>({
 			t: "meta",
 			rid: this.nextRid++,
-			...update,
-		}).then(() => undefined);
+			set: update.set,
+			unset: update.unset,
+		}).then(() => {
+			// keep the local view in sync so /mailbox meta reflects changes
+			// without a reconnect
+			if (this.sessionMeta) {
+				if (update.set) {
+					for (const [key, value] of Object.entries(update.set)) {
+						this.sessionMeta[key] = value;
+					}
+				}
+				if (update.unset) {
+					for (const key of update.unset) {
+						delete this.sessionMeta[key];
+					}
+				}
+			}
+		});
 	}
 
 	sendMail(target: AgentRef, subject: string, body: string, refs?: MailRef[]): Promise<MailRef> {
@@ -218,6 +241,8 @@ export interface ConnectionOptions {
 	/** GC tuning (tests); see ServiceOptions. */
 	gcDelayMs?: number;
 	gcGraceMs?: number;
+	/** Registration-time meta defaults: system keys (`_`-prefixed) refresh on every connect; user keys apply only when absent. */
+	helloMeta?: Record<string, string>;
 }
 
 export class MailboxConnection {
@@ -359,6 +384,7 @@ export class MailboxConnection {
 					this.scheduleReconnect(this.generation);
 				}
 			},
+			this.options?.helloMeta,
 		);
 		await client.connect();
 		this.client = client;

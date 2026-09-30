@@ -8,6 +8,11 @@ import { randomUUID } from "node:crypto";
 import { WebSocketServer, WebSocket } from "ws";
 import {
 	SESSION_ID_RE,
+	META_KEY_RE,
+	META_VALUE_MAX,
+	META_MAX_KEYS,
+	META_MAX_SYSTEM_KEYS,
+	TAG_RE,
 	type AgentRef,
 	type ClientMsg,
 	type MailRecord,
@@ -44,6 +49,34 @@ function parseInboxCursor(cursor: string): InboxCursor | null {
 function sortsAtOrNewerThan(mail: { createdAt: string; id: string }, cursor: InboxCursor): boolean {
 	if (mail.createdAt !== cursor.createdAt) return mail.createdAt > cursor.createdAt;
 	return mail.id >= cursor.id;
+}
+
+/** Validate a meta map. `allowSystem` permits system keys (leading `_`), used for hello-time auto values. */
+function validateMetaMap(map: Record<string, string>, allowSystem: boolean): boolean {
+	if (typeof map !== "object" || map === null) return false;
+	for (const [key, value] of Object.entries(map)) {
+		if (!META_KEY_RE.test(key)) return false;
+		if (key.startsWith("_") && !allowSystem) return false;
+		if (typeof value !== "string" || value.length > META_VALUE_MAX) return false;
+	}
+	return true;
+}
+
+function validateUnset(keys: string[]): boolean {
+	return (
+		Array.isArray(keys) && keys.length <= META_MAX_KEYS && keys.every((key) => META_KEY_RE.test(key) && !key.startsWith("_"))
+	);
+}
+
+/** Parse the reserved `tags` value (comma-separated). Returns null when absent or invalid. */
+function parseTags(value: string | undefined): string[] | null {
+	if (typeof value !== "string") return null;
+	const tags = value
+		.split(",")
+		.map((t) => t.trim())
+		.filter((t) => t.length > 0);
+	if (tags.length > 32 || tags.some((t) => !TAG_RE.test(t))) return null;
+	return tags;
 }
 
 interface ConnInfo {
@@ -150,6 +183,7 @@ export class MailboxService {
 			void this.handleMessage(ws, msg).catch((err) => {
 				this.reply(ws, {
 					t: "error",
+					rid: typeof msg.rid === "number" ? msg.rid : undefined,
 					code: "internal",
 					message: err instanceof Error ? err.message : String(err),
 				});
@@ -197,14 +231,64 @@ export class MailboxService {
 				}
 				this.conns.set(ws, { session: msg.session, agent: msg.agent });
 				this.online.set(msg.session, ws);
+
+				// merge registration-time meta (best-effort, per-key):
+				// - invalid keys/values are skipped individually, not fatal
+				// - system keys (leading `_`) refresh on every hello, but only
+				//   when the value actually changed (avoids JSONL churn on reconnect)
+				// - user keys only apply when absent (Object.hasOwn, so inherited
+				//   Object.prototype members are not mistaken for existing values)
+				// - caps are counted separately: user keys <= META_MAX_KEYS,
+				//   system keys <= META_MAX_SYSTEM_KEYS
+				// - the hello's system keyset is authoritative: stored system keys
+				//   absent from this hello are unset (bounds accumulation)
+				const state = await this.store.state(msg.session);
+				if (typeof msg.meta === "object" && msg.meta !== null) {
+					const set: Record<string, string> = {};
+					let sysCount = 0;
+					const sysKept = new Set<string>();
+					for (const [key, value] of Object.entries(msg.meta)) {
+						if (!META_KEY_RE.test(key)) continue;
+						if (typeof value !== "string" || value.length > META_VALUE_MAX) continue;
+						if (key.startsWith("_")) {
+							if (sysCount >= META_MAX_SYSTEM_KEYS) continue;
+							sysCount++;
+							sysKept.add(key);
+							if (state.meta.values[key] !== value) set[key] = value;
+						} else if (!Object.hasOwn(state.meta.values, key)) {
+							set[key] = value;
+						}
+					}
+					const mergedUser = new Set(
+							Object.keys(state.meta.values).filter((key) => !key.startsWith("_")),
+						);
+					for (const key of Object.keys(set)) {
+							if (!key.startsWith("_")) mergedUser.add(key);
+						}
+					if (mergedUser.size > META_MAX_KEYS) {
+						for (const key of Object.keys(set)) {
+							if (!key.startsWith("_")) delete set[key];
+						}
+					}
+					// authoritative unset: judged against the accepted system keyset
+					// (sysKept), so keys truncated by the cap also converge away
+					const unset = Object.keys(state.meta.values).filter(
+						(key) => key.startsWith("_") && !sysKept.has(key),
+					);
+					if (Object.keys(set).length > 0 || unset.length > 0) {
+						await this.store.appendMeta(msg.session, { set, unset });
+					}
+				}
+
 				this.reply(ws, {
 					t: "welcome",
 					rid: msg.rid,
 					project: this.projectId,
 					instanceId: this.instanceId,
+					meta: { ...state.meta.values },
 				});
 				// backfill: report unread count immediately after registration
-				const inbox = await this.store.inbox(msg.session);
+				const inbox = state.mails;
 				const unread = MailStore.unreadCount(inbox);
 				if (unread > 0) this.reply(ws, { t: "notify", unread });
 				return;
@@ -220,8 +304,9 @@ export class MailboxService {
 					sessions.push({
 						session,
 						agent: info.agent,
-						name: state.meta.name,
-						tags: state.meta.tags,
+						name: state.meta.values.name,
+						tags: state.meta.values.tags !== undefined ? (parseTags(state.meta.values.tags) ?? undefined) : undefined,
+						meta: { ...state.meta.values },
 					});
 				}
 				this.reply(ws, { t: "sessions", rid: msg.rid, sessions });
@@ -234,32 +319,51 @@ export class MailboxService {
 					this.reply(ws, { t: "error", rid: msg.rid, code: "not_registered", message: "hello first" });
 					return;
 				}
-				const update: { name?: string | null; tags?: string[] } = {};
-				if (msg.name !== undefined) {
-						if (msg.name !== null && (typeof msg.name !== "string" || msg.name.length > 128)) {
-							this.reply(ws, { t: "error", rid: msg.rid, code: "bad_meta", message: "invalid name" });
-							return;
-					}
-					update.name = msg.name;
-				}
-				if (msg.tags !== undefined) {
-						if (
-							!Array.isArray(msg.tags) ||
-							msg.tags.length > 32 ||
-							msg.tags.some((tag) => typeof tag !== "string" || !/^[A-Za-z0-9_.-]{1,64}$/.test(tag))
-						) {
-							this.reply(ws, { t: "error", rid: msg.rid, code: "bad_meta", message: "invalid tags" });
-							return;
-						}
-						update.tags = msg.tags;
-					}
-					if (update.name === undefined && update.tags === undefined) {
-						this.reply(ws, { t: "error", rid: msg.rid, code: "bad_meta", message: "nothing to update" });
-						return;
-					}
-					await this.store.appendMeta(from.session, update);
-					this.reply(ws, { t: "meta", rid: msg.rid });
+				const update: { set?: Record<string, string>; unset?: string[] } = {};
+				// user-facing op: system keys (leading `_`) cannot be written here
+				if (msg.set !== undefined && !validateMetaMap(msg.set, false)) {
+					this.reply(ws, { t: "error", rid: msg.rid, code: "bad_meta", message: "invalid set" });
 					return;
+				}
+				if (msg.unset !== undefined && !validateUnset(msg.unset)) {
+					this.reply(ws, { t: "error", rid: msg.rid, code: "bad_meta", message: "invalid unset" });
+					return;
+				}
+				if (msg.set?.tags !== undefined && parseTags(msg.set.tags) === null) {
+					this.reply(ws, { t: "error", rid: msg.rid, code: "bad_meta", message: "invalid tags value" });
+					return;
+				}
+				const setCount = msg.set ? Object.keys(msg.set).length : 0;
+				const unsetCount = msg.unset ? msg.unset.length : 0;
+				if (setCount === 0 && unsetCount === 0) {
+					this.reply(ws, { t: "error", rid: msg.rid, code: "bad_meta", message: "nothing to update" });
+					return;
+				}
+				const state = await this.store.state(from.session);
+				// the cap counts user keys only; system keys are bounded at
+				// registration time (META_MAX_SYSTEM_KEYS)
+				const currentCount = Object.keys(state.meta.values).filter((key) => !key.startsWith("_")).length;
+				const nextKeys = new Set(
+					Object.keys(state.meta.values).filter((key) => !key.startsWith("_")),
+				);
+				if (msg.set) for (const key of Object.keys(msg.set)) nextKeys.add(key);
+				if (msg.unset) for (const key of msg.unset) nextKeys.delete(key);
+				// reject only when the update would grow beyond the cap; shrinking
+				// an over-cap state (e.g. written by an older version) stays allowed
+				if (nextKeys.size > META_MAX_KEYS && nextKeys.size > currentCount) {
+					this.reply(ws, {
+						t: "error",
+						rid: msg.rid,
+						code: "bad_meta",
+						message: `too many meta keys (max ${META_MAX_KEYS})`,
+					});
+					return;
+				}
+				if (setCount > 0) update.set = msg.set;
+				if (unsetCount > 0) update.unset = msg.unset;
+				await this.store.appendMeta(from.session, update);
+				this.reply(ws, { t: "meta", rid: msg.rid });
+				return;
 			}
 
 			case "send": {
