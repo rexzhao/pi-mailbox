@@ -216,7 +216,7 @@ export default function (pi: ExtensionAPI) {
 				const role = c.isHost ? " [server]" : "";
 				const more = nextCursor ? `\n(older mails: /mailbox more ${nextCursor})` : "";
 				ctx.ui.notify(
-					`mailbox: ${unread} unread / ${mails.length} shown${role}\n${formatMailList(mails)}${more}`,
+					`mailbox: 页内 ${unread} 未读 / 显示 ${mails.length} 封${role}\n${formatMailList(mails)}${more}`,
 					"info",
 				);
 			} catch (err) {

@@ -125,6 +125,27 @@ try {
 	}
 	assert(badCursorErr && String(badCursorErr).includes("bad_cursor"), "invalid cursor errors");
 
+	// 5b. cursor continuation when the cursor mail leaves the filtered set:
+	// unreadOnly pages, then the cursor mail gets marked read mid-pagination
+	const u1 = await c.mailbox.inbox({ unreadOnly: true }, { limit: 1 });
+	assert(u1.mails.length === 1 && u1.mails[0].subject === "mail-2" && u1.nextCursor, "unread page 1");
+	await c.mailbox.read({ project: reg.projectId, session: "sessionC", mail: u1.mails[0].id });
+	const u2 = await c.mailbox.inbox({ unreadOnly: true }, { limit: 10, cursor: u1.nextCursor });
+	assert(
+		u2.mails.map((m) => m.subject).join(",") === "mail-1,mail-0",
+		"cursor skips at-or-newer positions even when the cursor mail left the set (no repeat, no restart)",
+	);
+
+	// 5c. refs validation: non-array and null elements
+	let badRefsErr = null;
+	try {
+		// bypass client typing deliberately
+		await c.mailbox.sendMail({ project: reg.projectId, session: "sessionB" }, "x", "y", [null]);
+	} catch (e) {
+		badRefsErr = e;
+	}
+	assert(badRefsErr && String(badRefsErr).includes("bad_send"), "null ref element rejected as bad_send");
+
 	// 6. offline target errors
 	let err = null;
 	try {

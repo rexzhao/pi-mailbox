@@ -40,6 +40,12 @@ function parseInboxCursor(cursor: string): InboxCursor | null {
 	}
 }
 
+/** True when `mail` sorts at or newer than `cursor` in the descending inbox order. */
+function sortsAtOrNewerThan(mail: { createdAt: string; id: string }, cursor: InboxCursor): boolean {
+	if (mail.createdAt !== cursor.createdAt) return mail.createdAt > cursor.createdAt;
+	return mail.id >= cursor.id;
+}
+
 interface ConnInfo {
 	session: string;
 	agent: string;
@@ -301,6 +307,8 @@ export class MailboxService {
 					refs.length > 16 ||
 					refs.some(
 						(r) =>
+							typeof r !== "object" ||
+							r === null ||
 							typeof r.project !== "string" ||
 							typeof r.session !== "string" ||
 							typeof r.mail !== "string" ||
@@ -344,7 +352,11 @@ export class MailboxService {
 				// newest first; (createdAt, id) is a stable total order
 				mails.sort((a, b) => (a.createdAt > b.createdAt ? -1 : a.createdAt < b.createdAt ? 1 : a.id > b.id ? -1 : 1));
 
-				// cursor: position after which to continue (exclusive), newest first
+				// cursor: continue strictly after this position (exclusive), newest
+				// first. Position-based, not identity-based: skip everything that
+				// sorts at or newer than the cursor, so a cursor mail that has since
+				// left the filtered set (e.g. marked read under unreadOnly) still
+				// paginates without repeats or restarts.
 				let start = 0;
 				if (msg.cursor !== undefined) {
 					const cursor = parseInboxCursor(msg.cursor);
@@ -352,8 +364,7 @@ export class MailboxService {
 						this.reply(ws, { t: "error", rid: msg.rid, code: "bad_cursor", message: "invalid cursor" });
 						return;
 					}
-					const idx = mails.findIndex((m) => m.createdAt === cursor.createdAt && m.id === cursor.id);
-					start = idx >= 0 ? idx + 1 : 0;
+					while (start < mails.length && sortsAtOrNewerThan(mails[start], cursor)) start++;
 				}
 
 				const limit = Math.min(Math.max(1, msg.limit ?? DEFAULT_INBOX_LIMIT), MAX_INBOX_LIMIT);
