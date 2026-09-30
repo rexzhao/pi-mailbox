@@ -1,0 +1,26 @@
+{
+	"name": "pi-mailbox",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"description": "Mailbox service and pi extension for cross-session agent messaging",
+	"scripts": {
+		"check": "tsc --noEmit"
+	},
+	"pi": {
+		"extensions": [
+			"./src/index.ts"
+		]
+	},
+	"dependencies": {
+		"ws": "8.22.0"
+	},
+	"devDependencies": {
+		"@types/ws": "8.18.2",
+		"typescript": "5.9.3"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*",
+		"typebox": "*"
+	}
+}
