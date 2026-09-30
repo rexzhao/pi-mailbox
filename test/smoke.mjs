@@ -136,7 +136,7 @@ try {
 		"cursor skips at-or-newer positions even when the cursor mail left the set (no repeat, no restart)",
 	);
 
-	// 5c. refs validation: non-array and null elements
+	// 5c. refs validation: null elements and non-array refs
 	let badRefsErr = null;
 	try {
 		// bypass client typing deliberately
@@ -145,6 +145,36 @@ try {
 		badRefsErr = e;
 	}
 	assert(badRefsErr && String(badRefsErr).includes("bad_send"), "null ref element rejected as bad_send");
+	let nonArrayRefsErr = null;
+	try {
+		await c.mailbox.sendMail({ project: reg.projectId, session: "sessionB" }, "x", "y", "nope");
+	} catch (e) {
+		nonArrayRefsErr = e;
+	}
+	assert(nonArrayRefsErr && String(nonArrayRefsErr).includes("bad_send"), "non-array refs rejected as bad_send");
+
+	// 5d. cursor position semantics (locks position-based continuation):
+	// a cursor NEWER than every mail means all mails are strictly older —
+	// they are returned (same as the cursor-mail-left-the-set case in 5b);
+	// a cursor OLDER than every mail means everything is at-or-newer — empty page
+	const futureCursor = Buffer.from(
+		JSON.stringify({ createdAt: "2999-01-01T00:00:00.000Z", id: "ffffffff" }),
+		"utf8",
+	).toString("base64url");
+	const beyondPage = await c.mailbox.inbox(undefined, { cursor: futureCursor });
+	assert(
+		beyondPage.mails.length > 0 && beyondPage.mails[0].subject === "mail-2",
+		"cursor newer than all mails returns the strictly-older mails",
+	);
+	const pastCursor = Buffer.from(
+		JSON.stringify({ createdAt: "2000-01-01T00:00:00.000Z", id: "00000000" }),
+		"utf8",
+	).toString("base64url");
+	const exhaustedPage = await c.mailbox.inbox(undefined, { cursor: pastCursor });
+	assert(
+		exhaustedPage.mails.length === 0 && !exhaustedPage.nextCursor,
+		"cursor older than all mails returns empty page with no cursor",
+	);
 
 	// 6. offline target errors
 	let err = null;
