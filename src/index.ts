@@ -335,11 +335,18 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			try {
-				// only explicit host:port connects; everything else requires
-				// an existing connection (run /mailbox start service first)
+				// host:port always (re)connects; otherwise connect only when
+				// the daemon is already running (never spawn — use
+				// /mailbox start service to start the daemon)
 				if (remote) {
 					const connection = await startConnection(ctx, remote);
 					ctx.ui.notify(`mailbox: connected`, "info");
+				} else if (!conn?.connected) {
+					const endpoint = await connectLocalDaemonIfRunning();
+					if (endpoint) {
+						const connection = await startConnection(ctx, null);
+						ctx.ui.notify(`mailbox: connected`, "info");
+					}
 				}
 				const c = requireConnection();
 				if (metaUpdate) {
