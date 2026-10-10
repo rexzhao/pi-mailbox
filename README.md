@@ -71,8 +71,10 @@ cross-session agent messaging within a project.
 
 ## Agent tools
 
-Activated only while the mailbox is connected (exposure is `deferred` until
-`/mailbox` succeeds):
+`mailbox_connect` is declared from the start so the agent can enable the
+mailbox on its own when it needs to talk to other sessions; calling it
+connects and activates the tools below (they are `deferred` until then,
+or until the user runs `/mailbox`):
 
 - `mailbox_list [unreadOnly] [since] [limit] [cursor]` — list this session's
   mail, newest first, paginated (default page 20, max 100); the reply carries

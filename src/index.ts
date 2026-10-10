@@ -149,8 +149,20 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function requireConnection(): MailboxConnection {
-		if (!conn?.connected) throw new Error("mailbox not connected; run /mailbox first");
+		if (!conn?.connected) throw new Error("mailbox not connected; run /mailbox or the mailbox_connect tool first");
 		return conn;
+	}
+
+	async function statusSummary(c: MailboxConnection): Promise<string> {
+		const { total, totalUnread } = await c.mailbox.inbox();
+		let onlinePart = "";
+		try {
+			const online = (await c.mailbox.sessions()).filter((s) => s.online).length;
+			onlinePart = `, ${online} clients online`;
+		} catch {
+			// best-effort; keep the mail counts when the sessions query fails
+		}
+		return `${total} mails (${totalUnread} unread)${onlinePart}, role: ${c.isHost ? "server" : "client"}`;
 	}
 
 	// -----------------------------------------------------------------------
@@ -304,25 +316,12 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				const showList = arg === "list" || arg === "list mail" || moreCursor !== null;
-				const { mails, nextCursor, total, totalUnread } = await c.mailbox.inbox(undefined, {
-					cursor: moreCursor ?? undefined,
-				});
+				const { mails, nextCursor } = await c.mailbox.inbox(undefined, { cursor: moreCursor ?? undefined });
 				const unread = mails.filter((m) => !m.readAt).length;
 				const role = c.isHost ? "server" : "client";
 				if (!showList) {
-					// plain /mailbox (or a fresh host:port connect): one status line;
-					// the client count is best-effort — omit it if the query fails
-					let onlinePart = "";
-					try {
-						const online = (await c.mailbox.sessions()).filter((s) => s.online).length;
-						onlinePart = `, ${online} clients online`;
-					} catch {
-						// keep the mail counts even when sessions fails
-					}
-					ctx.ui.notify(
-						`mailbox: ${total} mails (${totalUnread} unread)${onlinePart}, role: ${role} — /mailbox list to view`,
-						"info",
-					);
+					// plain /mailbox (or a fresh host:port connect): one status line
+					ctx.ui.notify(`mailbox: ${await statusSummary(c)} — /mailbox list to view`, "info");
 					return;
 				}
 				const more = nextCursor ? `
@@ -341,6 +340,45 @@ ${formatMailList(mails)}${more}`,
 	// -----------------------------------------------------------------------
 	// agent tools (deferred; activated while connected)
 	// -----------------------------------------------------------------------
+
+	pi.registerTool({
+		name: "mailbox_connect",
+		label: "Mailbox connect",
+		description:
+			"Connect this session to the project's mailbox and activate the mailbox tools " +
+			"(mailbox_list, mailbox_read, mailbox_send, mailbox_reply, mailbox_sessions). Use this " +
+			"when you need to communicate with other Pi agent sessions in this project: send or " +
+			"reply to mail, check your inbox, or discover peer sessions. After connecting, incoming " +
+			"mail is announced as notifications and the other mailbox tools become available. " +
+			"Returns a status summary (mail counts, online clients, host/client role).",
+		parameters: Type.Object({}),
+		// default exposure (direct, active): the model must see this tool so it
+		// can enable the mailbox on its own; it is not part of TOOL_NAMES, so
+		// activation toggling never withdraws it
+		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+			if (conn?.connected) {
+				const summary = await statusSummary(conn);
+				return {
+					content: [{ type: "text", text: `mailbox already connected: ${summary}` }],
+					details: { alreadyConnected: true },
+				};
+			}
+			if (ctx.mode !== "tui" && ctx.mode !== "rpc") {
+				throw new Error("mailbox: local hosting requires interactive mode; ask the user to run /mailbox");
+			}
+			const connection = await startConnection(ctx, null);
+			const summary = await statusSummary(connection);
+			return {
+				content: [
+					{
+						type: "text",
+						text: `mailbox connected: ${summary}. The mailbox tools (mailbox_list, mailbox_read, mailbox_send, mailbox_reply, mailbox_sessions) are now active.`,
+					},
+				],
+				details: { alreadyConnected: false, role: connection.isHost ? "server" : "client" },
+			};
+		},
+	});
 
 	pi.registerTool({
 		name: "mailbox_list",
