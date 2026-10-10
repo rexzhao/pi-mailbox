@@ -90,6 +90,12 @@ type ReadMsg struct {
 	Mail MailRef `json:"mail"`
 }
 
+type ShutdownMsg struct {
+	T     string `json:"t"`
+	Rid   int    `json:"rid"`
+	Token string `json:"token,omitempty"`
+}
+
 // ---- server -> client ----
 
 type PongMsg struct {

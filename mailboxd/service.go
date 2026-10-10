@@ -156,6 +156,8 @@ func (c *conn) handleMessage(t string, rid int, data []byte) error {
 		return c.handleInbox(rid, data)
 	case "read":
 		return c.handleRead(rid, data)
+	case "shutdown":
+		return c.handleShutdown(rid, data)
 	default:
 		ridCopy := rid
 		c.send(ErrorReply{T: "error", Rid: &ridCopy, Code: "bad_msg", Message: "unknown message type"})
@@ -592,6 +594,23 @@ func (c *conn) handleInbox(rid int, data []byte) error {
 		reply.NextCursor = encodeInboxCursor(page[len(page)-1])
 	}
 	c.send(reply)
+	return nil
+}
+
+// handleShutdown gracefully stops the daemon: reply first, then cancel the
+// run context so the unified cleanup path runs (close conns, clear registry,
+// release the lock). Requires the token when the daemon has one.
+func (c *conn) handleShutdown(rid int, data []byte) error {
+	var msg ShutdownMsg
+	if err := json.Unmarshal(data, &msg); err != nil {
+		return c.errorReply(rid, "bad_shutdown", "unparsable shutdown")
+	}
+	if c.daemon.AuthToken != "" && !secureTokenEqual(msg.Token, c.daemon.AuthToken) {
+		return c.errorReply(rid, "unauthorized", "invalid token")
+	}
+	c.send(MetaReply{T: "shutdown_ack", Rid: rid})
+	log.Printf("shutdown requested via protocol; stopping")
+	c.daemon.shutdown()
 	return nil
 }
 

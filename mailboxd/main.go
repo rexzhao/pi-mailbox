@@ -42,11 +42,16 @@ func main() {
 		registryF = flag.String("registry", defaultRegistryPath(), "registry file recording the daemon address")
 		lockF     = flag.String("lock", defaultLockPath(), "leader lock file")
 		printVer  = flag.Bool("version", false, "print version and exit")
+		stopFlag  = flag.Bool("stop", false, "stop the running daemon (via the shutdown protocol)")
 	)
 	flag.Parse()
 	if *printVer {
 		fmt.Println("mailboxd", ProtocolVersion)
 		return
+	}
+
+	if *stopFlag {
+		os.Exit(stopDaemon(*registryF, *token))
 	}
 
 	// resolve mode
@@ -161,7 +166,8 @@ type Daemon struct {
 	conns     map[*conn]struct{}  // all authenticated connections
 	idleSince time.Time           // zero when clients are connected
 
-	flk *flock.Flock
+	flk    *flock.Flock
+	cancel context.CancelFunc
 }
 
 // Run elects, listens, and serves until the process exits (error, signal, or
@@ -203,6 +209,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	d.cancel = cancel
 
 	httpSrv := &http.Server{Handler: d.httpHandler()}
 	serveErrCh := make(chan error, 1)
@@ -238,6 +245,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 		log.Printf("shutdown complete")
 	}
 	return serveErr
+}
+
+// shutdown triggers the unified cleanup path (used by the protocol handler).
+func (d *Daemon) shutdown() {
+	if d.cancel != nil {
+		d.cancel()
+	}
 }
 
 func modeName(remote bool) string {
