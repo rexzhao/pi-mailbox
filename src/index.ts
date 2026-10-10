@@ -505,7 +505,7 @@ ${formatMailList(mails)}${more}`,
 		exposure: "deferred",
 		async execute(_toolCallId, params) {
 			const c = requireConnection();
-			const own = { project: c.mailbox.project!, session: c.session };
+			const own = { project: c.mailbox.project!, session: c.shortSession };
 			const ref: MailRef = {
 				project: params.project ?? own.project,
 				session: params.session ?? own.session,
@@ -573,7 +573,7 @@ ${formatMailList(mails)}${more}`,
 		exposure: "deferred",
 		async execute(_toolCallId, params) {
 			const c = requireConnection();
-			const own = { project: c.mailbox.project!, session: c.session };
+			const own = { project: c.mailbox.project!, session: c.shortSession };
 			const ref: MailRef = {
 				project: params.project ?? own.project,
 				session: params.session ?? own.session,
