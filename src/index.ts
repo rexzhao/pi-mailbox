@@ -58,7 +58,7 @@ function formatMail(mail: MailRecord): string {
 		`date:    ${mail.createdAt}`,
 		`read:    ${mail.readAt ?? "unread"}`,
 	];
-	if (mail.refs.length > 0) {
+	if ((mail.refs ?? []).length > 0) {
 		lines.push(`refs:    ${mail.refs.map((r) => `${r.project}/${r.session}/${r.mail}`).join(", ")}`);
 	}
 	lines.push("", mail.body);

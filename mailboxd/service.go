@@ -439,7 +439,7 @@ func (c *conn) handleSend(rid int, data []byte) error {
 		From:    AgentRef{Project: proj.ID, Session: c.session},
 		Subject: msg.Subject,
 		Body:    msg.Body,
-		Refs:    msg.Refs,
+		Refs:    refsOrNil(msg.Refs),
 	}
 	if err := targetProj.Store.AppendSend(msg.Target.Session, mail); err != nil {
 		return err
@@ -674,4 +674,14 @@ func newUUID() string {
 	b[6] = (b[6] & 0x0f) | 0x40
 	b[8] = (b[8] & 0x3f) | 0x80
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// refsOrNil normalizes nil refs to an empty slice so the JSON wire format
+// and the stored record always carry refs:[] (never null), matching the
+// TS implementation's .
+func refsOrNil(refs []MailRef) []MailRef {
+	if refs == nil {
+		return []MailRef{}
+	}
+	return refs
 }
