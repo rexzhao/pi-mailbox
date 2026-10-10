@@ -25,11 +25,32 @@ import type { MailRecord, MailRef, SessionInfo } from "./protocol.ts";
 
 const TOOL_NAMES = ["mailbox_list", "mailbox_read", "mailbox_send", "mailbox_reply", "mailbox_sessions"] as const;
 
+/** Shared explanation of the external addressing format, embedded in tool output. */
+const ADDRESS_FORMAT_DOC =
+	"Addressing: a mailbox address is 'session@project'; a mail reference is 'session@project/mail' " +
+	"(a bare mail id means your own mailbox). Use mailbox_sessions to list peer addresses.";
+
 /** Parse "session" (own project) or "session@project" into an AgentRef. */
 function parseAddress(addr: string, ownProject: string): { project: string; session: string } {
 	const at = addr.indexOf("@");
 	if (at === -1) return { project: ownProject, session: addr };
 	return { project: addr.slice(at + 1), session: addr.slice(0, at) };
+}
+
+/**
+ * Parse a mail reference: "session@project/mail" (full), "session@project"
+ * is not valid here, or a bare mail id (own mailbox). Returns the MailRef.
+ */
+function parseMailRef(ref: string, own: { project: string; session: string }): { project: string; session: string; mail: string } {
+	const slash = ref.lastIndexOf("/");
+	if (slash === -1) return { ...own, mail: ref };
+	const { project, session } = parseAddress(ref.slice(0, slash), own.project);
+	return { project, session, mail: ref.slice(slash + 1) };
+}
+
+/** Render a mail ref in the external "session@project/mail" form. */
+function formatMailRef(ref: { project: string; session: string; mail: string }): string {
+	return `${ref.session}@${ref.project}/${ref.mail}`;
 }
 
 function formatMailList(mails: MailRecord[]): string {
@@ -61,15 +82,18 @@ function formatSessions(sessions: SessionInfo[]): string {
 		.join("\n");
 }
 
-function formatMail(mail: MailRecord): string {
+function formatMail(mail: MailRecord, ref?: MailRef): string {
 	const lines = [
 		`subject: ${mail.subject}`,
 		`from:    ${mail.from.session}@${mail.from.project}`,
 		`date:    ${mail.createdAt}`,
 		`read:    ${mail.readAt ?? "unread"}`,
 	];
+	if (ref) {
+		lines.push(`ref:     ${formatMailRef(ref)}`);
+	}
 	if ((mail.refs ?? []).length > 0) {
-		lines.push(`refs:    ${mail.refs.map((r) => `${r.session}@${r.project} ${r.mail}`).join(", ")}`);
+		lines.push(`refs:    ${mail.refs.map((r) => `${r.session}@${r.project}/${r.mail}`).join(", ")}`);
 	}
 	lines.push("", mail.body);
 	return lines.join("\n");
@@ -331,7 +355,7 @@ export default function (pi: ExtensionAPI) {
 				const m = /^([A-Za-z0-9.-]+):(\d+)(?:\s+(\S+))?$/.exec(arg);
 				if (!m) {
 					ctx.ui.notify(
-						"Usage: /mailbox [start service | stop service | restart service | off | status | list [client [all]|mail] | meta | name <n> | tag <a,b> | set k=v | unset k | read <id> | more <cursor> | host:port [token]]",
+						"Usage: /mailbox [start service | stop service | restart service | off | status | list [client [all]|mail] | meta | name <n> | tag <a,b> | set k=v | unset k | read <mail-ref> | more <cursor> | host:port [token]]",
 						"warning",
 					);
 					return;
@@ -384,15 +408,13 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				if (readId) {
-					const mail = await c.mailbox.read({
-						project: c.mailbox.project!,
-						session: c.shortSession,
-						mail: readId,
-					});
+					const own = { project: c.mailbox.project!, session: c.shortSession };
+					const ref = parseMailRef(readId, own);
+					const mail = await c.mailbox.read(ref);
 					if (!mail) {
 						ctx.ui.notify(`mailbox: mail ${readId} not found`, "warning");
 					} else {
-						ctx.ui.notify(formatMail(mail), "info");
+						ctx.ui.notify(formatMail(mail, ref), "info");
 					}
 					return;
 				}
@@ -431,7 +453,7 @@ ${formatMailList(mails)}${more}`,
 			"when you need to communicate with other Pi agent sessions in this project: send or " +
 			"reply to mail, check your inbox, or discover peer sessions. After connecting, incoming " +
 			"mail is announced as notifications and the other mailbox tools become available. " +
-			"Returns a status summary (mail counts, online clients).",
+			"Returns a status summary (mail counts, online clients, this session's address).",
 		parameters: Type.Object({}),
 		// default exposure (direct, active): the model must see this tool so it
 		// can enable the mailbox on its own; it is not part of TOOL_NAMES, so
@@ -440,7 +462,7 @@ ${formatMailList(mails)}${more}`,
 			if (conn?.connected) {
 				const summary = await statusSummary(conn);
 				return {
-					content: [{ type: "text", text: `mailbox already connected: ${summary}` }],
+					content: [{ type: "text", text: `mailbox already connected: ${summary}. Your address: ${conn.address}. ${ADDRESS_FORMAT_DOC}` }],
 					details: { alreadyConnected: true },
 				};
 			}
@@ -457,7 +479,7 @@ ${formatMailList(mails)}${more}`,
 				content: [
 					{
 						type: "text",
-						text: `mailbox connected: ${summary}. The mailbox tools (mailbox_list, mailbox_read, mailbox_send, mailbox_reply, mailbox_sessions) are now active.`,
+						text: `mailbox connected: ${summary}. Your address: ${connection.address}. ${ADDRESS_FORMAT_DOC}`,
 					},
 				],
 				details: { alreadyConnected: false },
@@ -497,25 +519,21 @@ ${formatMailList(mails)}${more}`,
 		name: "mailbox_read",
 		label: "Mailbox read",
 		description:
-			"Read a mail. A mail is addressed by its id plus the address of the mailbox " +
-			"holding it ('session@project'); the address defaults to this session's own " +
-			"mailbox. Reading own mail marks it read. Use mailbox_list first to get ids.",
+			"Read a mail. A mail is referenced as 'session@project/mail' (the mailbox " +
+			"address plus the mail id); a bare mail id means this session's own mailbox. " +
+			"Reading own mail marks it read. Use mailbox_list first to get ids.",
 		parameters: Type.Object({
-			mail: Type.String({ description: "Mail id" }),
-			address: Type.Optional(Type.String({ description: "Mailbox address 'session@project' holding the mail (defaults to this session's own mailbox)" })),
+			mail: Type.String({ description: "Mail reference 'session@project/mail'; a bare mail id means your own mailbox" }),
 		}),
 		exposure: "deferred",
 		async execute(_toolCallId, params) {
 			const c = requireConnection();
 			const own = { project: c.mailbox.project!, session: c.shortSession };
-			const ref: MailRef = {
-				...(params.address ? parseAddress(params.address, own.project) : own),
-				mail: params.mail,
-			};
+			const ref = parseMailRef(params.mail, own);
 			const mail = await c.mailbox.read(ref);
 			if (!mail) throw new Error(`mail ${params.mail} not found`);
 			return {
-				content: [{ type: "text", text: formatMail(mail) }],
+				content: [{ type: "text", text: formatMail(mail, ref) }],
 				details: { mail, ref },
 			};
 		},
@@ -531,27 +549,25 @@ ${formatMailList(mails)}${more}`,
 			"is delivered as unread on its next connection (use mailbox_sessions to " +
 			"find sessions). To reply to a mail, prefer mailbox_reply.",
 		parameters: Type.Object({
-			address: Type.String({ description: "Target address 'session@project' (a bare session id means this project; must have registered once)" }),
+			address: Type.String({ description: "Target mailbox address 'session@project'; a bare session id means this project. The session must have registered once (see mailbox_sessions)" }),
 			subject: Type.String({ description: "Subject line" }),
 			body: Type.Optional(Type.String({ description: "Mail body" })),
 			refs: Type.Optional(
 				Type.Array(
-					Type.Object({
-						address: Type.String({ description: "Address of the mailbox holding the referenced mail" }),
-						mail: Type.String({ description: "Mail id of the referenced mail" }),
-					}),
-					{ description: "Mails this mail references (e.g. the mail being replied to)" },
+					Type.String(),
+					{ description: "Referenced mails as 'session@project/mail' (a bare mail id means your own mailbox)" },
 				),
 			),
 		}),
 		exposure: "deferred",
 		async execute(_toolCallId, params) {
 			const c = requireConnection();
-			const target = parseAddress(params.address, c.mailbox.project!);
-			const refs = params.refs?.map((r) => ({ ...parseAddress(r.address, c.mailbox.project!), mail: r.mail }));
+			const own = { project: c.mailbox.project!, session: c.shortSession };
+			const target = parseAddress(params.address, own.project);
+			const refs = params.refs?.map((r) => parseMailRef(r, own));
 			const ref = await c.mailbox.sendMail(target, params.subject, params.body ?? "", refs);
 			return {
-				content: [{ type: "text", text: `sent: ${ref.session}@${ref.project} mail ${ref.mail}` }],
+				content: [{ type: "text", text: `sent: ${formatMailRef(ref)}` }],
 				details: { ref },
 			};
 		},
@@ -565,19 +581,15 @@ ${formatMailList(mails)}${more}`,
 			"original (subject 'Re: <original subject>'). Prefer this over mailbox_send " +
 			"when answering a specific mail.",
 		parameters: Type.Object({
-			mail: Type.String({ description: "Mail id being replied to (from mailbox_list)" }),
+			mail: Type.String({ description: "Mail being replied to: 'session@project/mail'; a bare mail id means your own mailbox" }),
 			body: Type.String({ description: "Reply body" }),
-			address: Type.Optional(Type.String({ description: "Mailbox address 'session@project' holding the original mail (defaults to this session's own mailbox)" })),
 			subject: Type.Optional(Type.String({ description: "Override the 'Re: <subject>' default" })),
 		}),
 		exposure: "deferred",
 		async execute(_toolCallId, params) {
 			const c = requireConnection();
 			const own = { project: c.mailbox.project!, session: c.shortSession };
-			const ref: MailRef = {
-				...(params.address ? parseAddress(params.address, own.project) : own),
-				mail: params.mail,
-			};
+			const ref = parseMailRef(params.mail, own);
 			const original = await c.mailbox.read(ref);
 			if (!original) throw new Error(`mail ${params.mail} not found`);
 			let subject = params.subject ?? original.subject;
@@ -585,7 +597,7 @@ ${formatMailList(mails)}${more}`,
 			subject = subject.slice(0, 256);
 			const sent = await c.mailbox.sendMail(original.from, subject, params.body, [ref]);
 			return {
-				content: [{ type: "text", text: `replied: ${sent.session}@${sent.project} mail ${sent.mail}` }],
+				content: [{ type: "text", text: `replied: ${formatMailRef(sent)}` }],
 				details: { ref: sent },
 			};
 		},
