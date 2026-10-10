@@ -208,7 +208,7 @@ export default function (pi: ExtensionAPI) {
 					// gracefully stop the daemon via the shutdown protocol
 					const bin = findMailboxdBinary();
 					if (bin) {
-						const result = spawnSync(bin, ["--stop"], {
+						const result = spawnSync(bin, ["stop"], {
 							env: { ...process.env },
 							encoding: "utf8",
 							timeout: 10_000,
@@ -222,7 +222,7 @@ export default function (pi: ExtensionAPI) {
 							);
 						}
 					} else {
-						ctx.ui.notify("mailbox: disconnected (mailboxd binary not found for --stop)", "warning");
+						ctx.ui.notify("mailbox: disconnected (mailboxd binary not found for stop)", "warning");
 					}
 				} catch (err) {
 					ctx.ui.notify(`mailbox: ${err instanceof Error ? err.message : String(err)}`, "error");
@@ -237,7 +237,7 @@ export default function (pi: ExtensionAPI) {
 					activateTools(false);
 					const bin = findMailboxdBinary();
 					if (bin) {
-						const result = spawnSync(bin, ["--stop"], {
+						const result = spawnSync(bin, ["stop"], {
 							env: { ...process.env },
 							encoding: "utf8",
 							timeout: 10_000,
