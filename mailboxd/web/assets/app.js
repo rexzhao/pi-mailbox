@@ -138,29 +138,13 @@ function renderContent() {
 			content.append(el("h1", {}, state.selected), el("p", { class: "hint" }, "loading…"));
 			return;
 		}
+		// header, then meta, then the toolbar, then the mail list (newest first)
 		const head = el("h1", {}, state.selected,
 			el("span", { class: "counts" }, `${mb.totalUnread} unread / ${mb.total} mails`));
-		if (mb.mails.length === 0) {
-			content.append(head, el("p", { class: "hint" }, "mailbox is empty"));
-		} else {
-			const list = el("ul", { class: "mails" });
-			for (const m of mb.mails) {
-				const item = el("li", { class: m.readAt ? "read" : "unread" },
-					el("span", { class: "dot" }, m.readAt ? "" : "●"),
-					el("span", { class: "from" }, `${m.from.session}@${m.from.project}`),
-					el("span", { class: "date" }, fmtTime(m.createdAt)),
-					el("span", { class: "subject" }, m.subject),
-				);
-				item.addEventListener("click", () => selectMail(m));
-				list.append(item);
-			}
-			content.append(head, list);
-		}
-		if (mb.nextCursor) {
-			const more = el("button", { type: "button", class: "more" }, "older mails");
-			more.addEventListener("click", () => loadMailbox(mb.nextCursor, true));
-			content.append(more);
-		}
+		content.append(head);
+
+		renderMetaPanel(content);
+
 		const delBtn = el("button", { type: "button", class: "danger" }, "delete this mailbox");
 		delBtn.addEventListener("click", async () => {
 			if (!confirm("Delete ALL mails and meta of " + state.selected + "? This cannot be undone.")) return;
@@ -181,8 +165,32 @@ function renderContent() {
 			}
 			slot.append(composeForm(state.selected, "", [], () => refresh()));
 		});
-		content.append(sendBtn, slot, delBtn);
-		renderMetaPanel(content);
+		const toolbar = el("div", { class: "toolbar" }, sendBtn, delBtn);
+		content.append(toolbar, slot);
+
+		if (mb.mails.length === 0) {
+			content.append(el("p", { class: "hint" }, "mailbox is empty"));
+		} else {
+			// API returns newest first; keep a defensive local sort
+			const sorted = [...mb.mails].sort((x, y) => (x.createdAt < y.createdAt ? 1 : x.createdAt > y.createdAt ? -1 : x.id < y.id ? 1 : -1));
+			const list = el("ul", { class: "mails" });
+			for (const m of sorted) {
+				const item = el("li", { class: m.readAt ? "read" : "unread" },
+					el("span", { class: "dot" }, m.readAt ? "" : "●"),
+					el("span", { class: "from" }, `${m.from.session}@${m.from.project}`),
+					el("span", { class: "date" }, fmtTime(m.createdAt)),
+					el("span", { class: "subject" }, m.subject),
+				);
+				item.addEventListener("click", () => selectMail(m));
+				list.append(item);
+			}
+			content.append(list);
+		}
+		if (mb.nextCursor) {
+			const more = el("button", { type: "button", class: "more" }, "older mails");
+			more.addEventListener("click", () => loadMailbox(mb.nextCursor, true));
+			content.append(more);
+		}
 		return;
 	}
 	if (state.selectedProject) {

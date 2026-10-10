@@ -143,6 +143,8 @@ h1 .counts { color: var(--muted); font-weight: normal; font-size: 13px; margin-l
 .reply-head .reply-btn { padding: 1px 10px; font-size: 12px; }
 .reply-slot:empty { display: none; }
 
+.toolbar { display: flex; gap: 8px; margin: 12px 0; }
+
 button.danger { border-color: #6e2b2b; color: #ff7b72; }
 
 .compose { max-width: 70ch; margin: 10px 0; }
