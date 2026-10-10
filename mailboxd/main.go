@@ -43,6 +43,7 @@ func main() {
 		lockF     = flag.String("lock", defaultLockPath(), "leader lock file")
 		printVer  = flag.Bool("version", false, "print version and exit")
 		stopFlag  = flag.Bool("stop", false, "stop the running daemon (via the shutdown protocol)")
+		cleanupFlag = flag.Bool("cleanup", false, "run orphan-mailbox cleanup on the running daemon")
 	)
 	flag.Parse()
 	if *printVer {
@@ -52,6 +53,9 @@ func main() {
 
 	if *stopFlag {
 		os.Exit(stopDaemon(*registryF, *token))
+	}
+	if *cleanupFlag {
+		os.Exit(cleanupDaemon(*registryF, *token))
 	}
 
 	// resolve mode

@@ -90,6 +90,14 @@ type ReadMsg struct {
 	Mail MailRef `json:"mail"`
 }
 
+type CleanupMsg struct {
+	T       string `json:"t"`
+	Rid     int    `json:"rid"`
+	Token   string `json:"token,omitempty"`
+	/** Project UUID; empty = all projects. */
+	Project string `json:"project,omitempty"`
+}
+
 type ShutdownMsg struct {
 	T     string `json:"t"`
 	Rid   int    `json:"rid"`
@@ -173,6 +181,18 @@ type MailReply struct {
 	T    string      `json:"t"`
 	Rid  int         `json:"rid"`
 	Mail *MailRecord `json:"mail"`
+}
+
+type CleanupReply struct {
+	T       string         `json:"t"`
+	Rid     int            `json:"rid"`
+	Results []CleanupResult `json:"results"`
+}
+
+type CleanupResult struct {
+	Project string `json:"project"`
+	Moved   int    `json:"moved"`
+	Error   string `json:"error,omitempty"`
 }
 
 type ErrorReply struct {

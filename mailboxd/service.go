@@ -33,7 +33,6 @@ func secureTokenEqual(a, b string) bool {
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
-var gcDelay = 30 * time.Second
 
 type conn struct {
 	daemon  *Daemon
@@ -156,6 +155,8 @@ func (c *conn) handleMessage(t string, rid int, data []byte) error {
 		return c.handleInbox(rid, data)
 	case "read":
 		return c.handleRead(rid, data)
+	case "cleanup":
+		return c.handleCleanup(rid, data)
 	case "shutdown":
 		return c.handleShutdown(rid, data)
 	default:
@@ -260,23 +261,6 @@ func (d *Daemon) project(msg HelloMsg) (*Project, error) {
 		p.SessionDir = msg.SessionDir
 	}
 	d.projects[msg.Project] = p
-	// deferred lifecycle GC (local mode only): wait for clients to
-	// re-register, then drop mailboxes of deleted pi sessions
-	if p.SessionDir != "" {
-		go func() {
-			time.Sleep(gcDelay)
-			online := map[string]bool{}
-			for sid := range p.OnlineSnapshot() {
-				online[sid] = true
-			}
-			moved, err := store.GCOrphans(p.SessionDir, gcGrace, online)
-			if err != nil {
-				log.Printf("gc project %s: %v", msg.Project, err)
-			} else if moved > 0 {
-				log.Printf("gc project %s: moved %d orphan mailbox(es)", msg.Project, moved)
-			}
-		}()
-	}
 	return p, nil
 }
 
@@ -594,6 +578,53 @@ func (c *conn) handleInbox(rid int, data []byte) error {
 		reply.NextCursor = encodeInboxCursor(page[len(page)-1])
 	}
 	c.send(reply)
+	return nil
+}
+
+// handleCleanup runs the orphan-mailbox GC on demand for the requested
+// project (or all projects). Only local-mode projects with a session
+// directory can be cleaned (remote mode has no pi session files to check).
+func (c *conn) handleCleanup(rid int, data []byte) error {
+	var msg CleanupMsg
+	if err := json.Unmarshal(data, &msg); err != nil {
+		return c.errorReply(rid, "bad_cleanup", "unparsable cleanup")
+	}
+	if c.daemon.AuthToken != "" && !secureTokenEqual(msg.Token, c.daemon.AuthToken) {
+		return c.errorReply(rid, "unauthorized", "invalid token")
+	}
+
+	results := []CleanupResult{}
+	c.daemon.mu.Lock()
+	projects := make([]*Project, 0, len(c.daemon.projects))
+	for _, p := range c.daemon.projects {
+		if msg.Project == "" || p.ID == msg.Project {
+			projects = append(projects, p)
+		}
+	}
+	c.daemon.mu.Unlock()
+
+	for _, p := range projects {
+		if p.SessionDir == "" {
+			if msg.Project != "" {
+				results = append(results, CleanupResult{Project: p.ID, Error: "no session directory (remote mode?)"})
+			}
+			continue
+		}
+		online := map[string]bool{}
+		for sid := range p.OnlineSnapshot() {
+			online[sid] = true
+		}
+		moved, err := p.Store.GCOrphans(p.SessionDir, gcGrace, online)
+		result := CleanupResult{Project: p.ID, Moved: moved}
+		if err != nil {
+			result.Error = err.Error()
+		}
+		results = append(results, result)
+		if moved > 0 {
+			log.Printf("cleanup project %s: moved %d orphan mailbox(es)", p.ID, moved)
+		}
+	}
+	c.send(CleanupReply{T: "cleanup", Rid: rid, Results: results})
 	return nil
 }
 

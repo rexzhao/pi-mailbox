@@ -152,10 +152,8 @@ func TestDaemonLocalFlow(t *testing.T) {
 	os.WriteFile(filepath.Join(sessionDir, "2026-01-01_sessA.jsonl"), []byte("{}\n"), 0o644)
 	os.WriteFile(filepath.Join(sessionDir, "2026-01-01_sessB.jsonl"), []byte("{}\n"), 0o644)
 
-	gcDelay = 100 * time.Millisecond // speed the GC up for the test
 	gcGrace = 0
 	defer func() {
-		gcDelay = 30 * time.Second
 		gcGrace = time.Hour
 	}()
 
