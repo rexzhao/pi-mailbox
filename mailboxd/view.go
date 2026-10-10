@@ -128,10 +128,9 @@ func joinHostPort(host string, port int) (string, error) {
 	if _, _, err := net.SplitHostPort(host); err == nil {
 		return "", fmt.Errorf("--host must not include a port: %q", host)
 	}
-	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
-		host = "[" + host + "]"
-	}
-	return net.JoinHostPort(host, strconv.Itoa(port)), nil
+	// JoinHostPort brackets IPv6 literals itself; Trim accepts inputs that
+	// already carry brackets
+	return net.JoinHostPort(strings.Trim(host, "[]"), strconv.Itoa(port)), nil
 }
 
 // browserOpener is a var so tests can inject a fake.

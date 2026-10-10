@@ -349,8 +349,9 @@ func (d *Daemon) hostAllowed(host string) bool {
 type threadEntry struct {
 	Mail  MailRecord `json:"mail"`
 	Owner string     `json:"owner"` // session@project
-	// internal: owning project id (not serialized)
+	// internal: owning project/session ids (not serialized)
 	project string
+	session string
 }
 
 // mailGraph is the daemon-wide ref graph: every mail keyed by its ref, plus
@@ -385,7 +386,7 @@ func (d *Daemon) buildMailGraph() *mailGraph {
 				continue
 			}
 			for _, m := range mails {
-				e := &threadEntry{Mail: *m, Owner: sid + "@" + p.ID, project: p.ID}
+				e := &threadEntry{Mail: *m, Owner: sid + "@" + p.ID, project: p.ID, session: sid}
 				g.byRef[refKey(p.ID, sid, m.ID)] = e
 				for _, ref := range m.Refs {
 					g.children[refKey(ref.Project, ref.Session, ref.Mail)] = append(
@@ -406,7 +407,7 @@ func (g *mailGraph) threadOf(rootKey string) []*threadEntry {
 		var next []string
 		for _, key := range frontier {
 			for _, child := range g.children[key] {
-				ck := refKey(child.project, refKeySession(child), child.Mail.ID)
+				ck := refKey(child.project, child.session, child.Mail.ID)
 				if visited[ck] {
 					continue
 				}
@@ -424,14 +425,6 @@ func (g *mailGraph) threadOf(rootKey string) []*threadEntry {
 		return replies[i].Mail.ID < replies[j].Mail.ID
 	})
 	return replies
-}
-
-// refKeySession extracts the session part of an Owner address.
-func refKeySession(e *threadEntry) string {
-	if at := strings.Index(e.Owner, "@"); at > 0 {
-		return e.Owner[:at]
-	}
-	return e.Owner
 }
 
 // apiThread returns a mail plus every mail that (transitively) references

@@ -173,6 +173,7 @@ function renderProjectOverview(content) {
 }
 
 async function renderProjectDetail(content) {
+	const project = state.selectedProject; // capture for the stale check
 	const info = ((state.info && state.info.projects) || []).find((p) => p.id === state.selectedProject) || {};
 	const counts = sessionCounts(state.selectedProject);
 	content.append(el("h1", {}, state.selectedProject,
@@ -182,11 +183,13 @@ async function renderProjectDetail(content) {
 
 	let threads;
 	try {
-		threads = (await api("/api/threads/" + state.selectedProject)).threads || [];
+		threads = (await api("/api/threads/" + project)).threads || [];
 	} catch (err) {
+		if (state.selectedProject !== project) return; // stale response
 		content.append(el("p", { class: "error" }, String(err.message || err)));
 		return;
 	}
+	if (state.selectedProject !== project) return; // stale response
 	if (threads.length === 0) {
 		content.append(el("p", { class: "hint" }, "no conversations"));
 		return;
@@ -288,9 +291,11 @@ async function selectSession(address, mailId) {
 }
 
 async function loadMailbox(cursor, append) {
+	const target = state.selected; // capture for the stale check
 	try {
 		const query = cursor ? "?cursor=" + encodeURIComponent(cursor) : "";
-		const mb = await api("/api/mailbox/" + state.selected + query);
+		const mb = await api("/api/mailbox/" + target + query);
+		if (state.selected !== target) return; // stale response
 		if (append && state.mailbox) {
 			state.mailbox.mails = state.mailbox.mails.concat(mb.mails);
 			state.mailbox.nextCursor = mb.nextCursor;
@@ -304,8 +309,10 @@ async function loadMailbox(cursor, append) {
 }
 
 async function selectMail(m) {
+	const target = state.selected; // capture for the stale check
 	try {
-		const detail = await api(`/api/thread/${state.selected}/${m.id}`);
+		const detail = await api(`/api/thread/${target}/${m.id}`);
+		if (state.selected !== target) return; // stale response
 		state.selectedMail = detail;
 	} catch (err) {
 		state.selectedMail = null;
