@@ -273,6 +273,7 @@ function renderThread(detail) {
 	// attach each reply to the thread mail it references (first resolvable
 	// ref; a reply is in the closure only because at least one ref resolves)
 	for (const r of detail.replies || []) {
+		const node = byRef.get(entryKeyOf(r));
 		let parent = root;
 		for (const ref of r.mail.refs || []) {
 			const p = byRef.get(refKeyOf(ref));
@@ -281,7 +282,7 @@ function renderThread(detail) {
 				break;
 			}
 		}
-		parent.children.push(r);
+		parent.children.push(node);
 	}
 	const box = el("article", { class: "mail-detail" });
 	box.append(renderThreadNode(root, 0));
