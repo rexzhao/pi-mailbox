@@ -133,6 +133,8 @@ export interface PongMsg {
 
 export interface SessionInfo {
 	session: string;
+	/** Owning project id, so listings render full session@project addresses. */
+	project?: string;
 	/** pi session display name; absent for offline sessions that never set `_agent`. */
 	agent?: string;
 	/** True when currently connected. */

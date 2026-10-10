@@ -48,6 +48,7 @@ function formatSessions(sessions: SessionInfo[]): string {
 	return sessions
 		.map((s) => {
 			const mark = s.online ? "*" : "-";
+			const address = s.project ? `${s.session}@${s.project}` : s.session;
 			const agent = s.agent ? `  ${s.agent}` : "";
 			const name = s.name ? `  name=${s.name}` : "";
 			const tags = s.tags && s.tags.length > 0 ? `  tags=${s.tags.join(",")}` : "";
@@ -55,7 +56,7 @@ function formatSessions(sessions: SessionInfo[]): string {
 				.filter(([k]) => k !== "name" && k !== "tags" && k !== "_agent")
 				.map(([k, v]) => `  ${k}=${v}`)
 				.join("");
-			return `[${mark}] ${s.session}${agent}${name}${tags}${extra}`;
+			return `[${mark}] ${address}${agent}${name}${tags}${extra}`;
 		})
 		.join("\n");
 }

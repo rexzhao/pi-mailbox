@@ -303,6 +303,7 @@ func (c *conn) handleSessions(rid int, data []byte) error {
 		agent, online := onlineAgents[sid]
 		info := SessionInfo{
 			Session: sid,
+			Project: proj.ID,
 			Online:  online,
 			Meta:    meta,
 		}

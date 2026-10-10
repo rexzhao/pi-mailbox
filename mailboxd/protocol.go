@@ -135,6 +135,8 @@ type WelcomeMsg struct {
 
 type SessionInfo struct {
 	Session string            `json:"session"`
+	/** Owning project id, so listings render full session@project addresses. */
+	Project string            `json:"project,omitempty"`
 	Agent   string            `json:"agent,omitempty"`
 	Online  bool              `json:"online"`
 	Name    string            `json:"name,omitempty"`
