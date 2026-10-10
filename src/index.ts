@@ -25,12 +25,19 @@ import type { MailRecord, MailRef, SessionInfo } from "./protocol.ts";
 
 const TOOL_NAMES = ["mailbox_list", "mailbox_read", "mailbox_send", "mailbox_reply", "mailbox_sessions"] as const;
 
+/** Parse "session" (own project) or "session@project" into an AgentRef. */
+function parseAddress(addr: string, ownProject: string): { project: string; session: string } {
+	const at = addr.indexOf("@");
+	if (at === -1) return { project: ownProject, session: addr };
+	return { project: addr.slice(at + 1), session: addr.slice(0, at) };
+}
+
 function formatMailList(mails: MailRecord[]): string {
 	if (mails.length === 0) return "mailbox is empty";
 	return mails
 		.map((m) => {
 			const read = m.readAt ? " " : "*";
-			const from = m.from.session.slice(0, 8);
+			const from = `${m.from.session}@${m.from.project}`;
 			return `[${read}] ${m.id}  from ${from}  ${m.subject}`;
 		})
 		.join("\n");
@@ -56,7 +63,7 @@ function formatSessions(sessions: SessionInfo[]): string {
 function formatMail(mail: MailRecord): string {
 	const lines = [
 		`subject: ${mail.subject}`,
-		`from:    ${mail.from.project}/${mail.from.session}`,
+		`from:    ${mail.from.session}@${mail.from.project}`,
 		`date:    ${mail.createdAt}`,
 		`read:    ${mail.readAt ?? "unread"}`,
 	];
@@ -523,15 +530,15 @@ ${formatMailList(mails)}${more}`,
 			"(use mailbox_sessions to find sessions). Returns the new mail's triple. " +
 			"To reply to a mail, prefer mailbox_reply.",
 		parameters: Type.Object({
-			session: Type.String({ description: "Target session id (must have registered once)" }),
+			session: Type.String({ description: "Target address: session id, or 'session@project' for cross-project delivery (must have registered once)" }),
 			subject: Type.String({ description: "Subject line" }),
 			body: Type.Optional(Type.String({ description: "Mail body" })),
 			refs: Type.Optional(
 				Type.Array(
 					Type.Object({
-						project: Type.String({ description: "Project UUID of the referenced mail" }),
+						project: Type.String({ description: "Project id of the referenced mail" }),
 						session: Type.String({ description: "Owner session of the referenced mail" }),
-						mail: Type.String({ description: "Mail UUID of the referenced mail" }),
+						mail: Type.String({ description: "Mail id of the referenced mail" }),
 					}),
 					{ description: "Mails this mail references (e.g. the mail being replied to)" },
 				),
@@ -540,10 +547,10 @@ ${formatMailList(mails)}${more}`,
 		exposure: "deferred",
 		async execute(_toolCallId, params) {
 			const c = requireConnection();
-			const target = { project: c.mailbox.project!, session: params.session };
+			const target = parseAddress(params.session, c.mailbox.project!);
 			const ref = await c.mailbox.sendMail(target, params.subject, params.body ?? "", params.refs);
 			return {
-				content: [{ type: "text", text: `sent: ${ref.project}/${ref.session}/${ref.mail}` }],
+				content: [{ type: "text", text: `sent: ${ref.session}@${ref.project} mail ${ref.mail}` }],
 				details: { ref },
 			};
 		},

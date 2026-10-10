@@ -289,12 +289,13 @@ func (s *Store) UpdateMeta(sessionID string, set map[string]string, unset []stri
 // HelloMerge applies the registration-time meta merge (mirroring the TS
 // implementation) and returns the resulting meta snapshot:
 //   - `_agent` is first in the source map (cap-proof) and re-assigned after
-//     the client merge (unspoofable)
+//     the client merge (unspoofable); `_origin` (the client's full session
+//     id, from hello.origin) follows the same rules
 //   - system keys refresh only when the value changed
 //   - user keys apply only when absent
 //   - separate caps: user keys, system keys
 //   - stored system keys absent from the accepted set are unset
-func (s *Store) HelloMerge(sessionID, agent string, meta map[string]string) (map[string]string, error) {
+func (s *Store) HelloMerge(sessionID, agent, origin string, meta map[string]string) (map[string]string, error) {
 	path, err := s.sessionFile(sessionID)
 	if err != nil {
 		return nil, err
@@ -306,10 +307,16 @@ func (s *Store) HelloMerge(sessionID, agent string, meta map[string]string) (map
 		return nil, err
 	}
 	metaSource := map[string]string{"_agent": agent}
+	if origin != "" {
+		metaSource["_origin"] = origin
+	}
 	for k, v := range meta {
 		metaSource[k] = v
 	}
 	metaSource["_agent"] = agent
+	if origin != "" {
+		metaSource["_origin"] = origin
+	}
 
 	var set map[string]string
 	sysKept := map[string]bool{}
@@ -520,7 +527,16 @@ func (s *Store) GCOrphans(sessionDir string, grace time.Duration, onlineSnapshot
 		return 0, nil
 	}
 	alive := func(sessionID string) bool {
-		suffix := "_" + sessionID + ".jsonl"
+		// resolve the mailbox's origin (the client's full session id) for
+		// the session-file check; fall back to the mailbox filename for
+		// legacy/origin-less mailboxes
+		origin := sessionID
+		if st, err := s.state(sessionID); err == nil {
+			if o := st.Meta["_origin"]; o != "" {
+				origin = o
+			}
+		}
+		suffix := "_" + origin + ".jsonl"
 		for _, f := range sessionFiles {
 			if strings.HasSuffix(f, suffix) {
 				return true

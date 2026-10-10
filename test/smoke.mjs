@@ -46,6 +46,10 @@ function events(log) {
 try {
 	// 1. first connection spawns the daemon and registers the project
 	const logA = { notify: [], connected: 0, disconnected: 0 };
+	const { deriveSessionId } = await import("../src/daemon.ts");
+	const shortA = deriveSessionId("agent-a", "sessA");
+	const shortB = deriveSessionId("agent-b", "sessB");
+	const shortC = deriveSessionId("agent-c", "sessC");
 	const a = new MailboxConnection("local", projectDir, null, "sessA", "agent-a", events(logA), {
 		helloMeta: { _model: "prov/m1", role: "worker" },
 		canSpawn: true,
@@ -73,12 +77,12 @@ try {
 	const c = new MailboxConnection("local", projectDir, null, "sessC", "agent-c", events(logC));
 	await c.start();
 	const ref = await b.mailbox.sendMail(
-		{ project: a.mailbox.project, session: "sessC" },
+		{ project: a.mailbox.project, session: shortC },
 		"hello",
 		"world",
 		[],
 	);
-	assert(ref.session === "sessC", "send returns triple");
+	assert(ref.session === shortC, "send returns the target short id");
 	await new Promise((r) => setTimeout(r, 200));
 	assert(logC.notify.includes(1), "notify pushed to recipient");
 
@@ -87,19 +91,19 @@ try {
 	assert(inb.mails[0].subject === "hello", "mail content");
 	const mailID = inb.mails[0].id;
 
-	const read = await c.mailbox.read({ project: a.mailbox.project, session: "sessC", mail: mailID });
+	const read = await c.mailbox.read({ project: a.mailbox.project, session: shortC, mail: mailID });
 	assert(read?.readAt !== null && read?.readAt !== undefined, "own read marks readAt");
 	const inb2 = await c.mailbox.inbox({ unreadOnly: true });
 	assert(inb2.mails.length === 0, "read mail no longer unread");
 
 	// sender can re-read by triple
-	const again = await b.mailbox.read({ project: a.mailbox.project, session: "sessC", mail: mailID });
+	const again = await b.mailbox.read({ project: a.mailbox.project, session: shortC, mail: mailID });
 	assert(again?.body === "world", "sender can read by triple");
 
 	// 5. meta ops: set/unset, system keys rejected, tags
 	await c.mailbox.setMeta({ set: { name: "worker-c", tags: "x,y" } });
 	let list = await a.mailbox.sessions();
-	let cInfo = list.find((s) => s.session === "sessC");
+	let cInfo = list.find((s) => s.session === shortC);
 	assert(cInfo?.name === "worker-c" && cInfo?.tags?.join(",") === "x,y", "name/tags visible in sessions");
 	let sysErr = null;
 	try {
@@ -110,25 +114,25 @@ try {
 	assert(sysErr && String(sysErr).includes("bad_meta"), "system key rejected via meta op");
 	await c.mailbox.setMeta({ unset: ["name"] });
 	list = await a.mailbox.sessions();
-	cInfo = list.find((s) => s.session === "sessC");
+	cInfo = list.find((s) => s.session === shortC);
 	assert(cInfo?.name === undefined && cInfo?.tags?.length === 2, "name unset, tags kept");
 	assert(c.mailbox.sessionMeta?.name === undefined, "sessionMeta kept in sync after unset");
 
 	// 6. offline delivery + offline listing + reconnect backfill
 	await c.stop();
 	const offlineRef = await b.mailbox.sendMail(
-		{ project: a.mailbox.project, session: "sessC" },
+		{ project: a.mailbox.project, session: shortC },
 		"offline mail",
 		"while away",
 		[],
 	);
-	assert(offlineRef.session === "sessC", "send to offline registered session accepted");
+	assert(offlineRef.session === shortC, "send to offline registered session accepted");
 	const withOffline = await a.mailbox.sessions(true);
-	const cOffline = withOffline.find((s) => s.session === "sessC");
+	const cOffline = withOffline.find((s) => s.session === shortC);
 	assert(cOffline && cOffline.online === false, "offline session listed with online=false");
 	assert(cOffline?.agent === "agent-c", "offline agent from _agent");
 	const onlineOnly = await a.mailbox.sessions();
-	assert(!onlineOnly.some((s) => s.session === "sessC"), "default listing omits offline");
+	assert(!onlineOnly.some((s) => s.session === shortC), "default listing omits offline");
 
 	const logC2 = { notify: [], connected: 0, disconnected: 0 };
 	const c2 = new MailboxConnection("local", projectDir, null, "sessC", "agent-c", events(logC2));
@@ -139,7 +143,7 @@ try {
 
 	// 7. pagination + cursor semantics
 	for (let i = 0; i < 3; i++) {
-		await b.mailbox.sendMail({ project: a.mailbox.project, session: "sessC" }, `mail-${i}`, "x", []);
+		await b.mailbox.sendMail({ project: a.mailbox.project, session: shortC }, `mail-${i}`, "x", []);
 	}
 	const page1 = await c2.mailbox.inbox(undefined, { limit: 2 });
 	assert(page1.mails.length === 2 && page1.nextCursor, "page 1 limited with cursor");
@@ -196,17 +200,19 @@ try {
 	const found = findMailboxdBinary();
 	assert(found !== null && found.endsWith(exe), `default binary path resolves (${found})`);
 
-	// 11. project registry persists
+	// 11. short ids: project id is a stable 8-char derivation, session ids
+	// are 10-char derivations of (agent, session)
 	const projectId = a.mailbox.project;
 	await a.stop();
 	await b.stop();
-	// the daemon stays up (idle timeout is minutes); kill it via its flock
-	// being released only on exit — instead verify reconnection after a
-	// daemon restart by... the daemon is shared; restart is covered by the
-	// mailboxd Go tests. Here we just verify the project registry survives.
-	const { readProjectId } = await import("../src/daemon.ts");
-	const pid = await readProjectId(projectDir);
-	assert(pid === projectId, "project UUID persisted in the registry file");
+	const { deriveProjectId } = await import("../src/daemon.ts");
+	const pid = await deriveProjectId(projectDir);
+	assert(pid === projectId, "project id derivation must be stable");
+	assert(/^[0-9a-z]{8}$/.test(projectId), "project id must be 8 base36 chars");
+	assert(/^[0-9a-z]{10}$/.test(shortA), "session id must be 10 base36 chars");
+	assert(shortA !== deriveSessionId("agent-b", "sessA"), "different agents must derive different session ids");
+	const { readHostId } = await import("../src/daemon.ts");
+	assert(/^[0-9a-f]{16}$/.test(await readHostId()), "host id must be 16 hex chars");
 } finally {
 	// the daemon is detached and holds the lock file in the temp home; stop
 	// it via the pid recorded in the registry so cleanup can remove the dir

@@ -1,6 +1,12 @@
 /**
  * Client-side mailboxd integration: resolve the local daemon (spawn it if
- * needed), and maintain the per-project UUID registry.
+ * needed), and derive the short mailbox ids.
+ *
+ * Id scheme (all base36, deterministic — no coordination needed):
+ *   hostId    16 hex random, ~/.pi/mailbox-host-id, created once per machine
+ *   project   base36(sha256(hostId + path))[0:8]        — globally unique
+ *   session   base36(sha256(agent + sessionUuid))[0:10] — unique per project
+ * The daemon treats ids as opaque strings; only this module knows the scheme.
  *
  * The in-process TS service is gone; the Go daemon is the only service.
  * Local flow: read the daemon registry (~/.pi/mailboxd.json, or
@@ -11,8 +17,8 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
-import { join } from "node:path";
-import { randomUUID } from "node:crypto";
+import { join, resolve } from "node:path";
+import { createHash, randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 import { PROTOCOL_VERSION } from "./protocol.ts";
@@ -159,98 +165,54 @@ export async function resolveLocalDaemon(): Promise<LocalEndpoint> {
 }
 
 // ---------------------------------------------------------------------------
-// per-project identity
+// identity derivation
 // ---------------------------------------------------------------------------
 
-interface ProjectRegistry {
-	projectId: string;
+/** Project id: 8 base36 chars, deterministic per (host, normalized path). */
+export async function deriveProjectId(projectDir: string): Promise<string> {
+	const hostId = await readHostId();
+	return shortHash(hostId + "\n" + normalizeProjectPath(projectDir), 8);
 }
 
-function projectRegistryPath(projectDir: string): string {
-	return join(projectDir, ".pi", "mailbox.json");
-}
-
-function projectLockPath(projectDir: string): string {
-	return join(projectDir, ".pi", "mailbox.project.lock");
+/** Session id: 10 base36 chars, deterministic per (agent, pi session id); unique within a project. */
+export function deriveSessionId(agent: string, session: string): string {
+	return shortHash(agent + "\n" + session, 10);
 }
 
 /**
- * Read (or create once) the project UUID. Creation races between sessions
- * are serialized with a mkdir lock (a few-millisecond critical section, not
- * a crash-safe lease — a stale lock directory is simply stolen after a
- * short timeout). The file also used to carry the old in-process service
- * entry, which is ignored.
+ * Per-host random identity: 16 hex chars in ~/.pi/mailbox-host-id, created
+ * once. Distinguishes projects on different machines that share a directory
+ * path (remote mode) without unstable inputs like IPs or hostnames.
  */
-const LOCK_STALE_MS = 60_000;
-
-export async function readProjectId(projectDir: string): Promise<string> {
-	const existing = await readProjectRegistry(projectDir);
-	if (existing) return existing;
-	await mkdir(join(projectDir, ".pi"), { recursive: true });
-	const lockPath = projectLockPath(projectDir);
-	// serialize first-time creation across sessions
-	for (let attempt = 0; ; attempt++) {
-		let acquired = false;
-		try {
-			await mkdir(lockPath);
-			acquired = true;
-		} catch (err) {
-			if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-			// stale lock: the creating process died mid-critical-section
-			let age = 0;
-			try {
-				age = Date.now() - (await stat(lockPath)).mtimeMs;
-			} catch {
-				// lock was released between EEXIST and stat: retry immediately
-				continue;
-			}
-			if (age > LOCK_STALE_MS) {
-				await rm(lockPath, { recursive: true, force: true });
-				continue;
-			}
-			if (attempt > 600) throw new Error("mailbox project-id lock contention timeout");
-			await new Promise((resolve) => setTimeout(resolve, 100));
-			continue;
-		}
-		if (acquired) {
-			try {
-				const again = await readProjectRegistry(projectDir);
-				if (again) return again;
-				const projectId = randomUUID();
-				await atomicWrite(projectRegistryPath(projectDir), JSON.stringify({ projectId }, null, "\t") + "\n");
-				return projectId;
-			} finally {
-				await rm(lockPath, { recursive: true, force: true });
-			}
-		}
-	}
-}
-
-async function readProjectRegistry(projectDir: string): Promise<string | null> {
+export async function readHostId(): Promise<string> {
+	const path = join(daemonHome(), "mailbox-host-id");
+	const valid = (s: string) => /^[0-9a-f]{16}$/.test(s);
 	try {
-		const raw = await readFile(projectRegistryPath(projectDir), "utf8");
-		const parsed = JSON.parse(raw) as ProjectRegistry;
-		if (typeof parsed.projectId !== "string" || parsed.projectId.length === 0) return null;
-		return parsed.projectId;
+		const existing = (await readFile(path, "utf8")).trim();
+		if (valid(existing)) return existing;
 	} catch {
-		return null;
+		// not created yet
 	}
+	await mkdir(daemonHome(), { recursive: true });
+	const id = randomBytes(8).toString("hex");
+	try {
+		await writeFile(path, id + "\n", { flag: "wx" });
+	} catch (err) {
+		// another process won the create race: use its id
+		if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+		const existing = (await readFile(path, "utf8")).trim();
+		if (valid(existing)) return existing;
+		throw new Error(`mailbox: unreadable host id file at ${path}`);
+	}
+	return id;
 }
 
-async function atomicWrite(path: string, content: string): Promise<void> {
-	const tmp = `${path}.tmp`;
-	await writeFile(tmp, content);
-	for (let attempt = 0; ; attempt++) {
-		try {
-			await rename(tmp, path);
-			return;
-		} catch (err) {
-			const code = (err as NodeJS.ErrnoException).code;
-			if ((code === "EPERM" || code === "EACCES" || code === "ENOTEMPTY") && attempt < 10) {
-				await new Promise((resolve) => setTimeout(resolve, 50));
-				continue;
-			}
-			throw err;
-		}
-	}
+/** First `len` base36 chars of the sha256 of `input` (zero-padded). */
+function shortHash(input: string, len: number): string {
+	const digest = createHash("sha256").update(input).digest("hex");
+	return BigInt("0x" + digest).toString(36).slice(0, len).padStart(len, "0");
+}
+
+function normalizeProjectPath(dir: string): string {
+	return resolve(dir).replace(/\\/g, "/");
 }

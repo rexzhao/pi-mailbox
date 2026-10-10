@@ -20,7 +20,7 @@ import {
 	type ServerMsg,
 	type SessionInfo,
 } from "./protocol.ts";
-import { readProjectId, resolveLocalDaemon, connectLocalDaemonIfRunning } from "./daemon.ts";
+import { deriveProjectId, deriveSessionId, resolveLocalDaemon, connectLocalDaemonIfRunning } from "./daemon.ts";
 
 const REQUEST_TIMEOUT_MS = 5_000;
 
@@ -41,6 +41,7 @@ export class MailboxClient {
 		projectRoot?: string;
 		sessionDir?: string;
 		session: string;
+		origin?: string;
 		agent: string;
 		token?: string;
 		meta?: Record<string, string>;
@@ -55,6 +56,7 @@ export class MailboxClient {
 			projectRoot?: string;
 			sessionDir?: string;
 			session: string;
+			origin?: string;
 			agent: string;
 			token?: string;
 			meta?: Record<string, string>;
@@ -291,6 +293,8 @@ export class MailboxConnection {
 	private readonly projectDir: string;
 	private readonly remote: RemoteTarget | null;
 	readonly session: string;
+	/** Short mailbox session id (derived from agent + session). This is the wire identity. */
+	readonly shortSession: string;
 	private readonly agent: string;
 	private readonly events: ConnectionEvents;
 	private readonly options: ConnectionOptions;
@@ -308,6 +312,7 @@ export class MailboxConnection {
 		this.projectDir = projectDir;
 		this.remote = remote;
 		this.session = session;
+		this.shortSession = deriveSessionId(agent, session);
 		this.agent = agent;
 		this.events = events;
 		this.options = options ?? {};
@@ -315,6 +320,11 @@ export class MailboxConnection {
 
 	get connected(): boolean {
 		return this.client?.isOpen ?? false;
+	}
+
+	/** This session's mailbox address, `session@project`, once registered. */
+	get address(): string | null {
+		return this.client?.project ? `${this.shortSession}@${this.client.project}` : null;
 	}
 
 	async start(): Promise<void> {
@@ -367,12 +377,14 @@ export class MailboxConnection {
 			projectRoot?: string;
 			sessionDir?: string;
 			session: string;
+			origin: string;
 			agent: string;
 			token?: string;
 			meta?: Record<string, string>;
 		} = {
-			project: await readProjectId(this.projectDir),
-			session: this.session,
+			project: await deriveProjectId(this.projectDir),
+			session: this.shortSession,
+			origin: this.session,
 			agent: this.agent,
 			meta: this.options.helloMeta,
 		};

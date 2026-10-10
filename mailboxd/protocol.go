@@ -32,10 +32,15 @@ type HelloMsg struct {
 	Project     string            `json:"project"`
 	ProjectRoot string            `json:"projectRoot,omitempty"`
 	SessionDir  string            `json:"sessionDir,omitempty"`
-	Session     string            `json:"session"`
-	Agent       string            `json:"agent"`
-	Token       string            `json:"token,omitempty"`
-	Meta        map[string]string `json:"meta,omitempty"`
+	// Session is the short mailbox session id the mailbox is keyed by.
+	Session string `json:"session"`
+	// Origin is the client's full session id (e.g. the pi session UUID);
+	// persisted as the _origin system meta, used by the lifecycle GC to
+	// match the client's session file. May be empty for non-pi agents.
+	Origin string            `json:"origin,omitempty"`
+	Agent  string            `json:"agent"`
+	Token  string            `json:"token,omitempty"`
+	Meta   map[string]string `json:"meta,omitempty"`
 }
 
 type SessionsMsg struct {

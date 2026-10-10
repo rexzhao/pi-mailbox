@@ -102,6 +102,20 @@ func (c *testClient) hello(rid int, project, root, session, agent string, meta m
 	return c.request(msg)
 }
 
+// helloShort registers with a short session id plus its origin (the full
+// client session id), the way the TS client does after the short-id change.
+func (c *testClient) helloShort(rid int, project, root, sessionDir, short, origin, agent string, meta map[string]string) map[string]interface{} {
+	msg := map[string]interface{}{
+		"t": "hello", "rid": rid, "project": project, "projectRoot": root,
+		"sessionDir": sessionDir,
+		"session": short, "origin": origin, "agent": agent,
+	}
+	if meta != nil {
+		msg["meta"] = meta
+	}
+	return c.request(msg)
+}
+
 // bootDaemon starts a local-mode daemon in the background and returns its
 // port plus a cancel function.
 func bootDaemon(t *testing.T, tmp string, token string, remote bool) (int, func()) {
@@ -504,5 +518,88 @@ func TestStoreMixedTimestamps(t *testing.T) {
 	}
 	if len(mails) != 2 || mails[0].ID != "new-1" || mails[1].ID != "old-1" {
 		t.Fatalf("mixed-format order wrong: %v %v", mails[0].ID, mails[1].ID)
+	}
+}
+
+// TestCleanupOriginGC verifies the on-demand cleanup with short session ids:
+// the mailbox is keyed by the short id, while the lifecycle check uses the
+// _origin meta (the client's full session id) to match the pi session file.
+func TestCleanupOriginGC(t *testing.T) {
+	tmp := t.TempDir()
+	projectRoot := filepath.Join(tmp, "proj")
+	os.MkdirAll(filepath.Join(projectRoot, ".pi", "mailbox"), 0o755)
+	sessionDir := filepath.Join(tmp, "sessions")
+	os.MkdirAll(sessionDir, 0o755)
+	// pi session files: sessA alive, sessB deleted later
+	os.WriteFile(filepath.Join(sessionDir, "2026-01-01_sessA.jsonl"), []byte("{}\n"), 0o644)
+	os.WriteFile(filepath.Join(sessionDir, "2026-01-01_sessB.jsonl"), []byte("{}\n"), 0o644)
+
+	gcGrace = 0
+	defer func() {
+		gcGrace = time.Hour
+	}()
+
+	port, stop := bootDaemon(t, tmp, "", false)
+	defer stop()
+	const project = "proj-gc"
+
+	// register with short ids + origins
+	a := dialTest(t, port)
+	if w := a.helloShort(1, project, projectRoot, sessionDir, "shortaaaa", "sessA", "agent-a", nil); w["t"] != "welcome" {
+		t.Fatalf("A welcome: %v", w)
+	}
+	b := dialTest(t, port)
+	if w := b.helloShort(1, project, projectRoot, sessionDir, "shortbbbb", "sessB", "agent-b", nil); w["t"] != "welcome" {
+		t.Fatalf("B welcome: %v", w)
+	}
+
+	// a mail into B's mailbox so the file exists with content
+	if m := a.request(map[string]interface{}{
+		"t": "send", "rid": 2,
+		"target":  map[string]string{"project": project, "session": "shortbbbb"},
+		"subject": "x", "body": "y",
+	}); m["t"] != "sent" {
+		t.Fatalf("send failed: %v", m)
+	}
+
+	// (origin visibility is exercised functionally by the cleanup below)
+
+	// delete sessB's pi session file and disconnect B: B's mailbox becomes
+	// an orphan (online sessions are never collected)
+	os.Remove(filepath.Join(sessionDir, "2026-01-01_sessB.jsonl"))
+	b.ws.Close(websocket.StatusNormalClosure, "")
+	time.Sleep(100 * time.Millisecond)
+
+	// on-demand cleanup: B's mailbox must move to .trash, A's must stay
+	cm := a.request(map[string]interface{}{"t": "cleanup", "rid": 4})
+	if cm["t"] != "cleanup" {
+		t.Fatalf("cleanup failed: %v", cm)
+	}
+	results := cm["results"].([]interface{})
+	if len(results) != 1 {
+		t.Fatalf("expected 1 project result, got %v", results)
+	}
+	r := results[0].(map[string]interface{})
+	if r["project"] != project || int(r["moved"].(float64)) != 1 {
+		t.Fatalf("cleanup result wrong: %v", r)
+	}
+
+	mailDir := filepath.Join(projectRoot, ".pi", "mailbox")
+	if _, err := os.Stat(filepath.Join(mailDir, "shortaaaa.jsonl")); err != nil {
+		t.Fatalf("A's mailbox should survive: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(mailDir, "shortbbbb.jsonl")); !os.IsNotExist(err) {
+		t.Fatalf("B's mailbox should be gone: %v", err)
+	}
+	trashDir := filepath.Join(mailDir, ".trash")
+	trashEntries, _ := os.ReadDir(trashDir)
+	trashed := false
+	for _, e := range trashEntries {
+		if strings.HasSuffix(e.Name(), "shortbbbb.jsonl") {
+			trashed = true
+		}
+	}
+	if !trashed {
+		t.Fatalf("B's mailbox should be in .trash: %v", trashEntries)
 	}
 }

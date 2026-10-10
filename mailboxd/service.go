@@ -210,7 +210,7 @@ func (c *conn) handleHello(rid int, data []byte) error {
 	}
 
 	// registration-time meta merge happens atomically inside the store
-	welcomeMeta, err := proj.Store.HelloMerge(msg.Session, msg.Agent, msg.Meta)
+	welcomeMeta, err := proj.Store.HelloMerge(msg.Session, msg.Agent, msg.Origin, msg.Meta)
 	if err != nil {
 		return err
 	}
@@ -419,7 +419,7 @@ func (c *conn) handleSend(rid int, data []byte) error {
 			fmt.Sprintf("target session %s has no mailbox (never registered)", msg.Target.Session))
 	}
 	mail := &MailRecord{
-		ID:      newUUID(),
+		ID:      newShortID(),
 		From:    AgentRef{Project: proj.ID, Session: c.session},
 		Subject: msg.Subject,
 		Body:    msg.Body,
@@ -705,6 +705,20 @@ func newUUID() string {
 	b[6] = (b[6] & 0x0f) | 0x40
 	b[8] = (b[8] & 0x3f) | 0x80
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// newShortID returns 10 random base36 chars. Mail ids only need uniqueness
+// within one session mailbox, so random short ids suffice.
+func newShortID() string {
+	const alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
+	b := make([]byte, 10)
+	if _, err := rand.Read(b); err != nil {
+		panic(err)
+	}
+	for i := range b {
+		b[i] = alphabet[int(b[i])%len(alphabet)]
+	}
+	return string(b)
 }
 
 // refsOrNil normalizes nil refs to an empty slice so the JSON wire format

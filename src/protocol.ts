@@ -6,13 +6,13 @@
  * be correlated. Unsolicited server pushes (`notify`) have no `rid`.
  */
 
-/** Identity of an agent session: project UUID + pi session id. */
+/** Identity of an agent session: project id + session id (short base36 ids; see daemon.ts for the scheme). */
 export interface AgentRef {
 	project: string;
 	session: string;
 }
 
-/** Pointer to a mail: project + owner session + mail UUID. Knowing the triple is the capability to read it. */
+/** Pointer to a mail: project + owner session + mail id. Knowing the triple is the capability to read it. */
 export interface MailRef extends AgentRef {
 	mail: string;
 }
@@ -38,13 +38,16 @@ export const PROTOCOL_VERSION = 2;
 export interface HelloMsg {
 	t: "hello";
 	rid: number;
-	/** Project UUID (see the per-project registry file). */
+	/** Project id (short base36, derived from host id + project path). */
 	project: string;
 	/** Absolute project root; local-mode daemons store data under its .pi/mailbox. */
 	projectRoot?: string;
 	/** pi session directory for this cwd; enables the daemon's lifecycle GC in local mode. */
 	sessionDir?: string;
+	/** Session id (short base36, derived from agent + pi session id); the mailbox is keyed by this. */
 	session: string;
+	/** Full pi session id; persisted as the `_origin` system meta for the lifecycle GC. */
+	origin?: string;
 	agent: string;
 	/** Connection token (remote-mode daemons require it). */
 	token?: string;

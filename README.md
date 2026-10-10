@@ -16,10 +16,13 @@ below.
   dies), records its address in `~/.pi/mailboxd.json`, and exits after an
   idle period with no clients. The extension probes that address and spawns
   the daemon when dead.
-- Each project has a stable UUID in `<project>/.pi/mailbox.json` (created
-  once, serialized with [@lickle/lock](https://www.npmjs.com/package/@lickle/lock)
-  for the same-platform native binding); the daemon routes by project and
-  stores data in `<project>/.pi/mailbox/` (local mode).
+- Ids are short and deterministic (base36): a per-machine host id
+  (`~/.pi/mailbox-host-id`, 16 hex chars, created once), a project id
+  `base36(sha256(hostId + path))[0:8]`, and a session id
+  `base36(sha256(agent + sessionId))[0:10]` (unique per project, per agent).
+  The daemon treats ids as opaque strings. It routes by project and stores
+  data in `<project>/.pi/mailbox/` (local mode). Addresses are
+  `session@project`; a bare session id means the own project.
 - Mails are immutable: send, read, and reference only. No editing, no
   comments, no deletion (yet). A mail is addressed by the triple
   `{project, session, mail}`; knowing the triple is the capability to read it.
@@ -130,9 +133,10 @@ writes its address to `~/.pi/mailboxd.json`. Data lives in each project's
   `--data-dir` (client paths are never trusted), and stays up (idle exit is
   disabled unless `--idle-exit` is set explicitly).
 
-The wire protocol is protocol v2: `hello` carries the project UUID, the
-  project root (local mode), an optional pi session directory (lifecycle GC),
-  and an optional token; `welcome`/`pong` carry a `protocolVersion`.
+The wire protocol is protocol v2: `hello` carries the short project id,
+  the project root (local mode), an optional pi session directory (lifecycle
+  GC), the session's origin id (the full pi session id, stored as the
+  `_origin` system meta for the lifecycle GC), and an optional token; `welcome`/`pong` carry a `protocolVersion`.
   Cross-project sends are allowed when the target project is also registered
   on the daemon. See `mailboxd/protocol.go`.
 
