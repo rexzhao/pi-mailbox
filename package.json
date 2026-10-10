@@ -13,7 +13,6 @@
 		]
 	},
 	"dependencies": {
-		"@lickle/lock": "0.0.1",
 		"ws": "8.22.0"
 	},
 	"devDependencies": {

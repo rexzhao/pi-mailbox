@@ -10,11 +10,10 @@
 
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { tryOpenLock, Lock } from "@lickle/lock";
 import { WebSocket } from "ws";
 import { PROTOCOL_VERSION } from "./protocol.ts";
 
@@ -168,17 +167,37 @@ function projectLockPath(projectDir: string): string {
 
 /**
  * Read (or create once) the project UUID. Creation races between sessions
- * are serialized with a flock; the file also used to carry the old in-process
- * service entry, which is ignored.
+ * are serialized with a mkdir lock (a few-millisecond critical section, not
+ * a crash-safe lease — a stale lock directory is simply stolen after a
+ * short timeout). The file also used to carry the old in-process service
+ * entry, which is ignored.
  */
+const LOCK_STALE_MS = 5_000;
+
 export async function readProjectId(projectDir: string): Promise<string> {
 	const existing = await readProjectRegistry(projectDir);
 	if (existing) return existing;
 	await mkdir(join(projectDir, ".pi"), { recursive: true });
+	const lockPath = projectLockPath(projectDir);
 	// serialize first-time creation across sessions
-	for (;;) {
-		const guard = await tryOpenLock(projectLockPath(projectDir), Lock.Exclusive);
-		if (guard) {
+	for (let attempt = 0; ; attempt++) {
+		let acquired = false;
+		try {
+			await mkdir(lockPath);
+			acquired = true;
+		} catch (err) {
+			if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+			// stale lock: the creating process died mid-critical-section
+			const age = Date.now() - (await stat(lockPath)).mtimeMs;
+			if (age > LOCK_STALE_MS) {
+				await rm(lockPath, { recursive: true, force: true });
+				continue;
+			}
+			if (attempt > 50) throw new Error("mailbox project-id lock contention timeout");
+			await new Promise((resolve) => setTimeout(resolve, 100));
+			continue;
+		}
+		if (acquired) {
 			try {
 				const again = await readProjectRegistry(projectDir);
 				if (again) return again;
@@ -186,10 +205,9 @@ export async function readProjectId(projectDir: string): Promise<string> {
 				await atomicWrite(projectRegistryPath(projectDir), JSON.stringify({ projectId }, null, "\t") + "\n");
 				return projectId;
 			} finally {
-				await guard.drop();
+				await rm(lockPath, { recursive: true, force: true });
 			}
 		}
-		await new Promise((resolve) => setTimeout(resolve, 100));
 	}
 }
 
