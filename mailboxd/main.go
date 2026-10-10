@@ -33,6 +33,35 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	log.SetPrefix("mailboxd: ")
 
+	// subcommand dispatch: mailboxd <command> [flags]
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "stop":
+			fs := flag.NewFlagSet("stop", flag.ExitOnError)
+			registry := fs.String("registry", defaultRegistryPath(), "registry file recording the daemon address")
+			token := fs.String("token", "", "connection token (required by remote-mode daemons)")
+			fs.Parse(os.Args[2:])
+			os.Exit(stopDaemon(*registry, *token))
+		case "cleanup":
+			fs := flag.NewFlagSet("cleanup", flag.ExitOnError)
+			registry := fs.String("registry", defaultRegistryPath(), "registry file recording the daemon address")
+			token := fs.String("token", "", "connection token (required by remote-mode daemons)")
+			fs.Parse(os.Args[2:])
+			os.Exit(cleanupDaemon(*registry, *token))
+		case "version":
+			fmt.Println("mailboxd", ProtocolVersion)
+			return
+		case "help":
+			printUsage()
+			return
+		}
+	}
+
+	// daemon mode: mailboxd [flags] or mailboxd serve [flags]
+	if len(os.Args) > 1 && os.Args[1] == "serve" {
+		os.Args = append(os.Args[:1], os.Args[2:]...) // strip "serve"
+	}
+
 	var (
 		listen    = flag.String("listen", "127.0.0.1:0", "listen address; a non-loopback address enables remote mode (token required, persistent)")
 		dataDir   = flag.String("data-dir", "", "remote-mode storage root (default: ~/.pi/mailboxd-data); one subdirectory per project")
@@ -41,22 +70,8 @@ func main() {
 		idleExitS = flag.Float64("idle-exit", 300, "exit after this many seconds with zero connected clients (local mode only; remote mode disables it unless set explicitly)")
 		registryF = flag.String("registry", defaultRegistryPath(), "registry file recording the daemon address")
 		lockF     = flag.String("lock", defaultLockPath(), "leader lock file")
-		printVer  = flag.Bool("version", false, "print version and exit")
-		stopFlag  = flag.Bool("stop", false, "stop the running daemon (via the shutdown protocol)")
-		cleanupFlag = flag.Bool("cleanup", false, "run orphan-mailbox cleanup on the running daemon")
 	)
 	flag.Parse()
-	if *printVer {
-		fmt.Println("mailboxd", ProtocolVersion)
-		return
-	}
-
-	if *stopFlag {
-		os.Exit(stopDaemon(*registryF, *token))
-	}
-	if *cleanupFlag {
-		os.Exit(cleanupDaemon(*registryF, *token))
-	}
 
 	// resolve mode
 	host, _, err := net.SplitHostPort(*listen)
@@ -333,4 +348,27 @@ func clearRegistry(path string, instanceID string) error {
 		return nil
 	}
 	return os.Remove(path)
+}
+
+func printUsage() {
+	fmt.Println("mailboxd — standalone mailbox daemon for pi-mailbox")
+	fmt.Println()
+	fmt.Println("Usage:")
+	fmt.Println("  mailboxd [flags]          start the daemon (or: mailboxd serve [flags])")
+	fmt.Println("  mailboxd stop [flags]     stop the running daemon")
+	fmt.Println("  mailboxd cleanup [flags]  run orphan-mailbox cleanup on the running daemon")
+	fmt.Println("  mailboxd version          print the version")
+	fmt.Println()
+	fmt.Println("Daemon flags:")
+	fmt.Println("  --listen <addr>           listen address (default 127.0.0.1:0; non-loopback enables remote mode)")
+	fmt.Println("  --data-dir <dir>          remote-mode storage root")
+	fmt.Println("  --token <secret>          connection token (remote mode)")
+	fmt.Println("  --token-file <path>       file containing the connection token")
+	fmt.Println("  --idle-exit <seconds>     exit after this idle period (default 300; 0 disables)")
+	fmt.Println("  --registry <file>         registry file path")
+	fmt.Println("  --lock <file>             leader lock file path")
+	fmt.Println()
+	fmt.Println("Subcommand flags:")
+	fmt.Println("  --registry <file>         registry file path")
+	fmt.Println("  --token <secret>          connection token")
 }
