@@ -1,10 +1,36 @@
 // mailboxd web UI — read-only viewer.
 // The connection token (if any) travels in the URL fragment (#t=...);
 // it is read once here and sent as a Bearer header on every API call.
+// Navigation state also lives in the fragment (#project= / #session= /
+// #mail=) so the browser back button works; writing the hash triggers
+// applyParams via hashchange — navigation never mutates state directly.
 
 "use strict";
 
-const token = new URLSearchParams((location.hash || "").replace(/^#/, "")).get("t") || "";
+function hashParams() {
+	return new URLSearchParams((location.hash || "").replace(/^#/, ""));
+}
+
+// Addresses in the fragment are base64url-encoded: no @ / + = special
+// characters in the URL. Inputs are ASCII (base36 ids), so btoa is safe.
+function encRef(s) {
+	return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function decRef(s) {
+	return atob(String(s).replace(/-/g, "+").replace(/_/g, "/"));
+}
+
+// The token is arbitrary, so it alone gets percent-encoded.
+function writeHash(params) {
+	const parts = [];
+	for (const [k, v] of params.entries()) {
+		parts.push(k + "=" + (k === "t" ? encodeURIComponent(v) : v));
+	}
+	location.hash = parts.join("&");
+}
+
+const token = hashParams().get("t") || "";
 
 async function api(path) {
 	const resp = await fetch(path, {
@@ -21,7 +47,9 @@ const state = {
 	sessions: [],
 	selectedProject: null, // project id currently entered (null = overview)
 	selected: null, // session address currently displayed
-	selectedMail: null, // mail detail to show inside the mailbox view
+	selectedMail: null, // thread detail of the open mail
+	mailbox: null, // inbox listing of the selected session
+	mailboxError: null,
 };
 
 function addr(s) {
@@ -62,14 +90,13 @@ function renderSidebar() {
 		return;
 	}
 	for (const [project, sessions] of [...byProject.entries()].sort()) {
-		const info = (state.info && state.info.projects || []).find((p) => p.id === project) || {};
+		const info = ((state.info && state.info.projects) || []).find((p) => p.id === project) || {};
 		const where = [info.host, info.path].filter(Boolean).join("  ");
 		const head = el("h2", {}, project);
 		if (where) head.append(el("span", { class: "where", title: where }, where));
-		const group = el("div", { class: "project" + (project === state.selectedProject ? " active" : "") },
-			head);
+		const group = el("div", { class: "project" + (project === state.selectedProject ? " active" : "") }, head);
 		head.addEventListener("click", () => selectProject(project));
-		for (const s of sessions.sort((a, b) => a.session < b.session ? -1 : 1)) {
+		for (const s of sessions.sort((a, b) => (a.session < b.session ? -1 : 1))) {
 			const extra = [s.agent, s.name, (s.tags || []).join(",")].filter(Boolean).join(" · ");
 			const item = el("button", {
 				type: "button",
@@ -86,67 +113,61 @@ function renderSidebar() {
 	}
 }
 
-function renderContent() {
-	const content = document.getElementById("content");
-	content.replaceChildren();
-	if (!state.selected) {
-		if (!state.selectedProject) renderProjectOverview(content);
-		else renderProjectDetail(content);
-		return;
-	}
-	if (state.mailboxError) {
-		content.append(el("p", { class: "error" }, state.mailboxError));
-		return;
-	}
-	const mb = state.mailbox;
-	if (!mb) {
-		content.append(el("p", { class: "hint" }, "loading…"));
-		return;
-	}
-	const head = el("h1", {}, state.selected,
-		el("span", { class: "counts" }, `${mb.totalUnread} unread / ${mb.total} mails`));
-
-	if (state.selectedMail) {
-		content.append(head, renderMailDetail(state.selectedMail));
-		return;
-	}
-	if (mb.mails.length === 0) {
-		content.append(head, el("p", { class: "hint" }, "mailbox is empty"));
-	} else {
-		const list = el("ul", { class: "mails" });
-		for (const m of mb.mails) {
-			const item = el("li", { class: m.readAt ? "read" : "unread" },
-				el("span", { class: "dot" }, m.readAt ? "" : "●"),
-				el("span", { class: "from" }, `${m.from.session}@${m.from.project}`),
-				el("span", { class: "date" }, fmtTime(m.createdAt)),
-				el("span", { class: "subject" }, m.subject),
-			);
-			item.addEventListener("click", () => selectMail(m));
-			list.append(item);
-		}
-		content.append(head, list);
-	}
-	if (mb.nextCursor) {
-		const more = el("button", { type: "button", class: "more" }, "older mails");
-		more.addEventListener("click", () => loadMailbox(mb.nextCursor, true));
-		content.append(more);
-	}
-	// session meta panel (full, unfiltered)
-	const session = state.sessions.find((s) => addr(s) === state.selected);
-	if (session && session.meta && Object.keys(session.meta).length > 0) {
-		const panel = el("div", { class: "meta" }, el("h2", {}, "meta"));
-		const table = el("table", {});
-		for (const [k, v] of Object.entries(session.meta).sort()) {
-			table.append(el("tr", {}, el("th", {}, k), el("td", {}, v)));
-		}
-		panel.append(table);
-		content.append(panel);
-	}
-}
-
 function sessionCounts(project) {
 	const list = state.sessions.filter((s) => s.project === project);
 	return { total: list.length, online: list.filter((s) => s.online).length };
+}
+
+function renderContent() {
+	const content = document.getElementById("content");
+	content.replaceChildren();
+	if (state.selectedMail) {
+		const head = el("h1", {}, state.selected,
+			el("span", { class: "counts" }, state.selectedMail.mail.subject));
+		content.append(head, renderThread(state.selectedMail));
+		return;
+	}
+	if (state.selected) {
+		if (state.mailboxError) {
+			content.append(el("p", { class: "error" }, state.mailboxError));
+			return;
+		}
+		const mb = state.mailbox;
+		if (!mb) {
+			content.append(el("h1", {}, state.selected), el("p", { class: "hint" }, "loading…"));
+			return;
+		}
+		const head = el("h1", {}, state.selected,
+			el("span", { class: "counts" }, `${mb.totalUnread} unread / ${mb.total} mails`));
+		if (mb.mails.length === 0) {
+			content.append(head, el("p", { class: "hint" }, "mailbox is empty"));
+		} else {
+			const list = el("ul", { class: "mails" });
+			for (const m of mb.mails) {
+				const item = el("li", { class: m.readAt ? "read" : "unread" },
+					el("span", { class: "dot" }, m.readAt ? "" : "●"),
+					el("span", { class: "from" }, `${m.from.session}@${m.from.project}`),
+					el("span", { class: "date" }, fmtTime(m.createdAt)),
+					el("span", { class: "subject" }, m.subject),
+				);
+				item.addEventListener("click", () => selectMail(m));
+				list.append(item);
+			}
+			content.append(head, list);
+		}
+		if (mb.nextCursor) {
+			const more = el("button", { type: "button", class: "more" }, "older mails");
+			more.addEventListener("click", () => loadMailbox(mb.nextCursor, true));
+			content.append(more);
+		}
+		renderMetaPanel(content);
+		return;
+	}
+	if (state.selectedProject) {
+		renderProjectDetail(content);
+		return;
+	}
+	renderProjectOverview(content);
 }
 
 function renderProjectOverview(content) {
@@ -163,7 +184,7 @@ function renderProjectOverview(content) {
 		const row = el("tr", { class: "row" },
 			el("td", { class: "mono" }, p.id),
 			el("td", {}, p.host || "—"),
-			el("td", { class: "mono path" }, p.path || "(central storage)" ),
+			el("td", { class: "mono path" }, p.path || "(central storage)"),
 			el("td", {}, counts.online + " online / " + counts.total),
 		);
 		row.addEventListener("click", () => selectProject(p.id));
@@ -174,9 +195,9 @@ function renderProjectOverview(content) {
 
 async function renderProjectDetail(content) {
 	const project = state.selectedProject; // capture for the stale check
-	const info = ((state.info && state.info.projects) || []).find((p) => p.id === state.selectedProject) || {};
-	const counts = sessionCounts(state.selectedProject);
-	content.append(el("h1", {}, state.selectedProject,
+	const info = ((state.info && state.info.projects) || []).find((p) => p.id === project) || {};
+	const counts = sessionCounts(project);
+	content.append(el("h1", {}, project,
 		el("span", { class: "counts" }, counts.online + " online / " + counts.total + " sessions")));
 	const where = [info.host, info.path].filter(Boolean).join("  ");
 	if (where) content.append(el("p", { class: "hint where" }, where));
@@ -214,63 +235,187 @@ async function renderProjectDetail(content) {
 	content.append(back);
 }
 
-function renderMailDetail(detail) {
-	const mail = detail.mail;
-	const box = el("article", { class: "mail-detail" });
-	box.append(el("h2", {}, mail.subject));
-	box.append(el("p", { class: "meta-line" }, "from: ", el("strong", {}, `${mail.from.session}@${mail.from.project}`)));
-	box.append(el("p", { class: "meta-line" }, "date: " + fmtTime(mail.createdAt)));
-	box.append(el("p", { class: "meta-line" }, "read: " + (mail.readAt ? fmtTime(mail.readAt) : "unread")));
-	if ((mail.refs || []).length > 0) {
-		const refs = el("p", { class: "meta-line" }, "refs: ");
-		mail.refs.forEach((r, i) => {
-			if (i > 0) refs.append(", ");
-			const link = el("a", { href: "#", class: "ref" }, `${r.session}@${r.project}/${r.mail}`);
-			link.addEventListener("click", (ev) => {
-				ev.preventDefault();
-				selectSession(`${r.session}@${r.project}`, r.mail);
-			});
-			refs.append(link);
-		});
-		box.append(refs);
-	}
-	box.append(el("pre", { class: "body" }, mail.body));
-
-	// forum-style reply chain: mails referencing this one (transitively),
-	// oldest first, full bodies
-	const replies = detail.replies || [];
-	if (replies.length > 0) {
-		const thread = el("div", { class: "thread" }, el("h2", {}, "replies (" + replies.length + ")"));
-		for (const rep of replies) {
-			const head = el("div", { class: "reply-head" },
-				el("span", { class: "from" }, (rep.mail.from.session || "?") + "@" + (rep.mail.from.project || "")),
-				el("span", { class: "date" }, fmtTime(rep.mail.createdAt)),
-			);
-			head.addEventListener("click", () => selectSession(rep.owner, rep.mail.id));
-			thread.append(
-				el("article", { class: "reply" },
-					head,
-					el("h3", {}, rep.mail.subject),
-					el("pre", { class: "body" }, rep.mail.body),
-				),
-			);
+function renderMetaPanel(content) {
+	const session = state.sessions.find((s) => addr(s) === state.selected);
+	if (session && session.meta && Object.keys(session.meta).length > 0) {
+		const panel = el("div", { class: "meta" }, el("h2", {}, "meta"));
+		const table = el("table", {});
+		for (const [k, v] of Object.entries(session.meta).sort()) {
+			table.append(el("tr", {}, el("th", {}, k), el("td", {}, v)));
 		}
-		box.append(thread);
+		panel.append(table);
+		content.append(panel);
 	}
+}
 
+// thread rendering: Reddit-style nesting — direct replies one level below
+// the parent, replies-to-replies one level deeper
+
+function refKeyOf(ref) {
+	return ref.project + "/" + ref.session + "/" + ref.mail;
+}
+
+function entryKeyOf(entry) {
+	// entry.owner = "session@project" (ids are base36, no "@" inside)
+	const at = entry.owner.indexOf("@");
+	return entry.owner.slice(at + 1) + "/" + entry.owner.slice(0, at) + "/" + entry.mail.id;
+}
+
+function renderThread(detail) {
+	// index every thread mail by its ref
+	const byRef = new Map();
+	const rootKey = entryKeyOf({ owner: detail.owner, mail: detail.mail });
+	byRef.set(rootKey, { owner: detail.owner, mail: detail.mail, children: [] });
+	for (const r of detail.replies || []) {
+		byRef.set(entryKeyOf(r), { owner: r.owner, mail: r.mail, children: [] });
+	}
+	const root = byRef.get(rootKey);
+	// attach each reply to the thread mail it references (first resolvable
+	// ref; a reply is in the closure only because at least one ref resolves)
+	for (const r of detail.replies || []) {
+		let parent = root;
+		for (const ref of r.mail.refs || []) {
+			const p = byRef.get(refKeyOf(ref));
+			if (p) {
+				parent = p;
+				break;
+			}
+		}
+		parent.children.push(r);
+	}
+	const box = el("article", { class: "mail-detail" });
+	box.append(renderThreadNode(root, 0));
 	const back = el("button", { type: "button" }, "back to mailbox");
-	back.addEventListener("click", () => {
-		state.selectedMail = null;
-		renderContent();
-	});
+	back.addEventListener("click", closeMail);
 	box.append(back);
 	return box;
 }
 
-// ------------------------------------------------------------------ actions
+function renderThreadNode(node, depth) {
+	const mail = node.mail;
+	const article = el("article", { class: "reply" + (depth === 0 ? " root" : "") });
+	const head = el("div", { class: "reply-head" },
+		el("span", { class: "from" }, mail.from.session + "@" + mail.from.project),
+		el("span", { class: "date" }, fmtTime(mail.createdAt)),
+	);
+	if (depth > 0) {
+		head.addEventListener("click", () => selectSession(node.owner, mail.id));
+		head.title = "open this mail's own thread";
+	}
+	article.append(
+		head,
+		el("h3", {}, mail.subject),
+		el("pre", { class: "body" }, mail.body),
+	);
+	if (node.children.length > 0) {
+		// oldest first within each level
+		node.children.sort((a, b) => (a.mail.createdAt < b.mail.createdAt ? -1 : a.mail.createdAt > b.mail.createdAt ? 1 : a.mail.id < b.mail.id ? -1 : 1));
+		const kids = el("div", { class: "children" });
+		for (const child of node.children) {
+			kids.append(renderThreadNode(child, depth + 1));
+		}
+		article.append(kids);
+	}
+	return article;
+}
+
+// ------------------------------------------------- hash-driven navigation
+//
+// Every navigation writes the hash; hashchange -> applyParams does the
+// actual state mutation and rendering. Back/forward replay old hashes.
 
 function selectProject(project) {
-	state.selectedProject = project;
+	const p = hashParams();
+	if (project) p.set("project", project);
+	else p.delete("project");
+	p.delete("session");
+	p.delete("mail");
+	writeHash(p);
+}
+
+function selectSession(address, mailId) {
+	const p = hashParams();
+	p.delete("project");
+	if (mailId) {
+		p.delete("session");
+		p.set("mail", encRef(address + "/" + mailId));
+	} else {
+		p.delete("mail");
+		p.set("session", encRef(address));
+	}
+	writeHash(p);
+}
+
+function selectMail(m) {
+	const p = hashParams();
+	p.delete("session");
+	p.set("mail", encRef(state.selected + "/" + m.id));
+	writeHash(p);
+}
+
+function closeMail() {
+	const p = hashParams();
+	p.delete("mail");
+	p.set("session", state.selected);
+	writeHash(p);
+}
+
+function projectOfOwner(owner) {
+	const at = owner.indexOf("@");
+	return at > 0 ? owner.slice(at + 1) : owner;
+}
+
+function applyParams() {
+	const p = hashParams();
+	let mailParam = null;
+	let sessionParam = null;
+	try {
+		if (p.get("mail")) mailParam = decRef(p.get("mail"));
+		if (p.get("session")) sessionParam = decRef(p.get("session"));
+	} catch {
+		mailParam = null; // malformed encoding: fall through to lower states
+		sessionParam = null;
+	}
+	const projectParam = p.get("project");
+
+	if (mailParam) {
+		const slash = mailParam.lastIndexOf("/");
+		if (slash > 0) {
+			const owner = mailParam.slice(0, slash);
+			const mailId = mailParam.slice(slash + 1);
+			state.selectedProject = projectOfOwner(owner);
+			state.selected = owner;
+			state.selectedMail = null;
+			state.mailbox = null;
+			state.mailboxError = null;
+			renderSidebar();
+			renderContent();
+			openThread(owner, mailId);
+			return;
+		}
+	}
+	if (sessionParam) {
+		state.selectedProject = projectOfOwner(sessionParam);
+		state.selected = sessionParam;
+		state.selectedMail = null;
+		state.mailbox = null;
+		state.mailboxError = null;
+		renderSidebar();
+		renderContent();
+		loadMailbox(null, false);
+		return;
+	}
+	if (projectParam) {
+		state.selectedProject = projectParam;
+		state.selected = null;
+		state.selectedMail = null;
+		state.mailbox = null;
+		state.mailboxError = null;
+		renderSidebar();
+		renderContent();
+		return;
+	}
+	state.selectedProject = null;
 	state.selected = null;
 	state.selectedMail = null;
 	state.mailbox = null;
@@ -279,16 +424,7 @@ function selectProject(project) {
 	renderContent();
 }
 
-async function selectSession(address, mailId) {
-	state.selected = address;
-	state.selectedMail = null;
-	state.mailbox = null;
-	state.mailboxError = null;
-	renderSidebar();
-	renderContent();
-	await loadMailbox(null, false);
-	if (mailId) await selectMail({ id: mailId });
-}
+// ------------------------------------------------------------------ actions
 
 async function loadMailbox(cursor, append) {
 	const target = state.selected; // capture for the stale check
@@ -303,18 +439,19 @@ async function loadMailbox(cursor, append) {
 			state.mailbox = mb;
 		}
 	} catch (err) {
+		if (state.selected !== target) return; // stale response
 		state.mailboxError = String(err.message || err);
 	}
 	renderContent();
 }
 
-async function selectMail(m) {
-	const target = state.selected; // capture for the stale check
+async function openThread(owner, mailId) {
 	try {
-		const detail = await api(`/api/thread/${target}/${m.id}`);
-		if (state.selected !== target) return; // stale response
+		const detail = await api(`/api/thread/${owner}/${mailId}`);
+		if (state.selected !== owner) return; // stale response
 		state.selectedMail = detail;
 	} catch (err) {
+		if (state.selected !== owner) return; // stale response
 		state.selectedMail = null;
 		state.mailboxError = String(err.message || err);
 	}
@@ -332,21 +469,14 @@ async function refresh() {
 		const proj = (info.projects || []).map((p) => p.id).join(", ");
 		document.getElementById("daemon-info").textContent =
 			`mailboxd · instance ${info.instanceId} · ${info.remote ? "remote" : "local"} · projects: ${proj || "none"}`;
-		if (state.selected && !state.sessions.some((s) => addr(s) === state.selected)) {
-			state.selected = null;
-			state.selectedMail = null;
-			state.mailbox = null;
-		}
-		if (state.selectedProject && !((state.info && state.info.projects) || []).some((p) => p.id === state.selectedProject)) {
-			state.selectedProject = null;
-		}
-		renderSidebar();
-		renderContent();
 	} catch (err) {
 		document.getElementById("content").replaceChildren(
 			el("p", { class: "error" }, String(err.message || err)));
+		return;
 	}
+	applyParams();
 }
 
+window.addEventListener("hashchange", applyParams);
 document.getElementById("refresh").addEventListener("click", refresh);
 refresh();
