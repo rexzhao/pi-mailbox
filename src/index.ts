@@ -31,6 +31,12 @@ const ADDRESS_FORMAT_DOC =
 	"Addressing: a mailbox address is 'session@project'; a mail reference is 'session@project/mail' " +
 	"(a bare mail id means your own mailbox). Use mailbox_sessions to list peer addresses.";
 
+/** http base URL from host + port, bracketing IPv6 literals. */
+function httpBase(host: string, port: number): string {
+	const h = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+	return `http://${h}:${port}`;
+}
+
 /** Best-effort browser open; detached, failures are ignored. */
 function openBrowser(url: string): void {
 	const plat = process.platform;
@@ -249,14 +255,14 @@ export default function (pi: ExtensionAPI) {
 					if (remote) {
 						// remote daemon: not in this machine's registry; build
 						// the URL from the live connection's target
-						const base = `http://${remote.host}:${remote.port}`;
+						const base = httpBase(remote.host, remote.port);
 						const resp = await fetch(`${base}/healthz`, {
 							headers: remote.token ? { Authorization: `Bearer ${remote.token}` } : {},
 							signal: AbortSignal.timeout(1_500),
 						});
 						if (resp.status === 401) throw new Error("unauthorized: daemon requires a token");
 						if (!resp.ok) throw new Error(`daemon answered ${resp.status}`);
-						url = remote.token ? `${base}/#t=${remote.token}` : `${base}/`;
+						url = `${base}/`;
 					} else {
 						// local: delegate to mailboxd view --json (single source of truth)
 						const bin = findMailboxdBinary();
@@ -267,8 +273,16 @@ export default function (pi: ExtensionAPI) {
 						}
 						url = (JSON.parse(result.stdout) as { url: string }).url;
 					}
-					ctx.ui.notify(`mailbox: ${url}`, "info");
-					openBrowser(url);
+					// open the full URL (token in the fragment for remote); show
+					// the address without the token so it never lands in the
+					// persistent session transcript
+					const remote2 = conn?.connected ? conn.remoteTarget : null;
+					const fullUrl = remote2?.token ? `${url}#t=${remote2.token}` : url;
+					ctx.ui.notify(
+						remote2?.token ? `mailbox: ${url} (token applied via URL fragment; omitted here)` : `mailbox: ${url}`,
+						"info",
+					);
+					openBrowser(fullUrl);
 				} catch (err) {
 					ctx.ui.notify(`mailbox: ${err instanceof Error ? err.message : String(err)}`, "error");
 				}

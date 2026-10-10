@@ -7,10 +7,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"runtime"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -51,7 +54,12 @@ func viewDaemon(out io.Writer, registryPath, host, token, tokenFile string, open
 		return code
 	}
 
-	url := fmt.Sprintf("http://%s:%d/", host, reg.Port)
+	hostPort, err := joinHostPort(host, reg.Port)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "mailboxd: %v\n", err)
+		return 1
+	}
+	url := "http://" + hostPort + "/"
 	if token != "" {
 		url += "#t=" + token
 	}
@@ -80,7 +88,12 @@ func viewDaemon(out io.Writer, registryPath, host, token, tokenFile string, open
 // probeHealthz verifies the daemon is reachable and returns its reply.
 func probeHealthz(host string, port int, token string) (map[string]any, int) {
 	client := &http.Client{Timeout: 1500 * time.Millisecond}
-	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://%s:%d/healthz", host, port), nil)
+	hostPort, err := joinHostPort(host, port)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "mailboxd: %v\n", err)
+		return nil, 1
+	}
+	req, err := http.NewRequest(http.MethodGet, "http://"+hostPort+"/healthz", nil)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "mailboxd: %v\n", err)
 		return nil, 1
@@ -104,6 +117,21 @@ func probeHealthz(host string, port int, token string) (map[string]any, int) {
 		return nil, 1
 	}
 	return reply, 0
+}
+
+// joinHostPort normalizes a host for URL building: rejects inputs that
+// already carry a port and brackets IPv6 literals.
+func joinHostPort(host string, port int) (string, error) {
+	if host == "" {
+		return "", fmt.Errorf("empty host")
+	}
+	if _, _, err := net.SplitHostPort(host); err == nil {
+		return "", fmt.Errorf("--host must not include a port: %q", host)
+	}
+	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
+		host = "[" + host + "]"
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port)), nil
 }
 
 // browserOpener is a var so tests can inject a fake.
