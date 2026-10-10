@@ -187,8 +187,10 @@ export function deriveSessionId(agent: string, session: string): string {
 export async function readHostId(): Promise<string> {
 	const path = join(daemonHome(), "mailbox-host-id");
 	const valid = (s: string) => /^[0-9a-f]{16}$/.test(s);
+	const read = async () =>
+		((await readFile(path, "utf8")).trim());
 	try {
-		const existing = (await readFile(path, "utf8")).trim();
+		const existing = await read();
 		if (valid(existing)) return existing;
 	} catch {
 		// not created yet
@@ -197,14 +199,24 @@ export async function readHostId(): Promise<string> {
 	const id = randomBytes(8).toString("hex");
 	try {
 		await writeFile(path, id + "\n", { flag: "wx" });
+		return id;
 	} catch (err) {
-		// another process won the create race: use its id
 		if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-		const existing = (await readFile(path, "utf8")).trim();
-		if (valid(existing)) return existing;
-		throw new Error(`mailbox: unreadable host id file at ${path}`);
+		// another process created it, or the file exists with invalid content:
+		// overwrite invalid content, then re-read so concurrent writers agree
+		// on the final value (last write wins; all readers return that value)
+		let existing: string;
+		try {
+			existing = await read();
+		} catch {
+			existing = "";
+		}
+		if (!valid(existing)) {
+			await writeFile(path, id + "\n");
+			return (await read()) || id;
+		}
+		return existing;
 	}
-	return id;
 }
 
 /** First `len` base36 chars of the sha256 of `input` (zero-padded). */

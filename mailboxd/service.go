@@ -33,7 +33,6 @@ func secureTokenEqual(a, b string) bool {
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
-
 type conn struct {
 	daemon  *Daemon
 	ws      *websocket.Conn

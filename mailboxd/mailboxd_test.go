@@ -108,7 +108,7 @@ func (c *testClient) helloShort(rid int, project, root, sessionDir, short, origi
 	msg := map[string]interface{}{
 		"t": "hello", "rid": rid, "project": project, "projectRoot": root,
 		"sessionDir": sessionDir,
-		"session": short, "origin": origin, "agent": agent,
+		"session":    short, "origin": origin, "agent": agent,
 	}
 	if meta != nil {
 		msg["meta"] = meta

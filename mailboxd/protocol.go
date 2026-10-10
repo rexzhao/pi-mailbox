@@ -27,11 +27,11 @@ type PingMsg struct {
 }
 
 type HelloMsg struct {
-	T           string            `json:"t"`
-	Rid         int               `json:"rid"`
-	Project     string            `json:"project"`
-	ProjectRoot string            `json:"projectRoot,omitempty"`
-	SessionDir  string            `json:"sessionDir,omitempty"`
+	T           string `json:"t"`
+	Rid         int    `json:"rid"`
+	Project     string `json:"project"`
+	ProjectRoot string `json:"projectRoot,omitempty"`
+	SessionDir  string `json:"sessionDir,omitempty"`
 	// Session is the short mailbox session id the mailbox is keyed by.
 	Session string `json:"session"`
 	// Origin is the client's full session id (e.g. the pi session UUID);
@@ -96,9 +96,9 @@ type ReadMsg struct {
 }
 
 type CleanupMsg struct {
-	T       string `json:"t"`
-	Rid     int    `json:"rid"`
-	Token   string `json:"token,omitempty"`
+	T     string `json:"t"`
+	Rid   int    `json:"rid"`
+	Token string `json:"token,omitempty"`
 	/** Project UUID; empty = all projects. */
 	Project string `json:"project,omitempty"`
 }
@@ -134,7 +134,7 @@ type WelcomeMsg struct {
 }
 
 type SessionInfo struct {
-	Session string            `json:"session"`
+	Session string `json:"session"`
 	/** Owning project id, so listings render full session@project addresses. */
 	Project string            `json:"project,omitempty"`
 	Agent   string            `json:"agent,omitempty"`
@@ -191,8 +191,8 @@ type MailReply struct {
 }
 
 type CleanupReply struct {
-	T       string         `json:"t"`
-	Rid     int            `json:"rid"`
+	T       string          `json:"t"`
+	Rid     int             `json:"rid"`
 	Results []CleanupResult `json:"results"`
 }
 

@@ -52,9 +52,9 @@ func cleanupDaemon(registryPath, token string) int {
 			continue
 		}
 		var reply struct {
-			T       string `json:"t"`
-			Code    string `json:"code"`
-			Message string `json:"message"`
+			T       string          `json:"t"`
+			Code    string          `json:"code"`
+			Message string          `json:"message"`
 			Results []CleanupResult `json:"results"`
 		}
 		if json.Unmarshal(data, &reply) != nil {

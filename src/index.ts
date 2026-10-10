@@ -74,7 +74,7 @@ function formatSessions(sessions: SessionInfo[]): string {
 			const name = s.name ? `  name=${s.name}` : "";
 			const tags = s.tags && s.tags.length > 0 ? `  tags=${s.tags.join(",")}` : "";
 			const extra = Object.entries(s.meta ?? {})
-				.filter(([k]) => k !== "name" && k !== "tags" && k !== "_agent")
+				.filter(([k]) => k !== "name" && k !== "tags" && k !== "_agent" && k !== "_origin")
 				.map(([k, v]) => `  ${k}=${v}`)
 				.join("");
 			return `[${mark}] ${address}${agent}${name}${tags}${extra}`;
@@ -149,13 +149,18 @@ export default function (pi: ExtensionAPI) {
 		await conn?.stop();
 		conn = null;
 		const session = ctx.sessionManager.getSessionId();
-		const agent = pi.getSessionName() ?? session.slice(0, 8);
+		// Stable agent kind: the session-id derivation and the wire identity
+		// must never change. The user-renamable display name (/name) is meta
+		// only — renaming a session must not move its mailbox.
+		const agent = "pi";
 		// registration-time auto meta: system keys (leading `_`) refresh on every
 		// connect; they cannot be set manually. `_host`/`_platform` are local-only:
 		// remote services should not learn machine details.
 		const helloMeta: Record<string, string> = {
 			_pi: VERSION,
 		};
+		const sessionName = pi.getSessionName();
+		if (sessionName) helloMeta.name = sessionName;
 		if (!remote) {
 			helloMeta._host = hostname();
 			helloMeta._platform = platform();

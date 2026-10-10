@@ -133,6 +133,13 @@ writes its address to `~/.pi/mailboxd.json`. Data lives in each project's
   `--data-dir` (client paths are never trusted), and stays up (idle exit is
   disabled unless `--idle-exit` is set explicitly).
 
+Note on identity changes: ids are derivations, so any change to the
+  derivation inputs (agent kind, session id, host id, project path) maps a
+  session to a new mailbox. The old mailbox file is not migrated — its mails
+  stay on disk, invisible to the relocated session, and are collected by
+  `mailboxd cleanup` once the underlying pi session is gone (or immediately
+  if the mailbox has no live origin).
+
 The wire protocol is protocol v2: `hello` carries the short project id,
   the project root (local mode), an optional pi session directory (lifecycle
   GC), the session's origin id (the full pi session id, stored as the
