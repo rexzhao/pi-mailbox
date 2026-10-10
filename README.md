@@ -72,10 +72,10 @@ below.
 - `/mailbox unset k [k2 ...]` — remove meta values
 - `/mailbox meta` — show this session's full meta
 - `/mailbox read <mailId>` — view one mail
-- `/mailbox start_service` — connect (spawns the daemon if needed)
-- `/mailbox stop_service` — disconnect (the daemon itself keeps running
+- `/mailbox start service` — connect (spawns the daemon if needed)
+- `/mailbox stop service` — disconnect (the daemon itself keeps running
   until its idle timeout, or `mailboxd --stop`)
-- `/mailbox restart_service` — disconnect and reconnect
+- `/mailbox restart service` — disconnect and reconnect
 - `/mailbox status` — connection status
 
 ## Agent tools

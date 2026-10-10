@@ -16,9 +16,11 @@
  */
 
 import { VERSION, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { spawnSync } from "node:child_process";
 import { hostname, platform } from "node:os";
 import { Type } from "typebox";
 import { MailboxConnection, type RemoteTarget } from "./client.ts";
+import { findMailboxdBinary } from "./daemon.ts";
 import type { MailRecord, MailRef, SessionInfo } from "./protocol.ts";
 
 const TOOL_NAMES = ["mailbox_list", "mailbox_read", "mailbox_send", "mailbox_reply", "mailbox_sessions"] as const;
@@ -149,7 +151,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function requireConnection(): MailboxConnection {
-		if (!conn?.connected) throw new Error("mailbox not connected; run /mailbox start_service or the mailbox_connect tool first");
+		if (!conn?.connected) throw new Error("mailbox not connected; run /mailbox start service or the mailbox_connect tool first");
 		return conn;
 	}
 
@@ -174,7 +176,7 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const arg = args.trim();
 
-			if (arg === "start_service") {
+			if (arg === "start service") {
 				try {
 					if (conn?.connected) {
 						ctx.ui.notify("mailbox: already connected", "info");
@@ -188,7 +190,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			if (arg === "restart_service") {
+			if (arg === "restart service") {
 				try {
 					await conn?.stop();
 					conn = null;
@@ -201,19 +203,63 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			if (arg === "stop_service" || arg === "off") {
+			if (arg === "off") {
 				await conn?.stop();
 				conn = null;
 				activateTools(false);
-				ctx.ui.notify("mailbox: disconnected", "info");
+				ctx.ui.notify("mailbox: disconnected (daemon keeps running)", "info");
 				return;
 			}
 
-			if (arg === "status") {
-				if (!conn?.connected) {
-					ctx.ui.notify("mailbox: disconnected", "info");
-				} else {
-						ctx.ui.notify(`mailbox: connected, project ${conn.mailbox.project}`, "info");
+			if (arg === "stop service") {
+				try {
+					await conn?.stop();
+					conn = null;
+					activateTools(false);
+					// gracefully stop the daemon via the shutdown protocol
+					const bin = findMailboxdBinary();
+					if (bin) {
+						const result = spawnSync(bin, ["--stop"], {
+							env: { ...process.env },
+							encoding: "utf8",
+							timeout: 10_000,
+						});
+						if (result.status === 0) {
+							ctx.ui.notify("mailbox: daemon stopped", "info");
+						} else {
+							ctx.ui.notify(
+								`mailbox: daemon stop: ${result.stderr?.trim() || result.stdout?.trim() || "failed"}`,
+								"warning",
+							);
+						}
+					} else {
+						ctx.ui.notify("mailbox: disconnected (mailboxd binary not found for --stop)", "warning");
+					}
+				} catch (err) {
+					ctx.ui.notify(`mailbox: ${err instanceof Error ? err.message : String(err)}`, "error");
+				}
+				return;
+			}
+
+			if (arg === "restart service") {
+				try {
+					await conn?.stop();
+					conn = null;
+					activateTools(false);
+					const bin = findMailboxdBinary();
+					if (bin) {
+						spawnSync(bin, ["--stop"], {
+							env: { ...process.env },
+							encoding: "utf8",
+							timeout: 10_000,
+						});
+					}
+					// wait briefly for the daemon to release the lock
+					await new Promise((resolve) => setTimeout(resolve, 500));
+					const connection = await startConnection(ctx, null);
+					ctx.ui.notify(`mailbox: restarted, project ${connection.mailbox.project}`, "info");
+				} catch (err) {
+					ctx.ui.notify(`mailbox: ${err instanceof Error ? err.message : String(err)}`, "error");
 				}
 				return;
 			}
@@ -280,7 +326,7 @@ export default function (pi: ExtensionAPI) {
 				const m = /^([A-Za-z0-9.-]+):(\d+)(?:\s+(\S+))?$/.exec(arg);
 				if (!m) {
 					ctx.ui.notify(
-						"Usage: /mailbox [start_service | stop_service | restart_service | status | list [client [all]|mail] | meta | name <n> | tag <a,b> | set k=v | unset k | read <id> | more <cursor> | host:port [token]]",
+						"Usage: /mailbox [start service | stop_service | restart service | off | status | list [client [all]|mail] | meta | name <n> | tag <a,b> | set k=v | unset k | read <id> | more <cursor> | host:port [token]]",
 						"warning",
 					);
 					return;
@@ -290,7 +336,7 @@ export default function (pi: ExtensionAPI) {
 
 			try {
 				// only explicit host:port connects; everything else requires
-				// an existing connection (run /mailbox start_service first)
+				// an existing connection (run /mailbox start service first)
 				if (remote) {
 					const connection = await startConnection(ctx, remote);
 					ctx.ui.notify(`mailbox: connected`, "info");
