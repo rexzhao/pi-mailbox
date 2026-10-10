@@ -8,7 +8,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -601,5 +603,271 @@ func TestCleanupOriginGC(t *testing.T) {
 	}
 	if !trashed {
 		t.Fatalf("B's mailbox should be in .trash: %v", trashEntries)
+	}
+}
+
+// TestViewCommand covers `mailboxd view`: registry resolution, the remote
+// --host requirement, and URL/JSON output against a live daemon.
+func TestViewCommand(t *testing.T) {
+	tmp := t.TempDir()
+
+	// fake opener so tests never launch a browser
+	opened := ""
+	oldOpener := browserOpener
+	browserOpener = func(u string) error { opened = u; return nil }
+	defer func() { browserOpener = oldOpener }()
+
+	// no registry -> exit 1
+	var out strings.Builder
+	if code := viewDaemon(&out, filepath.Join(tmp, "missing.json"), "", "", "", false, false); code == 0 {
+		t.Fatal("missing registry should exit non-zero")
+	}
+
+	// remote registry without --host -> exit 1
+	remoteReg := filepath.Join(tmp, "remote.json")
+	os.WriteFile(remoteReg, []byte(`{"port": 1234, "instanceId": "x", "remote": true, "pid": 1}`), 0o644)
+	if code := viewDaemon(&out, remoteReg, "", "", "", false, false); code == 0 {
+		t.Fatal("remote without --host should exit non-zero")
+	}
+
+	// live local daemon -> URL + open
+	root := filepath.Join(tmp, "proj")
+	os.MkdirAll(filepath.Join(root, ".pi", "mailbox"), 0o755)
+	port, stop := bootDaemon(t, tmp, "", false)
+	defer stop()
+	reg := filepath.Join(tmp, "mailboxd.json")
+	out.Reset()
+	if code := viewDaemon(&out, reg, "", "", "", true, false); code != 0 {
+		t.Fatalf("view failed: %s", out.String())
+	}
+	url := strings.TrimSpace(out.String())
+	want := fmt.Sprintf("http://127.0.0.1:%d/", port)
+	if url != want {
+		t.Fatalf("url: got %q want %q", url, want)
+	}
+	if opened != want {
+		t.Fatalf("opener got %q want %q", opened, want)
+	}
+
+	// --json output shape
+	out.Reset()
+	if code := viewDaemon(&out, reg, "", "", "", false, true); code != 0 {
+		t.Fatalf("view --json failed: %s", out.String())
+	}
+	var j map[string]interface{}
+	if err := json.Unmarshal([]byte(out.String()), &j); err != nil {
+		t.Fatalf("json output: %v", err)
+	}
+	if j["url"] != want || int(j["port"].(float64)) != port || int(j["protocolVersion"].(float64)) != ProtocolVersion {
+		t.Fatalf("json fields wrong: %v", j)
+	}
+
+	// dead port -> exit 1
+	deadReg := filepath.Join(tmp, "dead.json")
+	os.WriteFile(deadReg, []byte(fmt.Sprintf(`{"port": %d, "instanceId": "x", "remote": false, "pid": 1}`, lastFreePort())), 0o644)
+	if code := viewDaemon(&out, deadReg, "", "", "", false, false); code == 0 {
+		t.Fatal("dead daemon should exit non-zero")
+	}
+}
+
+func lastFreePort() int {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 1
+	}
+	defer l.Close()
+	return l.Addr().(*net.TCPAddr).Port
+}
+
+// TestHTTPAPI covers the read-only web API: shapes, the readAt-unchanged
+// invariant, and the tokenless local-mode Host/Origin defenses.
+func TestHTTPAPI(t *testing.T) {
+	tmp := t.TempDir()
+	root := filepath.Join(tmp, "proj")
+	os.MkdirAll(filepath.Join(root, ".pi", "mailbox"), 0o755)
+	port, stop := bootDaemon(t, tmp, "", false)
+	defer stop()
+	base := fmt.Sprintf("http://127.0.0.1:%d", port)
+
+	a := dialTest(t, port)
+	a.hello(1, "p", root, "s1", "a", nil)
+	b := dialTest(t, port)
+	b.hello(1, "p", root, "s2", "b", nil)
+	// a mail into b's mailbox (unread)
+	if m := a.request(map[string]interface{}{
+		"t": "send", "rid": 2,
+		"target":  map[string]string{"project": "p", "session": "s2"},
+		"subject": "api test", "body": "x",
+	}); m["t"] != "sent" {
+		t.Fatalf("send failed: %v", m)
+	}
+	inb := b.request(map[string]interface{}{"t": "inbox", "rid": 4})
+	mails := inb["mails"].([]interface{})
+	if len(mails) != 1 {
+		t.Fatalf("expected 1 mail, got %v", inb)
+	}
+	mailID := mails[0].(map[string]interface{})["id"].(string)
+
+	get := func(path string, headers map[string]string, hostOverride string) (*http.Response, map[string]interface{}) {
+		req, _ := http.NewRequest(http.MethodGet, base+path, nil)
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		if hostOverride != "" {
+			req.Host = hostOverride
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var body map[string]interface{}
+		data, _ := io.ReadAll(resp.Body)
+		json.Unmarshal(data, &body)
+		return resp, body
+	}
+
+	// healthz
+	resp, body := get("/healthz", nil, "")
+	if resp.StatusCode != 200 || int(body["protocolVersion"].(float64)) != ProtocolVersion {
+		t.Fatalf("healthz: %v %v", resp.StatusCode, body)
+	}
+
+	// info
+	resp, body = get("/api/info", nil, "")
+	if resp.StatusCode != 200 {
+		t.Fatalf("info: %v", resp.StatusCode)
+	}
+	projects := body["projects"].([]interface{})
+	if len(projects) != 1 || projects[0].(map[string]interface{})["id"] != "p" {
+		t.Fatalf("info projects: %v", body)
+	}
+
+	// sessions
+	resp, body = get("/api/sessions?includeOffline=1", nil, "")
+	if resp.StatusCode != 200 {
+		t.Fatalf("sessions: %v", resp.StatusCode)
+	}
+	sessions := body["sessions"].([]interface{})
+	if len(sessions) != 2 {
+		t.Fatalf("sessions: %v", body)
+	}
+
+	// mailbox listing: readAt must stay null (read-only invariant)
+	resp, body = get("/api/mailbox/s2@p", nil, "")
+	if resp.StatusCode != 200 || int(body["total"].(float64)) != 1 || int(body["totalUnread"].(float64)) != 1 {
+		t.Fatalf("mailbox: %v %v", resp.StatusCode, body)
+	}
+	listMails := body["mails"].([]interface{})
+	if listMails[0].(map[string]interface{})["readAt"] != nil {
+		t.Fatal("API listing must not mark mails read")
+	}
+
+	// single mail: readAt must stay null
+	resp, body = get("/api/mail/s2@p/"+mailID, nil, "")
+	if resp.StatusCode != 200 || body["readAt"] != nil {
+		t.Fatalf("mail detail: %v %v", resp.StatusCode, body)
+	}
+
+	// the WS read still works and marks read AFTER the API calls
+	rd := b.request(map[string]interface{}{
+		"t": "read", "rid": 5,
+		"mail": map[string]string{"project": "p", "session": "s2", "mail": mailID},
+	})
+	if rd["mail"].(map[string]interface{})["readAt"] == nil {
+		t.Fatal("WS read should mark readAt after API access")
+	}
+
+	// unknown project / no mailbox
+	if resp, _ = get("/api/mailbox/s2@nope", nil, ""); resp.StatusCode != 404 {
+		t.Fatalf("unknown project: %v", resp.StatusCode)
+	}
+	if resp, _ = get("/api/mailbox/ghost@p", nil, ""); resp.StatusCode != 404 {
+		t.Fatalf("no mailbox: %v", resp.StatusCode)
+	}
+
+	// Host allowlist (DNS-rebinding defense): a foreign Host is rejected
+	if resp, _ = get("/api/info", nil, "evil.example"); resp.StatusCode != 403 {
+		t.Fatalf("foreign host: %v", resp.StatusCode)
+	}
+	// Origin mismatch is rejected
+	if resp, _ = get("/api/info", map[string]string{"Origin": "http://evil.example"}, ""); resp.StatusCode != 403 {
+		t.Fatalf("foreign origin: %v", resp.StatusCode)
+	}
+
+	// static page: served without token, CSP set
+	resp, _ = get("/", nil, "")
+	if resp.StatusCode != 200 || resp.Header.Get("Content-Security-Policy") != "default-src 'self'" {
+		t.Fatalf("static: %v %v", resp.StatusCode, resp.Header)
+	}
+
+	// non-GET on the API
+	req, _ := http.NewRequest(http.MethodPost, base+"/api/info", nil)
+	resp2, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != 405 {
+		t.Fatalf("POST should be 405, got %v", resp2.StatusCode)
+	}
+}
+
+// TestHTTPAPIToken covers the remote-mode API: every data endpoint requires
+// the Bearer token; the static shell stays reachable without it.
+func TestHTTPAPIToken(t *testing.T) {
+	tmp := t.TempDir()
+	port, stop := bootDaemon(t, tmp, "sekrit", true)
+	defer stop()
+	base := fmt.Sprintf("http://127.0.0.1:%d", port)
+
+	// register a project via WS so /api/info has content
+	c := dialTest(t, port)
+	c.request(map[string]interface{}{
+		"t": "hello", "rid": 1, "project": "px", "session": "s1", "agent": "a", "token": "sekrit",
+	})
+
+	resp, err := http.Get(base + "/api/info")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 401 {
+		t.Fatalf("api without token: %v", resp.StatusCode)
+	}
+
+	resp, err = http.Get(base + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 401 {
+		t.Fatalf("healthz without token (remote): %v", resp.StatusCode)
+	}
+
+	req, _ := http.NewRequest(http.MethodGet, base+"/api/info", nil)
+	req.Header.Set("Authorization", "Bearer sekrit")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("api with token: %v", resp.StatusCode)
+	}
+	var body map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&body)
+	if body["remote"] != true {
+		t.Fatalf("info remote flag: %v", body)
+	}
+
+	// static shell without token
+	resp2, err := http.Get(base + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != 200 {
+		t.Fatalf("static without token: %v", resp2.StatusCode)
 	}
 }

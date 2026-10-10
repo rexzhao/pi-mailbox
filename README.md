@@ -128,6 +128,14 @@ writes its address to `~/.pi/mailboxd.json`. Data lives in each project's
 `.pi/mailbox/` directory (the client supplies the project root). Exits after
 `--idle-exit` (default 5m) with zero connected clients.
 
+**Web UI**: `mailboxd view` prints (and with `--open` opens) the address of
+the running daemon's read-only web UI — a viewer for projects, sessions,
+mailboxes, and mails (unread markers, refs, full meta). Remote daemons
+require `--host` and a token; the token travels in the URL fragment and is
+moved into an Authorization header by the page. In pi, `/mailbox view` does
+the same from an extension session. The UI never mutates state: reading
+through it does not mark mails read.
+
 **Remote mode** (`--listen` on a non-loopback address): serves external
   machines, requires `--token`/`--token-file`, stores all projects under
   `--data-dir` (client paths are never trusted), and stays up (idle exit is

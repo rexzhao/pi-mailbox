@@ -51,6 +51,15 @@ func main() {
 			commonFlags(fs)
 			fs.Parse(os.Args[2:])
 			os.Exit(cleanupDaemon(commonRegistry, commonToken))
+		case "view":
+			fs := flag.NewFlagSet("view", flag.ExitOnError)
+			commonFlags(fs)
+			host := fs.String("host", "", "host to use in the URL (required for remote daemons; local defaults to 127.0.0.1)")
+			tokenFile := fs.String("token-file", "", "file containing the connection token (first line)")
+			openIt := fs.Bool("open", false, "open the URL in the default browser")
+			asJSON := fs.Bool("json", false, "print machine-readable JSON instead of the URL")
+			fs.Parse(os.Args[2:])
+			os.Exit(viewDaemon(os.Stdout, commonRegistry, *host, commonToken, *tokenFile, *openIt, *asJSON))
 		case "version":
 			fmt.Println("mailboxd", ProtocolVersion)
 			return
@@ -360,6 +369,7 @@ func printUsage() {
 	fmt.Println("  mailboxd [daemon-flags]       start the daemon (or: mailboxd serve [daemon-flags])")
 	fmt.Println("  mailboxd stop [options]       stop the running daemon")
 	fmt.Println("  mailboxd cleanup [options]    run orphan-mailbox cleanup on the running daemon")
+	fmt.Println("  mailboxd view [options]       print the web UI address of the running daemon")
 	fmt.Println("  mailboxd version              print the version")
 	fmt.Println()
 	fmt.Println("Daemon flags:")
@@ -371,7 +381,13 @@ func printUsage() {
 	fmt.Println("  --registry <file>         registry file path")
 	fmt.Println("  --lock <file>             leader lock file path")
 	fmt.Println()
-	fmt.Println("Subcommand options (stop / cleanup):")
+	fmt.Println("View options:")
+	fmt.Println("  --host <addr>             host for the URL (required for remote daemons)")
+	fmt.Println("  --open                    open the URL in the default browser")
+	fmt.Println("  --json                    print JSON {url, host, port, instanceId, remote, protocolVersion}")
+	fmt.Println("  --token-file <path>       file containing the connection token")
+	fmt.Println()
+	fmt.Println("Subcommand options (stop / cleanup / view):")
 	fmt.Println("  --registry <file>         registry file path")
 	fmt.Println("  --token <secret>          connection token")
 }

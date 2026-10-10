@@ -77,9 +77,14 @@ func (c *conn) close() {
 	c.ws.CloseNow()
 }
 
-// httpHandler upgrades every request to a mailbox connection.
+// httpHandler dispatches between the WebSocket protocol and the read-only
+// web UI (see api.go) on the same port.
 func (d *Daemon) httpHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+			d.serveHTTP(w, r)
+			return
+		}
 		// browsers are not the client here; default origin policies are
 		// irrelevant for non-browser WebSocket clients
 		ws, err := websocket.Accept(w, r, nil)
@@ -256,6 +261,9 @@ func (d *Daemon) project(msg HelloMsg) (*Project, error) {
 		return nil, err
 	}
 	p := &Project{ID: msg.Project, Store: store, online: map[string]*conn{}}
+	if !d.Remote {
+		p.RootPath = msg.ProjectRoot
+	}
 	if !d.Remote && msg.SessionDir != "" {
 		p.SessionDir = msg.SessionDir
 	}

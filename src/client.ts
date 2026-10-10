@@ -291,6 +291,10 @@ export class MailboxConnection {
 
 	private readonly mode: ConnectionMode;
 	private readonly projectDir: string;
+	/** Remote target this connection dials (null in local mode). */
+	get remoteTarget(): RemoteTarget | null {
+		return this.remote;
+	}
 	private readonly remote: RemoteTarget | null;
 	readonly session: string;
 	/** Short mailbox session id (derived from agent + session). This is the wire identity. */

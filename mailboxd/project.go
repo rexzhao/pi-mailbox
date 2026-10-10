@@ -14,6 +14,7 @@ var (
 type Project struct {
 	ID         string
 	Store      *Store
+	RootPath   string // absolute project root (local mode only; informational)
 	SessionDir string // pi session directory, for the lifecycle GC (local mode)
 
 	mu     sync.Mutex

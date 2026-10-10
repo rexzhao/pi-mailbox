@@ -8,6 +8,7 @@
  * /mailbox tag <a,b,...>   set tags
  * /mailbox set k=v ...     set meta values (cookie-like key/value)
  * /mailbox unset k ...     remove meta values
+ * /mailbox view            print (and open) the daemon's read-only web UI
  * /mailbox off             disconnect
  * /mailbox status          connection status
  *
@@ -16,7 +17,7 @@
  */
 
 import { VERSION, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { hostname, platform } from "node:os";
 import { Type } from "typebox";
 import { MailboxConnection, type RemoteTarget } from "./client.ts";
@@ -29,6 +30,18 @@ const TOOL_NAMES = ["mailbox_list", "mailbox_read", "mailbox_send", "mailbox_rep
 const ADDRESS_FORMAT_DOC =
 	"Addressing: a mailbox address is 'session@project'; a mail reference is 'session@project/mail' " +
 	"(a bare mail id means your own mailbox). Use mailbox_sessions to list peer addresses.";
+
+/** Best-effort browser open; detached, failures are ignored. */
+function openBrowser(url: string): void {
+	const plat = process.platform;
+	const cmd = plat === "win32" ? "cmd" : plat === "darwin" ? "open" : "xdg-open";
+	const args = plat === "win32" ? ["/c", "start", "", url] : [url];
+	try {
+		spawn(cmd, args, { detached: true, stdio: "ignore" }).unref();
+	} catch {
+		// best-effort; the URL is already shown to the user
+	}
+}
 
 /** Parse "session" (own project) or "session@project" into an AgentRef. */
 function parseAddress(addr: string, ownProject: string): { project: string; session: string } {
@@ -229,6 +242,39 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
+			if (arg === "view") {
+				try {
+					let url: string;
+					const remote = conn?.connected ? conn.remoteTarget : null;
+					if (remote) {
+						// remote daemon: not in this machine's registry; build
+						// the URL from the live connection's target
+						const base = `http://${remote.host}:${remote.port}`;
+						const resp = await fetch(`${base}/healthz`, {
+							headers: remote.token ? { Authorization: `Bearer ${remote.token}` } : {},
+							signal: AbortSignal.timeout(1_500),
+						});
+						if (resp.status === 401) throw new Error("unauthorized: daemon requires a token");
+						if (!resp.ok) throw new Error(`daemon answered ${resp.status}`);
+						url = remote.token ? `${base}/#t=${remote.token}` : `${base}/`;
+					} else {
+						// local: delegate to mailboxd view --json (single source of truth)
+						const bin = findMailboxdBinary();
+						if (!bin) throw new Error("mailboxd binary not found; cannot resolve the web UI address");
+						const result = spawnSync(bin, ["view", "--json"], { encoding: "utf8", timeout: 10_000 });
+						if (result.status !== 0) {
+							throw new Error((result.stderr || result.stdout || "failed to resolve the web UI address").trim());
+						}
+						url = (JSON.parse(result.stdout) as { url: string }).url;
+					}
+					ctx.ui.notify(`mailbox: ${url}`, "info");
+					openBrowser(url);
+				} catch (err) {
+					ctx.ui.notify(`mailbox: ${err instanceof Error ? err.message : String(err)}`, "error");
+				}
+				return;
+			}
+
 			if (arg === "off") {
 				await conn?.stop();
 				conn = null;
@@ -360,7 +406,7 @@ export default function (pi: ExtensionAPI) {
 				const m = /^([A-Za-z0-9.-]+):(\d+)(?:\s+(\S+))?$/.exec(arg);
 				if (!m) {
 					ctx.ui.notify(
-						"Usage: /mailbox [start service | stop service | restart service | off | status | list [client [all]|mail] | meta | name <n> | tag <a,b> | set k=v | unset k | read <mail-ref> | more <cursor> | host:port [token]]",
+						"Usage: /mailbox [start service | stop service | restart service | view | off | status | list [client [all]|mail] | meta | name <n> | tag <a,b> | set k=v | unset k | read <mail-ref> | more <cursor> | host:port [token]]",
 						"warning",
 					);
 					return;
