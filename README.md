@@ -3,6 +3,16 @@
 A mailbox service and [pi](https://github.com/earendil-works/pi) extension for
 cross-session agent messaging within a project.
 
+Two implementations of the service exist:
+
+- **`mailboxd/` (Go)** — the standalone daemon: one process serves every
+  project that connects to it, holding a crash-safe flock for singleton
+  election, exiting after an idle period with no clients (local mode), or
+  serving external machines with token auth and central storage (remote
+  mode). See [mailboxd](#mailboxd) below.
+- **In-process (TypeScript)** — the original implementation embedded in a pi
+  session; still the zero-install fallback.
+
 ## How it works
 
 - Each project gets its own mailbox service. Leadership is a crash-safe
@@ -101,7 +111,34 @@ token; every reply also carries mailbox-wide `total` / `totalUnread`.
 npm install --ignore-scripts
 npm run check          # tsc --noEmit
 node --experimental-strip-types --no-warnings test/smoke.mjs
+cd mailboxd && go test ./...
 ```
+
+## mailboxd
+
+The Go daemon (`mailboxd/`) is a single static binary. Build it with
+`go build` in `mailboxd/`; cross-compile with the usual `GOOS`/`GOARCH`
+(plus `CGO_ENABLED=0`).
+
+**Local mode (default)**: listens on `127.0.0.1` with a random port, holds
+an exclusive flock on `~/.pi/mailboxd.leader` for singleton election, and
+writes its address to `~/.pi/mailboxd.json`. Data lives in each project's
+`.pi/mailbox/` directory (the client supplies the project root). Exits after
+`--idle-exit` (default 5m) with zero connected clients.
+
+**Remote mode** (`--listen` on a non-loopback address): serves external
+  machines, requires `--token`/`--token-file`, stores all projects under
+  `--data-dir` (client paths are never trusted), and stays up (idle exit is
+  disabled unless `--idle-exit` is set explicitly).
+
+The wire protocol is protocol v2: `hello` carries the project UUID, the
+  project root (local mode), an optional pi session directory (lifecycle GC),
+  and an optional token; `welcome`/`pong` carry a `protocolVersion`.
+  Cross-project sends are allowed when the target project is also registered
+  on the daemon. See `mailboxd/protocol.go`.
+
+The plugin does not spawn mailboxd yet (integration is the next step); until
+  then the TS in-process service handles all connections.
 
 ## Install
 
