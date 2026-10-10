@@ -22,8 +22,8 @@ func stopDaemon(registryPath, token string) int {
 		return 1
 	}
 	var reg struct {
-		Port   int    `json:"port"`
-		Remote bool   `json:"remote"`
+		Port   int  `json:"port"`
+		Remote bool `json:"remote"`
 	}
 	if json.Unmarshal(data, &reg) != nil || reg.Port <= 0 {
 		fmt.Fprintf(os.Stderr, "mailboxd: invalid registry at %s\n", registryPath)
@@ -59,8 +59,8 @@ func stopDaemon(registryPath, token string) int {
 			continue
 		}
 		var reply struct {
-			T   string `json:"t"`
-			Code string `json:"code"`
+			T       string `json:"t"`
+			Code    string `json:"code"`
 			Message string `json:"message"`
 		}
 		if json.Unmarshal(data, &reply) != nil {
