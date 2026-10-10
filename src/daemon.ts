@@ -172,7 +172,7 @@ function projectLockPath(projectDir: string): string {
  * short timeout). The file also used to carry the old in-process service
  * entry, which is ignored.
  */
-const LOCK_STALE_MS = 5_000;
+const LOCK_STALE_MS = 60_000;
 
 export async function readProjectId(projectDir: string): Promise<string> {
 	const existing = await readProjectRegistry(projectDir);
@@ -188,12 +188,18 @@ export async function readProjectId(projectDir: string): Promise<string> {
 		} catch (err) {
 			if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
 			// stale lock: the creating process died mid-critical-section
-			const age = Date.now() - (await stat(lockPath)).mtimeMs;
+			let age = 0;
+			try {
+				age = Date.now() - (await stat(lockPath)).mtimeMs;
+			} catch {
+				// lock was released between EEXIST and stat: retry immediately
+				continue;
+			}
 			if (age > LOCK_STALE_MS) {
 				await rm(lockPath, { recursive: true, force: true });
 				continue;
 			}
-			if (attempt > 50) throw new Error("mailbox project-id lock contention timeout");
+			if (attempt > 600) throw new Error("mailbox project-id lock contention timeout");
 			await new Promise((resolve) => setTimeout(resolve, 100));
 			continue;
 		}

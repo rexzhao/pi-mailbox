@@ -608,7 +608,7 @@ func (c *conn) handleShutdown(rid int, data []byte) error {
 	if c.daemon.AuthToken != "" && !secureTokenEqual(msg.Token, c.daemon.AuthToken) {
 		return c.errorReply(rid, "unauthorized", "invalid token")
 	}
-	c.send(MetaReply{T: "shutdown_ack", Rid: rid})
+	c.send(ShutdownAck{T: "shutdown_ack", Rid: rid})
 	log.Printf("shutdown requested via protocol; stopping")
 	c.daemon.shutdown()
 	return nil

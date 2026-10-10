@@ -96,6 +96,11 @@ type ShutdownMsg struct {
 	Token string `json:"token,omitempty"`
 }
 
+type ShutdownAck struct {
+	T   string `json:"t"`
+	Rid int    `json:"rid"`
+}
+
 // ---- server -> client ----
 
 type PongMsg struct {
