@@ -35,19 +35,22 @@ func main() {
 
 	// subcommand dispatch: mailboxd <command> [flags]
 	if len(os.Args) > 1 {
+		var commonRegistry, commonToken string
+		commonFlags := func(fs *flag.FlagSet) {
+			fs.StringVar(&commonRegistry, "registry", defaultRegistryPath(), "registry file recording the daemon address")
+			fs.StringVar(&commonToken, "token", "", "connection token (required by remote-mode daemons)")
+		}
 		switch os.Args[1] {
 		case "stop":
 			fs := flag.NewFlagSet("stop", flag.ExitOnError)
-			registry := fs.String("registry", defaultRegistryPath(), "registry file recording the daemon address")
-			token := fs.String("token", "", "connection token (required by remote-mode daemons)")
+			commonFlags(fs)
 			fs.Parse(os.Args[2:])
-			os.Exit(stopDaemon(*registry, *token))
+			os.Exit(stopDaemon(commonRegistry, commonToken))
 		case "cleanup":
 			fs := flag.NewFlagSet("cleanup", flag.ExitOnError)
-			registry := fs.String("registry", defaultRegistryPath(), "registry file recording the daemon address")
-			token := fs.String("token", "", "connection token (required by remote-mode daemons)")
+			commonFlags(fs)
 			fs.Parse(os.Args[2:])
-			os.Exit(cleanupDaemon(*registry, *token))
+			os.Exit(cleanupDaemon(commonRegistry, commonToken))
 		case "version":
 			fmt.Println("mailboxd", ProtocolVersion)
 			return
