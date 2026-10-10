@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"regexp"
 	"sync"
 )
@@ -19,6 +20,23 @@ type Project struct {
 
 	mu     sync.Mutex
 	online map[string]*conn // session id -> registered connection
+}
+
+// errSessionOnline is returned by DeleteMailboxIfOffline.
+var errSessionOnline = errors.New("session is online")
+
+// DeleteMailboxIfOffline deletes the session's mailbox, refusing while the
+// session is connected (it would recreate state immediately). The online
+// check and the deletion form one critical section under the project lock;
+// the store lock is always acquired after the project lock (never the
+// reverse), so this nesting is safe.
+func (p *Project) DeleteMailboxIfOffline(sessionID string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if c, ok := p.online[sessionID]; ok && c.isOpen() {
+		return errSessionOnline
+	}
+	return p.Store.DeleteMailbox(sessionID)
 }
 
 func (p *Project) IsOnline(sessionID string) bool {

@@ -21,6 +21,7 @@ package main
 import (
 	"embed"
 	"encoding/json"
+	"errors"
 	"io/fs"
 	"net"
 	"net/http"
@@ -589,7 +590,13 @@ func (d *Daemon) apiSend(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid ref: " + s})
 			return
 		}
-		refs = append(refs, MailRef{Project: rp, Session: rs, Mail: s[slash+1:]})
+		mailID := s[slash+1:]
+		if rs == "" || rp == "" || mailID == "" ||
+			len(rs) > 128 || len(rp) > 128 || len(mailID) > 128 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid ref: " + s})
+			return
+		}
+		refs = append(refs, MailRef{Project: rp, Session: rs, Mail: mailID})
 	}
 	// ensure the user's mailbox exists in this project so replies (and
 	// agent-initiated mail) can be delivered
@@ -649,11 +656,11 @@ func (d *Daemon) apiDelete(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown project"})
 		return
 	}
-	if proj.IsOnline(session) {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "session is online; it would recreate its mailbox — disconnect first"})
-		return
-	}
-	if err := proj.Store.DeleteMailbox(session); err != nil {
+	if err := proj.DeleteMailboxIfOffline(session); err != nil {
+		if errors.Is(err, errSessionOnline) {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "session is online; it would recreate its mailbox — disconnect first"})
+			return
+		}
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
 		return
 	}
