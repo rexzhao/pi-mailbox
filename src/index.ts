@@ -20,7 +20,7 @@ import { spawnSync } from "node:child_process";
 import { hostname, platform } from "node:os";
 import { Type } from "typebox";
 import { MailboxConnection, type RemoteTarget } from "./client.ts";
-import { findMailboxdBinary } from "./daemon.ts";
+import { connectLocalDaemonIfRunning, findMailboxdBinary } from "./daemon.ts";
 import type { MailRecord, MailRef, SessionInfo } from "./protocol.ts";
 
 const TOOL_NAMES = ["mailbox_list", "mailbox_read", "mailbox_send", "mailbox_reply", "mailbox_sessions"] as const;
@@ -411,7 +411,8 @@ ${formatMailList(mails)}${more}`,
 		name: "mailbox_connect",
 		label: "Mailbox connect",
 		description:
-			"Connect this session to the project's mailbox and activate the mailbox tools " +
+			"Connect this session to the project's mailbox (the daemon must already be " +
+			"running; ask the user to run /mailbox start service if it is not) and " +
 			"(mailbox_list, mailbox_read, mailbox_send, mailbox_reply, mailbox_sessions). Use this " +
 			"when you need to communicate with other Pi agent sessions in this project: send or " +
 			"reply to mail, check your inbox, or discover peer sessions. After connecting, incoming " +
@@ -429,8 +430,12 @@ ${formatMailList(mails)}${more}`,
 					details: { alreadyConnected: true },
 				};
 			}
-			if (ctx.mode !== "tui" && ctx.mode !== "rpc") {
-				throw new Error("mailbox: local hosting requires interactive mode; ask the user to run /mailbox");
+			// connect only if the daemon is already running; never spawn it
+			const endpoint = await connectLocalDaemonIfRunning();
+			if (!endpoint) {
+				throw new Error(
+					"mailbox: no running mailboxd daemon found. Ask the user to run `/mailbox start service` to start it.",
+				);
 			}
 			const connection = await startConnection(ctx, null);
 			const summary = await statusSummary(connection);

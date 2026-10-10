@@ -132,6 +132,15 @@ export interface LocalEndpoint {
  * Resolve the local daemon endpoint, spawning mailboxd when the registered
  * daemon is dead. Safe to call repeatedly.
  */
+/** Connect to the daemon only if it's already running; never spawns. */
+export async function connectLocalDaemonIfRunning(): Promise<LocalEndpoint | null> {
+	const reg = await readDaemonRegistry();
+	if (reg && (await probeDaemon(reg.port))) {
+		return { url: `ws://127.0.0.1:${reg.port}`, port: reg.port };
+	}
+	return null;
+}
+
 export async function resolveLocalDaemon(): Promise<LocalEndpoint> {
 	let reg = await readDaemonRegistry();
 	if (reg && (await probeDaemon(reg.port))) {
