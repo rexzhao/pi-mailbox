@@ -57,8 +57,8 @@ below.
 
 ## Commands
 
-- `/mailbox` — connect and show a one-line status summary (mail counts,
-  clients online)
+- `/mailbox` — show a one-line status summary (mail counts, clients
+  online); requires an active connection
 - `/mailbox host:port [token]` — connect to a remote mailboxd (token
   required by remote-mode daemons)
 - `/mailbox list [client [all]|mail]` — list online sessions, all
@@ -72,7 +72,10 @@ below.
 - `/mailbox unset k [k2 ...]` — remove meta values
 - `/mailbox meta` — show this session's full meta
 - `/mailbox read <mailId>` — view one mail
-- `/mailbox off` — disconnect
+- `/mailbox start_service` — connect (spawns the daemon if needed)
+- `/mailbox stop_service` — disconnect (the daemon itself keeps running
+  until its idle timeout, or `mailboxd --stop`)
+- `/mailbox restart_service` — disconnect and reconnect
 - `/mailbox status` — connection status
 
 ## Agent tools

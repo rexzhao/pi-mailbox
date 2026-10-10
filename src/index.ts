@@ -149,7 +149,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function requireConnection(): MailboxConnection {
-		if (!conn?.connected) throw new Error("mailbox not connected; run /mailbox or the mailbox_connect tool first");
+		if (!conn?.connected) throw new Error("mailbox not connected; run /mailbox start_service or the mailbox_connect tool first");
 		return conn;
 	}
 
@@ -174,7 +174,34 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const arg = args.trim();
 
-			if (arg === "off") {
+			if (arg === "start_service") {
+				try {
+					if (conn?.connected) {
+						ctx.ui.notify("mailbox: already connected", "info");
+						return;
+					}
+					const connection = await startConnection(ctx, null);
+					ctx.ui.notify(`mailbox: connected, project ${connection.mailbox.project}`, "info");
+				} catch (err) {
+					ctx.ui.notify(`mailbox: ${err instanceof Error ? err.message : String(err)}`, "error");
+				}
+				return;
+			}
+
+			if (arg === "restart_service") {
+				try {
+					await conn?.stop();
+					conn = null;
+					activateTools(false);
+					const connection = await startConnection(ctx, null);
+					ctx.ui.notify(`mailbox: restarted, project ${connection.mailbox.project}`, "info");
+				} catch (err) {
+					ctx.ui.notify(`mailbox: ${err instanceof Error ? err.message : String(err)}`, "error");
+				}
+				return;
+			}
+
+			if (arg === "stop_service" || arg === "off") {
 				await conn?.stop();
 				conn = null;
 				activateTools(false);
@@ -253,7 +280,7 @@ export default function (pi: ExtensionAPI) {
 				const m = /^([A-Za-z0-9.-]+):(\d+)(?:\s+(\S+))?$/.exec(arg);
 				if (!m) {
 					ctx.ui.notify(
-						"Usage: /mailbox [list [client [all]|mail] | meta | name <n> | tag <a,b> | set k=v | unset k | read <id> | more <cursor> | host:port [token] | off | status]",
+						"Usage: /mailbox [start_service | stop_service | restart_service | status | list [client [all]|mail] | meta | name <n> | tag <a,b> | set k=v | unset k | read <id> | more <cursor> | host:port [token]]",
 						"warning",
 					);
 					return;
@@ -262,9 +289,9 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			try {
-				// explicit host:port always (re)connects, even if already connected;
-				// otherwise connect only when not yet connected
-				if (!conn?.connected || remote) {
+				// only explicit host:port connects; everything else requires
+				// an existing connection (run /mailbox start_service first)
+				if (remote) {
 					const connection = await startConnection(ctx, remote);
 					ctx.ui.notify(`mailbox: connected`, "info");
 				}
