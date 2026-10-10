@@ -20,7 +20,7 @@ import {
 	type ServerMsg,
 	type SessionInfo,
 } from "./protocol.ts";
-import { readProjectId, resolveLocalDaemon } from "./daemon.ts";
+import { readProjectId, resolveLocalDaemon, connectLocalDaemonIfRunning } from "./daemon.ts";
 
 const REQUEST_TIMEOUT_MS = 5_000;
 
@@ -262,6 +262,8 @@ export type ConnectionMode = "local" | "remote";
 export interface ConnectionOptions {
 	/** Registration-time meta defaults: system keys (`_`-prefixed) refresh on every connect; user keys apply only when absent. */
 	helloMeta?: Record<string, string>;
+	/** When true, the connection may spawn a new daemon when none is running. Only /mailbox start service sets this. */
+	canSpawn?: boolean;
 }
 
 export interface ConnectionEvents {
@@ -375,7 +377,16 @@ export class MailboxConnection {
 			meta: this.options.helloMeta,
 		};
 		if (this.mode === "local") {
-			const endpoint = await resolveLocalDaemon();
+			let endpoint;
+			if (this.options.canSpawn) {
+				endpoint = await resolveLocalDaemon();
+			} else {
+				const running = await connectLocalDaemonIfRunning();
+				if (!running) {
+					throw new Error("mailbox: daemon not running; run /mailbox start service");
+				}
+				endpoint = running;
+			}
 			url = endpoint.url;
 			hello.projectRoot = this.projectDir;
 			hello.sessionDir = this.sessionDirProvider?.();

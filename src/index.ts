@@ -112,6 +112,7 @@ export default function (pi: ExtensionAPI) {
 			model?: { id: string; provider: string } | undefined;
 		},
 		remote: RemoteTarget | null,
+		canSpawn = false,
 	): Promise<MailboxConnection> {
 		await conn?.stop();
 		conn = null;
@@ -141,6 +142,7 @@ export default function (pi: ExtensionAPI) {
 			},
 			{
 				helloMeta,
+				canSpawn,
 			},
 		);
 		// the daemon's lifecycle GC needs the pi session directory (local mode)
@@ -182,7 +184,7 @@ export default function (pi: ExtensionAPI) {
 						ctx.ui.notify("mailbox: already connected", "info");
 						return;
 					}
-					const connection = await startConnection(ctx, null);
+					const connection = await startConnection(ctx, null, true);
 					ctx.ui.notify(`mailbox: connected, project ${connection.mailbox.project}`, "info");
 				} catch (err) {
 					ctx.ui.notify(`mailbox: ${err instanceof Error ? err.message : String(err)}`, "error");
@@ -251,7 +253,7 @@ export default function (pi: ExtensionAPI) {
 					}
 					// wait briefly for the daemon to release the lock
 					await new Promise((resolve) => setTimeout(resolve, 500));
-					const connection = await startConnection(ctx, null);
+					const connection = await startConnection(ctx, null, true);
 					ctx.ui.notify(`mailbox: restarted, project ${connection.mailbox.project}`, "info");
 				} catch (err) {
 					ctx.ui.notify(`mailbox: ${err instanceof Error ? err.message : String(err)}`, "error");

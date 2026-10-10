@@ -48,6 +48,7 @@ try {
 	const logA = { notify: [], connected: 0, disconnected: 0 };
 	const a = new MailboxConnection("local", projectDir, null, "sessA", "agent-a", events(logA), {
 		helloMeta: { _model: "prov/m1", role: "worker" },
+		canSpawn: true,
 	});
 	await a.start();
 	assert(a.connected, "A connected (daemon spawned via resolveLocalDaemon)");
