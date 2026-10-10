@@ -2,7 +2,7 @@
  * pi-mailbox extension.
  *
  * /mailbox                 connect (host or client) and list this session's mail
- * /mailbox host:port       connect to a remote mailbox service
+ * /mailbox host:port [t]    connect to a remote mailboxd (optional token)
  * /mailbox read <id>       view one mail
  * /mailbox name <name>     set display name (persists across reconnects)
  * /mailbox tag <a,b,...>   set tags
@@ -18,7 +18,7 @@
 import { VERSION, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { hostname, platform } from "node:os";
 import { Type } from "typebox";
-import { MailboxConnection } from "./client.ts";
+import { MailboxConnection, type RemoteTarget } from "./client.ts";
 import type { MailRecord, MailRef, SessionInfo } from "./protocol.ts";
 
 const TOOL_NAMES = ["mailbox_list", "mailbox_read", "mailbox_send", "mailbox_reply", "mailbox_sessions"] as const;
@@ -109,7 +109,7 @@ export default function (pi: ExtensionAPI) {
 			sessionManager: { getSessionId(): string; getCwd(): string; getSessionDir(): string };
 			model?: { id: string; provider: string } | undefined;
 		},
-		remoteUrl: string | null,
+		remote: RemoteTarget | null,
 	): Promise<MailboxConnection> {
 		await conn?.stop();
 		conn = null;
@@ -121,15 +121,15 @@ export default function (pi: ExtensionAPI) {
 		const helloMeta: Record<string, string> = {
 			_pi: VERSION,
 		};
-		if (!remoteUrl) {
+		if (!remote) {
 			helloMeta._host = hostname();
 			helloMeta._platform = platform();
 		}
 		if (ctx.model) helloMeta._model = `${ctx.model.provider}/${ctx.model.id}`;
 		const connection = new MailboxConnection(
-			remoteUrl ? "remote" : "local",
+			remote ? "remote" : "local",
 			ctx.sessionManager.getCwd(),
-			remoteUrl,
+			remote,
 			session,
 			agent,
 			{
@@ -138,11 +138,11 @@ export default function (pi: ExtensionAPI) {
 				onDisconnected: () => activateTools(false),
 			},
 			{
-				// session dir for orphan-mailbox GC (no effect when connecting as client)
-				sessionsDir: ctx.sessionManager.getSessionDir(),
 				helloMeta,
 			},
 		);
+		// the daemon's lifecycle GC needs the pi session directory (local mode)
+		connection.sessionDirProvider = () => ctx.sessionManager.getSessionDir();
 		conn = connection;
 		await connection.start();
 		return connection;
@@ -162,7 +162,7 @@ export default function (pi: ExtensionAPI) {
 		} catch {
 			// best-effort; keep the mail counts when the sessions query fails
 		}
-		return `${total} mails (${totalUnread} unread)${onlinePart}, role: ${c.isHost ? "server" : "client"}`;
+		return `${total} mails (${totalUnread} unread)${onlinePart}`;
 	}
 
 	// -----------------------------------------------------------------------
@@ -186,13 +186,12 @@ export default function (pi: ExtensionAPI) {
 				if (!conn?.connected) {
 					ctx.ui.notify("mailbox: disconnected", "info");
 				} else {
-					const role = conn.isHost ? "hosting" : "client";
-					ctx.ui.notify(`mailbox: connected (${role}), project ${conn.mailbox.project}`, "info");
+						ctx.ui.notify(`mailbox: connected, project ${conn.mailbox.project}`, "info");
 				}
 				return;
 			}
 
-			let remoteUrl: string | null = null;
+			let remote: RemoteTarget | null = null;
 			let readId: string | null = null;
 			let moreCursor: string | null = null;
 			let metaUpdate: { set?: Record<string, string>; unset?: string[] } | null = null;
@@ -251,28 +250,23 @@ export default function (pi: ExtensionAPI) {
 			) {
 				// show metadata / sessions / inbox below; `list` defaults to mail
 			} else if (arg !== "") {
-				const m = /^([A-Za-z0-9.-]+):(\d+)$/.exec(arg);
+				const m = /^([A-Za-z0-9.-]+):(\d+)(?:\s+(\S+))?$/.exec(arg);
 				if (!m) {
 					ctx.ui.notify(
-						"Usage: /mailbox [list [client [all]|mail] | meta | name <n> | tag <a,b> | set k=v | unset k | read <id> | more <cursor> | host:port | off | status]",
+						"Usage: /mailbox [list [client [all]|mail] | meta | name <n> | tag <a,b> | set k=v | unset k | read <id> | more <cursor> | host:port [token] | off | status]",
 						"warning",
 					);
 					return;
 				}
-				remoteUrl = `ws://${m[1]}:${m[2]}`;
-			}
-
-			if (!remoteUrl && ctx.mode !== "tui" && ctx.mode !== "rpc") {
-				ctx.ui.notify("mailbox: local hosting requires interactive mode; use /mailbox host:port", "warning");
-				return;
+				remote = { host: m[1], port: Number(m[2]), token: m[3] };
 			}
 
 			try {
 				// explicit host:port always (re)connects, even if already connected;
 				// otherwise connect only when not yet connected
-				if (!conn?.connected || remoteUrl) {
-					const connection = await startConnection(ctx, remoteUrl);
-					ctx.ui.notify(`mailbox: connected (${connection.isHost ? "hosting" : "client"})`, "info");
+				if (!conn?.connected || remote) {
+					const connection = await startConnection(ctx, remote);
+					ctx.ui.notify(`mailbox: connected`, "info");
 				}
 				const c = requireConnection();
 				if (metaUpdate) {
@@ -318,7 +312,6 @@ export default function (pi: ExtensionAPI) {
 				const showList = arg === "list" || arg === "list mail" || moreCursor !== null;
 				const { mails, nextCursor } = await c.mailbox.inbox(undefined, { cursor: moreCursor ?? undefined });
 				const unread = mails.filter((m) => !m.readAt).length;
-				const role = c.isHost ? "server" : "client";
 				if (!showList) {
 					// plain /mailbox (or a fresh host:port connect): one status line
 					ctx.ui.notify(`mailbox: ${await statusSummary(c)} — /mailbox list to view`, "info");
@@ -327,7 +320,7 @@ export default function (pi: ExtensionAPI) {
 				const more = nextCursor ? `
 (older mails: /mailbox more ${nextCursor})` : "";
 				ctx.ui.notify(
-					`mailbox: page: ${unread} unread / ${mails.length} shown (${role})
+					`mailbox: page: ${unread} unread / ${mails.length} shown
 ${formatMailList(mails)}${more}`,
 					"info",
 				);
@@ -350,7 +343,7 @@ ${formatMailList(mails)}${more}`,
 			"when you need to communicate with other Pi agent sessions in this project: send or " +
 			"reply to mail, check your inbox, or discover peer sessions. After connecting, incoming " +
 			"mail is announced as notifications and the other mailbox tools become available. " +
-			"Returns a status summary (mail counts, online clients, host/client role).",
+			"Returns a status summary (mail counts, online clients).",
 		parameters: Type.Object({}),
 		// default exposure (direct, active): the model must see this tool so it
 		// can enable the mailbox on its own; it is not part of TOOL_NAMES, so
@@ -375,7 +368,7 @@ ${formatMailList(mails)}${more}`,
 						text: `mailbox connected: ${summary}. The mailbox tools (mailbox_list, mailbox_read, mailbox_send, mailbox_reply, mailbox_sessions) are now active.`,
 					},
 				],
-				details: { alreadyConnected: false, role: connection.isHost ? "server" : "client" },
+				details: { alreadyConnected: false },
 			};
 		},
 	});

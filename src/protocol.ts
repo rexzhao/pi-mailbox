@@ -33,11 +33,21 @@ export interface MailRecord {
 // ---------------------------------------------------------------------------
 
 /** Handshake + registration. One connection per session; a second hello for the same session replaces the first connection. */
+export const PROTOCOL_VERSION = 2;
+
 export interface HelloMsg {
 	t: "hello";
 	rid: number;
+	/** Project UUID (see the per-project registry file). */
+	project: string;
+	/** Absolute project root; local-mode daemons store data under its .pi/mailbox. */
+	projectRoot?: string;
+	/** pi session directory for this cwd; enables the daemon's lifecycle GC in local mode. */
+	sessionDir?: string;
 	session: string;
 	agent: string;
+	/** Connection token (remote-mode daemons require it). */
+	token?: string;
 	/** Registration-time meta defaults, best-effort per key: system keys (leading `_`) refresh on every hello; user keys apply only when absent; invalid entries are skipped individually. */
 	meta?: Record<string, string>;
 }
@@ -106,6 +116,7 @@ export interface WelcomeMsg {
 	rid: number;
 	project: string;
 	instanceId: string;
+	protocolVersion?: number;
 	/** This session's full meta after the registration merge. */
 	meta?: Record<string, string>;
 }

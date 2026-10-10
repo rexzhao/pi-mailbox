@@ -31,11 +31,22 @@ var sessionIDRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 // precision; parse with time.RFC3339Nano, which accepts both.
 const timeStampLayout = "2006-01-02T15:04:05.000000000Z07:00"
 
+// nsMinTime/nsMaxTime bound the int64 UnixNano range (~1678-2262); outside
+// it UnixNano overflows and comparisons invert.
+var (
+	nsMinTime = time.Date(1678, 1, 1, 0, 0, 0, 0, time.UTC)
+	nsMaxTime = time.Date(2262, 1, 1, 0, 0, 0, 0, time.UTC)
+)
+
 // parseCreatedAt parses both the fixed-width nanosecond layout and the TS
 // millisecond layout (time.RFC3339Nano accepts variable fractions).
+// Timestamps outside the int64 nanosecond range are rejected.
 func parseCreatedAt(s string) (int64, bool) {
 	t, err := time.Parse(time.RFC3339Nano, s)
 	if err != nil {
+		return 0, false
+	}
+	if t.Before(nsMinTime) || t.After(nsMaxTime) {
 		return 0, false
 	}
 	return t.UnixNano(), true

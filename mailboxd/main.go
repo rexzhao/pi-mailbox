@@ -104,14 +104,23 @@ func main() {
 	}
 }
 
-func defaultRegistryPath() string {
+// piHome resolves the daemon's config directory: ~/.pi by default, or
+// $PI_MAILBOXD_DIR when set (used for test isolation and multi-instance
+// setups).
+func piHome() string {
+	if dir := os.Getenv("PI_MAILBOXD_DIR"); dir != "" {
+		return dir
+	}
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".pi", "mailboxd.json")
+	return filepath.Join(home, ".pi")
+}
+
+func defaultRegistryPath() string {
+	return filepath.Join(piHome(), "mailboxd.json")
 }
 
 func defaultLockPath() string {
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".pi", "mailboxd.leader")
+	return filepath.Join(piHome(), "mailboxd.leader")
 }
 
 func firstLine(s string) string {
@@ -164,6 +173,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	// singleton election: crash-safe because the OS releases the flock when
 	// the process dies
+	// the config dir may not exist yet (first run, or a fresh PI_MAILBOXD_DIR)
+	if err := os.MkdirAll(filepath.Dir(d.LockPath), 0o755); err != nil {
+		return fmt.Errorf("create config dir: %w", err)
+	}
 	d.flk = flock.New(d.LockPath)
 	acquired, err := d.flk.TryLock()
 	if err != nil {

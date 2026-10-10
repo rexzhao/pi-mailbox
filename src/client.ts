@@ -1,15 +1,16 @@
 /**
- * Mailbox client: WebSocket connection to a mailbox service, with
+ * Mailbox client: WebSocket connection to a mailboxd daemon, with
  * request/response correlation and reconnect logic.
  *
- * `MailboxConnection` is the high-level object used by the extension:
- * - local mode: participates in leader election, may host the service, and
- *   re-elects on connection loss
- * - remote mode: plain client with backoff reconnect to a fixed address
+ * There is no in-process service anymore: every connection targets the
+ * standalone Go daemon. Local mode resolves (and spawns) the daemon on every
+ * attempt, so a restarted daemon on a new port is picked up automatically;
+ * remote mode retries a fixed URL with a token.
  */
 
 import { WebSocket } from "ws";
 import {
+	PROTOCOL_VERSION,
 	isServerMsg,
 	type AgentRef,
 	type ClientMsg,
@@ -19,8 +20,7 @@ import {
 	type ServerMsg,
 	type SessionInfo,
 } from "./protocol.ts";
-import { ensureService } from "./registry.ts";
-import type { ServiceHandle } from "./service.ts";
+import { readProjectId, resolveLocalDaemon } from "./daemon.ts";
 
 const REQUEST_TIMEOUT_MS = 5_000;
 
@@ -28,32 +28,42 @@ export class MailboxClient {
 	private ws: WebSocket | null = null;
 	private nextRid = 1;
 	private readonly pending = new Map<number, { resolve: (msg: ServerMsg) => void; reject: (err: Error) => void }>();
-	/** This session's full meta as of the last successful registration (from the welcome reply). */
-	sessionMeta: Record<string, string> | null = null;
 	/** Project UUID, learned from the welcome reply. */
 	project: string | null = null;
+	/** This session's full meta as of the last successful registration (from the welcome reply). */
+	sessionMeta: Record<string, string> | null = null;
 	/** Set when closed on purpose; suppresses reconnect handling in the caller. */
 	closed = false;
 
 	private readonly url: string;
-	private readonly session: string;
-	private readonly agent: string;
-	private readonly helloMeta: Record<string, string> | undefined;
+	private readonly hello: {
+		project: string;
+		projectRoot?: string;
+		sessionDir?: string;
+		session: string;
+		agent: string;
+		token?: string;
+		meta?: Record<string, string>;
+	};
 	private readonly onNotify: (unread: number) => void;
 	private readonly onUnexpectedClose: () => void;
 
 	constructor(
 		url: string,
-		session: string,
-		agent: string,
+		hello: {
+			project: string;
+			projectRoot?: string;
+			sessionDir?: string;
+			session: string;
+			agent: string;
+			token?: string;
+			meta?: Record<string, string>;
+		},
 		onNotify: (unread: number) => void,
 		onUnexpectedClose: () => void,
-		helloMeta?: Record<string, string>,
 	) {
 		this.url = url;
-		this.session = session;
-		this.agent = agent;
-		this.helloMeta = helloMeta;
+		this.hello = hello;
 		this.onNotify = onNotify;
 		this.onUnexpectedClose = onUnexpectedClose;
 	}
@@ -63,7 +73,7 @@ export class MailboxClient {
 			const ws = new WebSocket(this.url);
 			this.ws = ws;
 			ws.on("open", () => {
-				void this.hello().then(resolve, reject);
+				void this.handshake().then(resolve, reject);
 			});
 			ws.on("message", (data) => this.dispatch(String(data)));
 			ws.on("error", (err) => {
@@ -132,17 +142,28 @@ export class MailboxClient {
 		});
 	}
 
-	private hello(): Promise<void> {
-		return this.request<{ project: string; meta?: Record<string, string> }>({
+	private handshake(): Promise<void> {
+		return this.request<{ project: string; meta?: Record<string, string>; protocolVersion?: number }>({
 			t: "hello",
 			rid: this.nextRid++,
-			session: this.session,
-			agent: this.agent,
-			meta: this.helloMeta,
-		}).then((reply) => {
-			this.project = reply.project;
-			this.sessionMeta = reply.meta ?? null;
-		});
+			...this.hello,
+		}).then(
+			(reply) => {
+				if (reply.protocolVersion !== undefined && reply.protocolVersion !== PROTOCOL_VERSION) {
+					this.ws?.terminate();
+					throw new Error(
+						`mailbox: protocol version mismatch (daemon ${reply.protocolVersion}, client ${PROTOCOL_VERSION})`,
+					);
+				}
+				this.project = reply.project;
+				this.sessionMeta = reply.meta ?? null;
+			},
+			(err) => {
+				// close the socket on handshake failure so it is not leaked
+				this.ws?.terminate();
+				throw err;
+			},
+		);
 	}
 
 	get isOpen(): boolean {
@@ -153,7 +174,7 @@ export class MailboxClient {
 		this.closed = true;
 		for (const entry of this.pending.values()) entry.reject(new Error("mailbox: closed"));
 		this.pending.clear();
-		this.ws?.close(1000);
+		this.ws?.terminate();
 		this.ws = null;
 	}
 
@@ -162,7 +183,49 @@ export class MailboxClient {
 			t: "sessions",
 			rid: this.nextRid++,
 			includeOffline,
-		}).then((reply) => reply.sessions);
+		}).then((reply) => reply.sessions ?? []);
+	}
+
+	sendMail(target: AgentRef, subject: string, body: string, refs?: MailRef[]): Promise<MailRef> {
+		return this.request<{ mail: MailRef }>({
+			t: "send",
+			rid: this.nextRid++,
+			target,
+			subject,
+			body,
+			refs,
+		}).then((reply) => reply.mail);
+	}
+
+	inbox(
+		filter?: InboxFilter,
+		opts?: { limit?: number; cursor?: string },
+	): Promise<{ mails: MailRecord[]; nextCursor?: string; total: number; totalUnread: number }> {
+		return this.request<{
+			mails?: MailRecord[];
+			nextCursor?: string;
+			total: number;
+			totalUnread: number;
+		}>({
+			t: "inbox",
+			rid: this.nextRid++,
+			filter,
+			limit: opts?.limit,
+			cursor: opts?.cursor,
+		}).then((reply) => ({
+			mails: reply.mails ?? [],
+			nextCursor: reply.nextCursor,
+			total: reply.total,
+			totalUnread: reply.totalUnread,
+		}));
+	}
+
+	read(mail: MailRef): Promise<MailRecord | null> {
+		return this.request<{ mail: MailRecord | null }>({
+			t: "read",
+			rid: this.nextRid++,
+			mail,
+		}).then((reply) => reply.mail ?? null);
 	}
 
 	setMeta(update: { set?: Record<string, string>; unset?: string[] }): Promise<void> {
@@ -188,43 +251,6 @@ export class MailboxClient {
 			}
 		});
 	}
-
-	sendMail(target: AgentRef, subject: string, body: string, refs?: MailRef[]): Promise<MailRef> {
-		return this.request<{ mail: MailRef }>({
-			t: "send",
-			rid: this.nextRid++,
-			target,
-			subject,
-			body,
-			refs,
-		}).then((reply) => reply.mail);
-	}
-
-	inbox(
-		filter?: InboxFilter,
-		opts?: { limit?: number; cursor?: string },
-	): Promise<{ mails: MailRecord[]; nextCursor?: string; total: number; totalUnread: number }> {
-		return this.request<{ mails: MailRecord[]; nextCursor?: string; total: number; totalUnread: number }>({
-			t: "inbox",
-			rid: this.nextRid++,
-			filter,
-			limit: opts?.limit,
-			cursor: opts?.cursor,
-		}).then((reply) => ({
-			mails: reply.mails,
-			nextCursor: reply.nextCursor,
-			total: reply.total,
-			totalUnread: reply.totalUnread,
-		}));
-	}
-
-	read(mail: MailRef): Promise<MailRecord | null> {
-		return this.request<{ mail: MailRecord | null }>({
-			t: "read",
-			rid: this.nextRid++,
-			mail,
-		}).then((reply) => reply.mail);
-	}
 }
 
 // ---------------------------------------------------------------------------
@@ -232,6 +258,11 @@ export class MailboxClient {
 // ---------------------------------------------------------------------------
 
 export type ConnectionMode = "local" | "remote";
+
+export interface ConnectionOptions {
+	/** Registration-time meta defaults: system keys (`_`-prefixed) refresh on every connect; user keys apply only when absent. */
+	helloMeta?: Record<string, string>;
+}
 
 export interface ConnectionEvents {
 	onNotify: (unread: number) => void;
@@ -241,19 +272,14 @@ export interface ConnectionEvents {
 	onConnected: () => void;
 }
 
-export interface ConnectionOptions {
-	/** pi session directory for this cwd; enables orphan-mailbox GC when hosting. */
-	sessionsDir?: string;
-	/** GC tuning (tests); see ServiceOptions. */
-	gcDelayMs?: number;
-	gcGraceMs?: number;
-	/** Registration-time meta defaults: system keys (`_`-prefixed) refresh on every connect; user keys apply only when absent. */
-	helloMeta?: Record<string, string>;
+export interface RemoteTarget {
+	host: string;
+	port: number;
+	token?: string;
 }
 
 export class MailboxConnection {
 	private client: MailboxClient | null = null;
-	private hosted: ServiceHandle | null = null;
 	private reconnectTimer: NodeJS.Timeout | null = null;
 	private stopped = false;
 	/** Bumped on every drop so stale reconnect loops stop. */
@@ -261,16 +287,16 @@ export class MailboxConnection {
 
 	private readonly mode: ConnectionMode;
 	private readonly projectDir: string;
-	private readonly remoteUrl: string | null;
-	private readonly options: ConnectionOptions | undefined;
+	private readonly remote: RemoteTarget | null;
 	readonly session: string;
 	private readonly agent: string;
 	private readonly events: ConnectionEvents;
+	private readonly options: ConnectionOptions;
 
 	constructor(
 		mode: ConnectionMode,
 		projectDir: string,
-		remoteUrl: string | null,
+		remote: RemoteTarget | null,
 		session: string,
 		agent: string,
 		events: ConnectionEvents,
@@ -278,25 +304,21 @@ export class MailboxConnection {
 	) {
 		this.mode = mode;
 		this.projectDir = projectDir;
-		this.remoteUrl = remoteUrl;
-		this.options = options;
+		this.remote = remote;
 		this.session = session;
 		this.agent = agent;
 		this.events = events;
+		this.options = options ?? {};
 	}
 
 	get connected(): boolean {
 		return this.client?.isOpen ?? false;
 	}
 
-	get isHost(): boolean {
-		return this.hosted !== null;
-	}
-
 	async start(): Promise<void> {
 		this.stopped = false;
 		// initial attempt throws so callers can report connection failures,
-		// but also schedules a retry so a late-starting service is picked up
+		// but also schedules a retry so a late-starting daemon is picked up
 		try {
 			await this.attempt();
 		} catch (err) {
@@ -313,17 +335,12 @@ export class MailboxConnection {
 		this.reconnectTimer = null;
 		this.client?.close();
 		this.client = null;
-		if (this.hosted) {
-			const hosted = this.hosted;
-			this.hosted = null;
-			await hosted.stop();
-		}
 	}
 
 	private scheduleReconnect(generation: number): void {
 		if (this.stopped || generation !== this.generation) return;
 		if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-		const delay = 200 + Math.floor(Math.random() * 800); // stagger competing re-elections
+		const delay = 200 + Math.floor(Math.random() * 800); // stagger retries
 		this.reconnectTimer = setTimeout(() => {
 			void this.connectOnce(generation);
 		}, delay);
@@ -332,80 +349,74 @@ export class MailboxConnection {
 	private async connectOnce(generation = this.generation): Promise<void> {
 		if (this.stopped || generation !== this.generation) return;
 		try {
-			await this.attempt(generation);
+			await this.attempt();
 		} catch {
 			this.events.onDisconnected();
 			this.scheduleReconnect(generation);
 		}
 	}
 
-	private async attempt(generation = this.generation): Promise<void> {
-		if (this.stopped || generation !== this.generation) return;
+	private async attempt(): Promise<void> {
+		if (this.stopped) return;
+		const generation = this.generation;
 		let url: string;
-		const existing = this.hosted; // read once; assigned below without re-reading
+		const hello: {
+			project: string;
+			projectRoot?: string;
+			sessionDir?: string;
+			session: string;
+			agent: string;
+			token?: string;
+			meta?: Record<string, string>;
+		} = {
+			project: await readProjectId(this.projectDir),
+			session: this.session,
+			agent: this.agent,
+			meta: this.options.helloMeta,
+		};
 		if (this.mode === "local") {
-			if (existing) {
-				// fast path: we already lead — talk to our own service directly.
-				// (ensureService would always see our own flock as held.)
-				try {
-					url = `ws://127.0.0.1:${existing.port}`;
-					await this.openClient(url);
-					this.events.onConnected();
-					return;
-				} catch {
-					// our own service died outside handle.stop: stop the handle
-					// (releasing the leader lock) and re-elect below
-					this.hosted = null;
-					await existing.stop().catch(() => undefined);
-				}
-			}
-			// re-election: try to become the leader via the flock; otherwise
-			// connect to the registered leader (throws while it is unreachable,
-			// the reconnect loop retries)
-			const election = await ensureService(this.projectDir, this.options);
-			if (election.hosted) {
-				if (existing && existing.instanceId !== election.hosted.instanceId) {
-					// an unexpected second service won the election; stop ours
-					// instead of leaking the handle
-					this.hosted = election.hosted;
-					await existing.stop().catch(() => undefined);
-				} else {
-					this.hosted = election.hosted;
-				}
-			} else if (existing && existing.instanceId !== election.instanceId) {
-				// another instance took over; our old service is dead or orphaned —
-				// release it so stop() does not leak the http server
-				this.hosted = null;
-				await existing.stop().catch(() => undefined);
-			} else {
-				// probe found our own live service; keep the handle
-			}
-			url = `ws://127.0.0.1:${election.port}`;
+			const endpoint = await resolveLocalDaemon();
+			url = endpoint.url;
+			hello.projectRoot = this.projectDir;
+			hello.sessionDir = this.sessionDirProvider?.();
 		} else {
-			url = this.remoteUrl!;
+			url = `ws://${this.remote!.host}:${this.remote!.port}`;
+			hello.token = this.remote!.token;
 		}
-		await this.openClient(url);
+		// stop() may have run during the async resolution above (up to 10s
+		// for a daemon spawn); bail instead of opening a post-stop connection
+		if (this.stopped || generation !== this.generation) return;
+		await this.openClient(url, hello);
 		this.events.onConnected();
 	}
 
-	private async openClient(url: string): Promise<void> {
+	/** pi session directory provider (set by the extension for the lifecycle GC). */
+	sessionDirProvider: (() => string | undefined) | null = null;
+
+	private async openClient(
+		url: string,
+		hello: {
+			project: string;
+			projectRoot?: string;
+			sessionDir?: string;
+			session: string;
+			agent: string;
+			token?: string;
+			meta?: Record<string, string>;
+		},
+	): Promise<void> {
 		this.client?.close();
 		const client = new MailboxClient(
 			url,
-			this.session,
-			this.agent,
+			hello,
 			(unread) => this.events.onNotify(unread),
 			() => {
-				// unexpected close: if we were hosting, drop the handle so the
-				// next connectOnce re-runs the election instead of trusting a
-				// dead server we still believe we own
 				if (this.client === client) {
 					this.client = null;
 					this.events.onDisconnected();
 					this.scheduleReconnect(this.generation);
 				}
 			},
-			this.options?.helloMeta,
 		);
 		await client.connect();
 		this.client = client;

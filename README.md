@@ -3,28 +3,23 @@
 A mailbox service and [pi](https://github.com/earendil-works/pi) extension for
 cross-session agent messaging within a project.
 
-Two implementations of the service exist:
-
-- **`mailboxd/` (Go)** — the standalone daemon: one process serves every
-  project that connects to it, holding a crash-safe flock for singleton
-  election, exiting after an idle period with no clients (local mode), or
-  serving external machines with token auth and central storage (remote
-  mode). See [mailboxd](#mailboxd) below.
-- **In-process (TypeScript)** — the original implementation embedded in a pi
-  session; still the zero-install fallback.
+The service is `mailboxd`, a standalone Go daemon: one process serves every
+project that connects to it, holding a crash-safe flock for singleton
+election, and exiting after an idle period with no clients. The extension is
+a pure client that spawns the daemon on demand. See [mailboxd](#mailboxd)
+below.
 
 ## How it works
 
-- Each project gets its own mailbox service. Leadership is a crash-safe
-  lease: the leader holds an exclusive OS file lock (`flock` on Unix,
-  `LockFileEx` on Windows, via [@lickle/lock](https://www.npmjs.com/package/@lickle/lock))
-  on `<project>/.pi/mailbox.leader` for its service lifetime. The OS releases
-  the lock automatically when the process dies, so handover needs no
-  timeouts or liveness heuristics, and a second service can never exist
-  while the leader lives. Other sessions connect as clients to the address
-  recorded in `<project>/.pi/mailbox.json` (alongside a stable project UUID).
-  Requires a platform with a prebuilt native binding: win32-x64,
-  darwin-x64/arm64, or linux-x64 (glibc).
+- One mailboxd process serves the whole machine: it holds an exclusive
+  flock on `~/.pi/mailboxd.leader` (the OS releases it when the process
+  dies), records its address in `~/.pi/mailboxd.json`, and exits after an
+  idle period with no clients. The extension probes that address and spawns
+  the daemon when dead.
+- Each project has a stable UUID in `<project>/.pi/mailbox.json` (created
+  once, serialized with [@lickle/lock](https://www.npmjs.com/package/@lickle/lock)
+  for the same-platform native binding); the daemon routes by project and
+  stores data in `<project>/.pi/mailbox/` (local mode).
 - Mails are immutable: send, read, and reference only. No editing, no
   comments, no deletion (yet). A mail is addressed by the triple
   `{project, session, mail}`; knowing the triple is the capability to read it.
@@ -41,8 +36,8 @@ Two implementations of the service exist:
   system-reserved and set automatically at registration time: `_model`
   (provider/model), `_pi` (pi version), and — local mode only, not sent to
   remote services — `_host` and `_platform`. User keys set via `/mailbox set`
-  or `name`/`tag` persist server-side and survive reconnects and host
-  handover; registration-time defaults never overwrite an existing user
+  or `name`/`tag` persist server-side and survive reconnects and daemon
+  restarts; registration-time defaults never overwrite an existing user
   key. The welcome reply returns the session's full merged meta.
 - Storage is a per-session JSONL event log at
   `<project>/.pi/mailbox/<sessionId>.jsonl` (`send` / `read` / `meta` events),
@@ -62,9 +57,10 @@ Two implementations of the service exist:
 
 ## Commands
 
-- `/mailbox` — connect (host or client) and list this session's mail (the
-  list line is suffixed with `[server]` when this session hosts the service)
-- `/mailbox host:port` — connect to a remote mailbox service
+- `/mailbox` — connect and show a one-line status summary (mail counts,
+  clients online)
+- `/mailbox host:port [token]` — connect to a remote mailboxd (token
+  required by remote-mode daemons)
 - `/mailbox list [client [all]|mail]` — list online sessions, all
   mailboxes (with `all`, including offline ones marked `-`), or this
   session's mail (default: mail, same as `/mailbox`)
@@ -137,8 +133,9 @@ The wire protocol is protocol v2: `hello` carries the project UUID, the
   Cross-project sends are allowed when the target project is also registered
   on the daemon. See `mailboxd/protocol.go`.
 
-The plugin does not spawn mailboxd yet (integration is the next step); until
-  then the TS in-process service handles all connections.
+The extension locates the `mailboxd` binary via `$PI_MAILBOXD`, then
+`<package>/mailboxd/mailboxd[.exe]`. Build it with `go build` in `mailboxd/`
+(or cross-compile with `CGO_ENABLED=0 GOOS=... GOARCH=... go build`).
 
 ## Install
 
