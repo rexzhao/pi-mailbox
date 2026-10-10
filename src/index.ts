@@ -29,7 +29,9 @@ const TOOL_NAMES = ["mailbox_list", "mailbox_read", "mailbox_send", "mailbox_rep
 /** Shared explanation of the external addressing format, embedded in tool output. */
 const ADDRESS_FORMAT_DOC =
 	"Addressing: a mailbox address is 'session@project'; a mail reference is 'session@project/mail' " +
-	"(a bare mail id means your own mailbox). Use mailbox_sessions to list peer addresses.";
+	"(a bare mail id means your own mailbox). Use mailbox_sessions to list peer addresses. " +
+	"Threading rule: start NEW topics with mailbox_send; answer any existing mail with " +
+	"mailbox_reply ONLY (it references the original — a reply sent via mailbox_send breaks the thread).";
 
 /** http base URL from host + port, bracketing IPv6 literals. */
 function httpBase(host: string, port: number): string {
@@ -608,11 +610,15 @@ ${formatMailList(mails)}${more}`,
 		name: "mailbox_send",
 		label: "Mailbox send",
 		description:
-			"Send a mail to another session, addressed as 'session@project' (a bare " +
-			"session id means this project). The target must have registered at least " +
-			"once (its mailbox exists); it does not need to be online — offline mail " +
-			"is delivered as unread on its next connection (use mailbox_sessions to " +
-			"find sessions). To reply to a mail, prefer mailbox_reply.",
+			"Start a NEW conversation thread: send a mail to another session, addressed " +
+			"as 'session@project' (a bare session id means this project). This tool " +
+			"never references a prior mail, so the result is a new thread root — use " +
+			"it only for new topics. To answer, comment on, or follow up ANY existing " +
+			"mail, ALWAYS use mailbox_reply instead: it references the original, and a " +
+			"'Re:'-style reply sent through mailbox_send breaks the thread chain. The " +
+			"target must have registered at least once (its mailbox exists); it does " +
+			"not need to be online — offline mail is delivered as unread on its next " +
+			"connection (use mailbox_sessions to find sessions).",
 		parameters: Type.Object({
 			address: Type.String({ description: "Target mailbox address 'session@project'; a bare session id means this project. The session must have registered once (see mailbox_sessions)" }),
 			subject: Type.String({ description: "Subject line" }),
@@ -643,8 +649,9 @@ ${formatMailList(mails)}${more}`,
 		label: "Mailbox reply",
 		description:
 			"Reply to a mail: sends a new mail to the original sender, referencing the " +
-			"original (subject 'Re: <original subject>'). Prefer this over mailbox_send " +
-			"when answering a specific mail.",
+			"original (subject 'Re: <original subject>') so the reply joins its thread. " +
+			"ALWAYS use this — never mailbox_send — when answering, commenting on, or " +
+			"following up any existing mail; unreferenced replies break the thread chain.",
 		parameters: Type.Object({
 			mail: Type.String({ description: "Mail being replied to: 'session@project/mail'; a bare mail id means your own mailbox" }),
 			body: Type.String({ description: "Reply body" }),
