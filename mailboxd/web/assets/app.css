@@ -116,6 +116,45 @@ h1 .counts { color: var(--muted); font-weight: normal; font-size: 13px; margin-l
 	word-break: break-word;
 }
 
+.thread { margin-top: 24px; }
+.thread h2 { font-size: 13px; color: var(--muted); text-transform: uppercase; }
+.reply {
+	border: 1px solid var(--line);
+	border-radius: 6px;
+	margin: 10px 0;
+	overflow: hidden;
+}
+.reply-head {
+	display: flex;
+	justify-content: space-between;
+	gap: 10px;
+	padding: 6px 10px;
+	background: var(--panel);
+	cursor: pointer;
+}
+.reply-head:hover { background: #20262e; }
+.reply-head .from { font-family: Consolas, monospace; }
+.reply-head .date { color: var(--muted); font-size: 12px; }
+.reply h3 { margin: 8px 10px 4px; font-size: 14px; }
+.reply .body { margin: 0 10px 10px; }
+
+.overview { border-collapse: collapse; margin-top: 8px; }
+.overview th {
+	text-align: left;
+	color: var(--muted);
+	font-weight: normal;
+	font-size: 12px;
+	text-transform: uppercase;
+	padding: 4px 16px 4px 0;
+}
+.overview td { padding: 6px 16px 6px 0; }
+.overview tr.row { cursor: pointer; }
+.overview tr.row:hover td { background: var(--panel); }
+.overview .mono { font-family: Consolas, monospace; }
+.overview .path { color: var(--muted); }
+.where { color: var(--muted); font-weight: normal; font-size: 10px; margin-left: 8px; }
+.project.active h2 { color: var(--accent); }
+
 .meta { margin-top: 20px; }
 .meta h2 { font-size: 12px; color: var(--muted); text-transform: uppercase; }
 .meta table { border-collapse: collapse; }

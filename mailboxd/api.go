@@ -106,6 +106,10 @@ func (d *Daemon) serveAPI(w http.ResponseWriter, r *http.Request) {
 		d.apiMailbox(w, r)
 	case strings.HasPrefix(r.URL.Path, "/api/mail/"):
 		d.apiMail(w, r)
+	case strings.HasPrefix(r.URL.Path, "/api/thread/"):
+		d.apiThread(w, r)
+	case strings.HasPrefix(r.URL.Path, "/api/threads/"):
+		d.apiThreads(w, r)
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
 	}
@@ -121,11 +125,17 @@ func (d *Daemon) apiInfo(w http.ResponseWriter, _ *http.Request) {
 	sort.Slice(projects, func(i, j int) bool { return projects[i].ID < projects[j].ID })
 	type webProject struct {
 		ID   string `json:"id"`
+		Host string `json:"host,omitempty"` // daemon hostname (local mode only)
 		Path string `json:"path,omitempty"` // local mode only
 	}
 	out := make([]webProject, 0, len(projects))
 	for _, p := range projects {
-		out = append(out, webProject{ID: p.ID, Path: p.RootPath})
+		wp := webProject{ID: p.ID}
+		if p.RootPath != "" {
+			wp.Host = d.host
+			wp.Path = p.RootPath
+		}
+		out = append(out, wp)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"protocolVersion": ProtocolVersion,
@@ -330,4 +340,192 @@ func (d *Daemon) hostAllowed(host string) bool {
 		}
 	}
 	return false
+}
+
+// threadEntry is one mail in a thread, annotated with the address of the
+// mailbox holding it (a mail's owner is otherwise only implied by the file
+// it is stored in, and the UI needs it to navigate).
+type threadEntry struct {
+	Mail  MailRecord `json:"mail"`
+	Owner string     `json:"owner"` // session@project
+	// internal: owning project id (not serialized)
+	project string
+}
+
+// mailGraph is the daemon-wide ref graph: every mail keyed by its ref, plus
+// the reverse edges (which mails reference a given mail).
+type mailGraph struct {
+	byRef    map[string]*threadEntry
+	children map[string][]*threadEntry // parent refKey -> mails referencing it
+}
+
+func refKey(project, session, mail string) string {
+	return project + "\x00" + session + "\x00" + mail
+}
+
+// buildMailGraph loads every mail on the daemon (all projects, all
+// mailboxes) and indexes it for thread traversal.
+func (d *Daemon) buildMailGraph() *mailGraph {
+	d.mu.Lock()
+	projects := make([]*Project, 0, len(d.projects))
+	for _, p := range d.projects {
+		projects = append(projects, p)
+	}
+	d.mu.Unlock()
+
+	g := &mailGraph{
+		byRef:    map[string]*threadEntry{},
+		children: map[string][]*threadEntry{},
+	}
+	for _, p := range projects {
+		for _, sid := range p.Store.ListSessionIDs() {
+			mails, err := p.Store.Inbox(sid)
+			if err != nil {
+				continue
+			}
+			for _, m := range mails {
+				e := &threadEntry{Mail: *m, Owner: sid + "@" + p.ID, project: p.ID}
+				g.byRef[refKey(p.ID, sid, m.ID)] = e
+				for _, ref := range m.Refs {
+					g.children[refKey(ref.Project, ref.Session, ref.Mail)] = append(
+						g.children[refKey(ref.Project, ref.Session, ref.Mail)], e)
+				}
+			}
+		}
+	}
+	return g
+}
+
+// threadOf walks the transitive reply chain of one mail, oldest first.
+func (g *mailGraph) threadOf(rootKey string) []*threadEntry {
+	visited := map[string]bool{rootKey: true}
+	frontier := []string{rootKey}
+	replies := []*threadEntry{}
+	for len(frontier) > 0 {
+		var next []string
+		for _, key := range frontier {
+			for _, child := range g.children[key] {
+				ck := refKey(child.project, refKeySession(child), child.Mail.ID)
+				if visited[ck] {
+					continue
+				}
+				visited[ck] = true
+				replies = append(replies, child)
+				next = append(next, ck)
+			}
+		}
+		frontier = next
+	}
+	sort.SliceStable(replies, func(i, j int) bool {
+		if replies[i].Mail.NS != replies[j].Mail.NS {
+			return replies[i].Mail.NS < replies[j].Mail.NS // oldest first
+		}
+		return replies[i].Mail.ID < replies[j].Mail.ID
+	})
+	return replies
+}
+
+// refKeySession extracts the session part of an Owner address.
+func refKeySession(e *threadEntry) string {
+	if at := strings.Index(e.Owner, "@"); at > 0 {
+		return e.Owner[:at]
+	}
+	return e.Owner
+}
+
+// apiThread returns a mail plus every mail that (transitively) references
+// it, oldest first — the forum-style reply chain.
+func (d *Daemon) apiThread(w http.ResponseWriter, r *http.Request) {
+	rest := strings.TrimPrefix(r.URL.Path, "/api/thread/")
+	slash := strings.Index(rest, "/")
+	if slash <= 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "expected <session>@<project>/<mailId>"})
+		return
+	}
+	session, projectID, ok := parseSessionRef(rest[:slash])
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "expected <session>@<project>/<mailId>"})
+		return
+	}
+	mailID := rest[slash+1:]
+	proj := d.projectByID(projectID)
+	if proj == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown project"})
+		return
+	}
+	root, err := proj.Store.Mail(session, mailID)
+	if err != nil || root == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such mail"})
+		return
+	}
+	g := d.buildMailGraph()
+	replies := g.threadOf(refKey(projectID, session, mailID))
+	out := make([]threadEntry, 0, len(replies))
+	for _, e := range replies {
+		out = append(out, *e)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"mail":    root,
+		"owner":   session + "@" + projectID,
+		"replies": out,
+	})
+}
+
+// threadSummary is one conversation root in a project's thread listing.
+type threadSummary struct {
+	Mail        MailRecord `json:"mail"`
+	Owner       string     `json:"owner"` // session@project
+	Replies     int        `json:"replies"`
+	LastReplyAt string     `json:"lastReplyAt,omitempty"` // newest reply createdAt, if any
+
+	activityNS int64 // LastReplyAt or Mail createdAt, for the sort (internal)
+}
+
+// apiThreads lists a project's conversation roots: mails with no refs —
+// or whose refs resolve to nothing on this daemon (orphaned replies whose
+// parent mailboxes were cleaned up) — each with reply statistics computed
+// over the daemon-wide ref graph. Sorted by last activity, newest first.
+func (d *Daemon) apiThreads(w http.ResponseWriter, r *http.Request) {
+	projectID := strings.TrimPrefix(r.URL.Path, "/api/threads/")
+	if projectID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "expected <project>"})
+		return
+	}
+	if d.projectByID(projectID) == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown project"})
+		return
+	}
+	g := d.buildMailGraph()
+	threads := []threadSummary{}
+	for key, e := range g.byRef {
+		if e.project != projectID {
+			continue
+		}
+		// a root has no refs at all, or no ref that resolves on this daemon
+		resolvable := false
+		for _, ref := range e.Mail.Refs {
+			if _, ok := g.byRef[refKey(ref.Project, ref.Session, ref.Mail)]; ok {
+				resolvable = true
+				break
+			}
+		}
+		if len(e.Mail.Refs) > 0 && resolvable {
+			continue
+		}
+		replies := g.threadOf(key)
+		ts := threadSummary{Mail: e.Mail, Owner: e.Owner, Replies: len(replies), activityNS: e.Mail.NS}
+		if len(replies) > 0 {
+			last := replies[len(replies)-1].Mail
+			ts.LastReplyAt = last.CreatedAt
+			ts.activityNS = last.NS
+		}
+		threads = append(threads, ts)
+	}
+	sort.SliceStable(threads, func(i, j int) bool {
+		if threads[i].activityNS != threads[j].activityNS {
+			return threads[i].activityNS > threads[j].activityNS // newest activity first
+		}
+		return threads[i].Mail.ID > threads[j].Mail.ID
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"threads": threads})
 }

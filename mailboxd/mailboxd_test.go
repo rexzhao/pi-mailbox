@@ -871,3 +871,212 @@ func TestHTTPAPIToken(t *testing.T) {
 		t.Fatalf("static without token: %v", resp2.StatusCode)
 	}
 }
+
+// TestHTTPThread covers /api/thread: the transitive reply chain, oldest-first
+// ordering, and the owner annotation used for navigation.
+func TestHTTPThread(t *testing.T) {
+	tmp := t.TempDir()
+	root := filepath.Join(tmp, "proj")
+	os.MkdirAll(filepath.Join(root, ".pi", "mailbox"), 0o755)
+	port, stop := bootDaemon(t, tmp, "", false)
+	defer stop()
+	base := fmt.Sprintf("http://127.0.0.1:%d", port)
+
+	a := dialTest(t, port)
+	a.hello(1, "p", root, "s1", "a", nil)
+	b := dialTest(t, port)
+	b.hello(1, "p", root, "s2", "b", nil)
+
+	send := func(rid int, from *testClient, target, subject string, refs []map[string]string) string {
+		msg := map[string]interface{}{
+			"t": "send", "rid": rid,
+			"target":  map[string]string{"project": "p", "session": target},
+			"subject": subject, "body": "x",
+		}
+		if refs != nil {
+			msg["refs"] = refs
+		}
+		m := from.request(msg)
+		if m["t"] != "sent" {
+			t.Fatalf("send %s failed: %v", subject, m)
+		}
+		return m["mail"].(map[string]interface{})["mail"].(string)
+	}
+
+	// m1: a -> b (lives in b's mailbox)
+	m1 := send(2, a, "s2", "root", nil)
+	// r1: b replies to m1 (lives in a's mailbox, refs m1)
+	r1 := send(3, b, "s1", "Re: root", []map[string]string{{"project": "p", "session": "s2", "mail": m1}})
+	// m2: a replies to r1 (lives in b's mailbox, refs r1 — NOT m1)
+	m2 := send(4, a, "s2", "Re: Re: root", []map[string]string{{"project": "p", "session": "s1", "mail": r1}})
+	// unrelated mail (must not appear)
+	send(5, a, "s2", "unrelated", nil)
+
+	getThread := func(path string) (int, map[string]interface{}) {
+		resp, err := http.Get(base + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var body map[string]interface{}
+		json.NewDecoder(resp.Body).Decode(&body)
+		return resp.StatusCode, body
+	}
+
+	// thread of m1: r1 (direct) + m2 (transitive via r1), oldest first
+	code, body := getThread("/api/thread/s2@p/" + m1)
+	if code != 200 {
+		t.Fatalf("thread: %v", code)
+	}
+	if body["owner"] != "s2@p" {
+		t.Fatalf("thread owner: %v", body["owner"])
+	}
+	replies := body["replies"].([]interface{})
+	if len(replies) != 2 {
+		t.Fatalf("expected 2 replies (transitive), got %v", body)
+	}
+	first := replies[0].(map[string]interface{})
+	second := replies[1].(map[string]interface{})
+	if first["mail"].(map[string]interface{})["id"] != r1 || second["mail"].(map[string]interface{})["id"] != m2 {
+		t.Fatalf("order should be oldest first: %v", body)
+	}
+	// owners point at the mailboxes holding the replies (for navigation)
+	if first["owner"] != "s1@p" || second["owner"] != "s2@p" {
+		t.Fatalf("reply owners: %v %v", first["owner"], second["owner"])
+	}
+
+	// thread of r1: just m2
+	code, body = getThread("/api/thread/s1@p/" + r1)
+	if code != 200 || len(body["replies"].([]interface{})) != 1 {
+		t.Fatalf("thread of r1: %v %v", code, body)
+	}
+
+	// leaf mail: no replies
+	code, body = getThread("/api/thread/s2@p/" + m2)
+	if code != 200 || len(body["replies"].([]interface{})) != 0 {
+		t.Fatalf("leaf thread: %v %v", code, body)
+	}
+
+	// unknown mail: 404
+	if code, _ = getThread("/api/thread/s2@p/nope"); code != 404 {
+		t.Fatalf("unknown mail: %v", code)
+	}
+}
+
+// TestHTTPThreads covers /api/threads/<project>: roots-only listing (replies
+// reachable via thread), orphaned-reply roots, cross-project replies counted,
+// and the last-activity sort.
+func TestHTTPThreads(t *testing.T) {
+	tmp := t.TempDir()
+	root1 := filepath.Join(tmp, "p1")
+	root2 := filepath.Join(tmp, "p2")
+	os.MkdirAll(filepath.Join(root1, ".pi", "mailbox"), 0o755)
+	os.MkdirAll(filepath.Join(root2, ".pi", "mailbox"), 0o755)
+	port, stop := bootDaemon(t, tmp, "", false)
+	defer stop()
+	base := fmt.Sprintf("http://127.0.0.1:%d", port)
+
+	a := dialTest(t, port)
+	a.hello(1, "proj-1", root1, "s1", "a", nil)
+	b := dialTest(t, port)
+	b.hello(1, "proj-1", root1, "s2", "b", nil)
+	c := dialTest(t, port)
+	c.hello(1, "proj-2", root2, "s3", "c", nil)
+
+	send := func(rid int, from *testClient, project, target, subject string, refs []map[string]string) string {
+		msg := map[string]interface{}{
+			"t": "send", "rid": rid,
+			"target":  map[string]string{"project": project, "session": target},
+			"subject": subject, "body": "x",
+		}
+		if refs != nil {
+			msg["refs"] = refs
+		}
+		m := from.request(msg)
+		if m["t"] != "sent" {
+			t.Fatalf("send %s failed: %v", subject, m)
+		}
+		return m["mail"].(map[string]interface{})["mail"].(string)
+	}
+
+	// m1: a -> b, root in proj-1
+	m1 := send(2, a, "proj-1", "s2", "root thread", nil)
+	// r1: b replies to m1 (lives in a's mailbox in proj-1)
+	r1 := send(3, b, "proj-1", "s1", "Re: root", []map[string]string{{"project": "proj-1", "session": "s2", "mail": m1}})
+	// orphan: refs a nonexistent mail -> must be listed as a root
+	orphan := send(4, a, "proj-1", "s2", "orphaned reply", []map[string]string{{"project": "proj-1", "session": "s2", "mail": "doesnotexist"}})
+	// cross-project reply: c (proj-2) replies to m1; lives in b's mailbox in
+	// proj-1; sent last so m1's thread has the newest activity despite being
+	// created before the orphan (activity sort, not creation sort)
+	send(5, c, "proj-1", "s2", "cross reply", []map[string]string{{"project": "proj-1", "session": "s2", "mail": m1}})
+	// unrelated project-2 root
+	p2root := send(6, c, "proj-2", "s3", "other project", nil)
+
+	getThreads := func(project string) (int, map[string]interface{}) {
+		resp, err := http.Get(base + "/api/threads/" + project)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var body map[string]interface{}
+		json.NewDecoder(resp.Body).Decode(&body)
+		return resp.StatusCode, body
+	}
+
+	code, body := getThreads("proj-1")
+	if code != 200 {
+		t.Fatalf("threads: %v", code)
+	}
+	threads := body["threads"].([]interface{})
+	// roots in proj-1: m1, orphan — NOT r1 (its ref resolves), NOT the cross reply, NOT p2root
+	if len(threads) != 2 {
+		t.Fatalf("expected 2 roots, got %v", body)
+	}
+	ids := map[string]map[string]interface{}{}
+	for _, t := range threads {
+		ts := t.(map[string]interface{})
+		ids[ts["mail"].(map[string]interface{})["id"].(string)] = ts
+	}
+	m1s, ok := ids[m1]
+	if !ok {
+		t.Fatalf("m1 not listed: %v", body)
+	}
+	if _, ok := ids[orphan]; !ok {
+		t.Fatalf("orphaned reply not listed as root: %v", body)
+	}
+	if _, ok := ids[r1]; ok {
+		t.Fatalf("reply r1 must not be listed as root: %v", body)
+	}
+	// m1's thread: r1 + cross reply = 2 replies
+	if int(m1s["replies"].(float64)) != 2 {
+		t.Fatalf("m1 replies count: %v", m1s)
+	}
+	if m1s["lastReplyAt"] == "" {
+		t.Fatalf("m1 lastReplyAt: %v", m1s)
+	}
+	// m1's owner is the mailbox holding it (b's)
+	if m1s["owner"] != "s2@proj-1" {
+		t.Fatalf("m1 owner: %v", m1s["owner"])
+	}
+
+	// proj-2 has its own root
+	code, body = getThreads("proj-2")
+	if code != 200 || len(body["threads"].([]interface{})) != 1 {
+		t.Fatalf("proj-2 threads: %v %v", code, body)
+	}
+	p2 := body["threads"].([]interface{})[0].(map[string]interface{})
+	if p2["mail"].(map[string]interface{})["id"] != p2root {
+		t.Fatalf("proj-2 root: %v", p2)
+	}
+
+	// activity sort: the thread with the newest reply (m1, cross reply is
+	// newest) sorts before the orphan (no replies)
+	if threads[0].(map[string]interface{})["mail"].(map[string]interface{})["id"] != m1 {
+		t.Fatalf("activity sort: newest-activity thread should be first: %v", threads)
+	}
+
+	// unknown project
+	if code, _ = getThreads("nope"); code != 404 {
+		t.Fatalf("unknown project: %v", code)
+	}
+}

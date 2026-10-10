@@ -190,6 +190,7 @@ type Daemon struct {
 	IdleExit     time.Duration
 
 	instanceID string
+	host       string // daemon hostname, shown in the web UI
 	port       int
 
 	mu        sync.Mutex
@@ -205,6 +206,7 @@ type Daemon struct {
 // idle timeout).
 func (d *Daemon) Run(ctx context.Context) error {
 	d.instanceID = newUUID()
+	d.host, _ = os.Hostname()
 	d.projects = make(map[string]*Project)
 	d.conns = make(map[*conn]struct{})
 
