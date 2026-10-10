@@ -190,19 +190,6 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			if (arg === "restart service") {
-				try {
-					await conn?.stop();
-					conn = null;
-					activateTools(false);
-					const connection = await startConnection(ctx, null);
-					ctx.ui.notify(`mailbox: restarted, project ${connection.mailbox.project}`, "info");
-				} catch (err) {
-					ctx.ui.notify(`mailbox: ${err instanceof Error ? err.message : String(err)}`, "error");
-				}
-				return;
-			}
-
 			if (arg === "off") {
 				await conn?.stop();
 				conn = null;
@@ -248,11 +235,19 @@ export default function (pi: ExtensionAPI) {
 					activateTools(false);
 					const bin = findMailboxdBinary();
 					if (bin) {
-						spawnSync(bin, ["--stop"], {
+						const result = spawnSync(bin, ["--stop"], {
 							env: { ...process.env },
 							encoding: "utf8",
 							timeout: 10_000,
 						});
+						if (result.status !== 0) {
+							ctx.ui.notify(
+								`mailbox: daemon stop failed: ${result.stderr?.trim() || result.stdout?.trim() || "unknown error"}`,
+								"warning",
+							);
+						}
+					} else {
+						ctx.ui.notify("mailbox: mailboxd binary not found; cannot stop daemon", "warning");
 					}
 					// wait briefly for the daemon to release the lock
 					await new Promise((resolve) => setTimeout(resolve, 500));
@@ -326,7 +321,7 @@ export default function (pi: ExtensionAPI) {
 				const m = /^([A-Za-z0-9.-]+):(\d+)(?:\s+(\S+))?$/.exec(arg);
 				if (!m) {
 					ctx.ui.notify(
-						"Usage: /mailbox [start service | stop_service | restart service | off | status | list [client [all]|mail] | meta | name <n> | tag <a,b> | set k=v | unset k | read <id> | more <cursor> | host:port [token]]",
+						"Usage: /mailbox [start service | stop service | restart service | off | status | list [client [all]|mail] | meta | name <n> | tag <a,b> | set k=v | unset k | read <id> | more <cursor> | host:port [token]]",
 						"warning",
 					);
 					return;
