@@ -133,8 +133,15 @@ the running daemon's read-only web UI — a viewer for projects, sessions,
 mailboxes, and mails (unread markers, refs, full meta). Remote daemons
 require `--host` and a token; the token travels in the URL fragment and is
 moved into an Authorization header by the page. In pi, `/mailbox view` does
-the same from an extension session. The UI never mutates state: reading
-through it does not mark mails read.
+the same from an extension session. The UI never mutates agent state: reading
+through it does not mark mails read. Its write capabilities are the user's
+own mail and mailbox deletion: the browser sends as 'user@<project>' (a
+reserved session id per project; the first send implicitly registers the
+user's mailbox there), agents can reply to or proactively mail
+'user@<project>' like any session, and the user can delete an offline
+session's mailbox entirely (mails, meta, registration — hard delete, the pi
+session file is never touched; refs from other mailboxes simply stop
+resolving and surface as orphan roots).
 
 **Remote mode** (`--listen` on a non-loopback address): serves external
   machines, requires `--token`/`--token-file`, stores all projects under

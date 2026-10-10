@@ -32,10 +32,11 @@ function writeHash(params) {
 
 const token = hashParams().get("t") || "";
 
-async function api(path) {
-	const resp = await fetch(path, {
-		headers: token ? { Authorization: "Bearer " + token } : {},
-	});
+async function api(path, opts) {
+	const init = opts
+		? { method: "POST", headers: { "Content-Type": "application/json", ...(token ? { Authorization: "Bearer " + token } : {}) }, body: JSON.stringify(opts) }
+		: { headers: token ? { Authorization: "Bearer " + token } : {} };
+	const resp = await fetch(path, init);
 	if (resp.status === 401) throw new Error("unauthorized: wrong or missing token");
 	if (resp.status === 403) throw new Error("forbidden: " + (await resp.json()).error);
 	if (!resp.ok) throw new Error("HTTP " + resp.status);
@@ -160,6 +161,27 @@ function renderContent() {
 			more.addEventListener("click", () => loadMailbox(mb.nextCursor, true));
 			content.append(more);
 		}
+		const delBtn = el("button", { type: "button", class: "danger" }, "delete this mailbox");
+		delBtn.addEventListener("click", async () => {
+			if (!confirm("Delete ALL mails and meta of " + state.selected + "? This cannot be undone.")) return;
+			try {
+				await api("/api/delete", { address: state.selected });
+				selectProject(state.selectedProject); // the session is gone; back to the project
+				refresh();
+			} catch (err) {
+				alert(String(err.message || err));
+			}
+		});
+		const sendBtn = el("button", { type: "button" }, "send mail to this session");
+		const slot = el("div", {});
+		sendBtn.addEventListener("click", () => {
+			if (slot.firstChild) {
+				slot.replaceChildren();
+				return;
+			}
+			slot.append(composeForm(state.selected, "", [], () => refresh()));
+		});
+		content.append(sendBtn, slot, delBtn);
 		renderMetaPanel(content);
 		return;
 	}
@@ -298,16 +320,31 @@ function renderThreadNode(node, depth) {
 	const head = el("div", { class: "reply-head" },
 		el("span", { class: "from" }, mail.from.session + "@" + mail.from.project),
 		el("span", { class: "date" }, fmtTime(mail.createdAt)),
+		el("span", { class: "spacer" }),
+		el("button", { type: "button", class: "reply-btn" }, "reply"),
 	);
 	if (depth > 0) {
-		head.addEventListener("click", () => selectSession(node.owner, mail.id));
+		head.addEventListener("click", (ev) => {
+			if (ev.target.classList.contains("reply-btn")) return;
+			selectSession(node.owner, mail.id);
+		});
 		head.title = "open this mail's own thread";
 	}
 	article.append(
 		head,
 		el("h3", {}, mail.subject),
 		el("pre", { class: "body" }, mail.body),
+		el("div", { class: "reply-slot" }),
 	);
+	article.querySelector(".reply-btn").addEventListener("click", (ev) => {
+		ev.stopPropagation();
+		const slot = article.querySelector(".reply-slot");
+		if (slot.firstChild) {
+			slot.replaceChildren();
+			return;
+		}
+		slot.append(replyComposeForm(node, () => refresh()));
+	});
 	if (node.children.length > 0) {
 		// oldest first within each level
 		node.children.sort((a, b) => (a.mail.createdAt < b.mail.createdAt ? -1 : a.mail.createdAt > b.mail.createdAt ? 1 : a.mail.id < b.mail.id ? -1 : 1));
@@ -318,6 +355,42 @@ function renderThreadNode(node, depth) {
 		article.append(kids);
 	}
 	return article;
+}
+
+// compose/reply form: sends as user@<project> via POST /api/send (the
+// web UI's only write capability)
+function composeForm(to, subject, refs, onSent) {
+	const form = el("form", { class: "compose" });
+	const subj = el("input", { type: "text", placeholder: "subject", value: subject || "", required: "" });
+	const body = el("textarea", { placeholder: "body", rows: "5", required: "" });
+	const status = el("span", { class: "hint" });
+	const send = el("button", { type: "submit" }, "send");
+	const cancel = el("button", { type: "button" }, "cancel");
+	form.append(subj, body, el("div", { class: "actions" }, send, cancel, status));
+	cancel.addEventListener("click", () => form.remove());
+	form.addEventListener("submit", async (ev) => {
+		ev.preventDefault();
+		send.disabled = true;
+		status.textContent = "sending…";
+		try {
+			await api("/api/send", { to, subject: subj.value, body: body.value, refs });
+			form.remove();
+			onSent();
+		} catch (err) {
+			status.textContent = "";
+			send.disabled = false;
+			form.append(el("p", { class: "error" }, String(err.message || err)));
+		}
+	});
+	return form;
+}
+
+function replyComposeForm(node, onSent) {
+	const mail = node.mail;
+	const to = mail.from.session + "@" + mail.from.project;
+	const subject = /^Re: /u.test(mail.subject) ? mail.subject : "Re: " + mail.subject;
+	const refs = [node.owner + "/" + mail.id];
+	return composeForm(to, subject, refs, onSent);
 }
 
 // ------------------------------------------------- hash-driven navigation

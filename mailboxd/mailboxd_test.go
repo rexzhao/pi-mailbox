@@ -5,6 +5,7 @@ package main
 // assertions.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -1078,5 +1079,254 @@ func TestHTTPThreads(t *testing.T) {
 	// unknown project
 	if code, _ = getThreads("nope"); code != 404 {
 		t.Fatalf("unknown project: %v", code)
+	}
+}
+
+// TestHTTPSend covers the web user's send capability: POST /api/send writes
+// as user@<project>, implicitly registers the user mailbox (so agents can
+// reply and initiate), the WS hello reserves "user", and the GC never
+// collects the user mailbox.
+func TestHTTPSend(t *testing.T) {
+	tmp := t.TempDir()
+	root := filepath.Join(tmp, "proj")
+	os.MkdirAll(filepath.Join(root, ".pi", "mailbox"), 0o755)
+	port, stop := bootDaemon(t, tmp, "", false)
+	defer stop()
+	base := fmt.Sprintf("http://127.0.0.1:%d", port)
+
+	a := dialTest(t, port)
+	a.hello(1, "p", root, "s1", "a", nil)
+	b := dialTest(t, port)
+	b.hello(1, "p", root, "s2", "b", nil)
+
+	// WS hello cannot register the reserved session id
+	if m := a.request(map[string]interface{}{"t": "hello", "rid": 99, "project": "p", "projectRoot": root, "session": "user", "agent": "x"}); m["code"] != "bad_hello" {
+		t.Fatalf("hello as user should be rejected: %v", m)
+	}
+
+	post := func(path string, payload any) (*http.Response, map[string]interface{}) {
+		data, _ := json.Marshal(payload)
+		resp, err := http.Post(base+path, "application/json", bytes.NewReader(data))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var body map[string]interface{}
+		json.NewDecoder(resp.Body).Decode(&body)
+		return resp, body
+	}
+
+	// send to a never-registered session: no_mailbox
+	if resp, _ := post("/api/send", map[string]any{"to": "ghost@p", "subject": "x", "body": "y"}); resp.StatusCode != 404 {
+		t.Fatalf("no mailbox: %v", resp.StatusCode)
+	}
+	// unknown project
+	if resp, _ := post("/api/send", map[string]any{"to": "s2@nope", "subject": "x", "body": "y"}); resp.StatusCode != 404 {
+		t.Fatalf("unknown project: %v", resp.StatusCode)
+	}
+	// invalid refs
+	if resp, _ := post("/api/send", map[string]any{"to": "s2@p", "subject": "x", "body": "y", "refs": []string{"garbage"}}); resp.StatusCode != 400 {
+		t.Fatalf("invalid refs: %v", resp.StatusCode)
+	}
+	// POST to a read-only endpoint: 405
+	if resp, _ := post("/api/info", nil); resp.StatusCode != 405 {
+		t.Fatalf("POST /api/info: %v", resp.StatusCode)
+	}
+	// GET /api/send: 405
+	if resp, err := http.Get(base + "/api/send"); err != nil || resp.StatusCode != 405 {
+		t.Fatalf("GET /api/send: %v %v", err, resp)
+	} else {
+		resp.Body.Close()
+	}
+
+	// the user sends to s2; b is online and must get a notify push
+	resp, body := post("/api/send", map[string]any{"to": "s2@p", "subject": "from the web", "body": "hello"})
+	if resp.StatusCode != 200 {
+		t.Fatalf("send: %v %v", resp.StatusCode, body)
+	}
+	userMailID := body["mail"].(map[string]interface{})["id"].(string)
+	if body["ref"] != "s2@p/"+userMailID {
+		t.Fatalf("ref: %v", body["ref"])
+	}
+	if n := b.expectNotify(); n < 1 {
+		t.Fatalf("expected notify for online recipient, got %d", n)
+	}
+	// the mail is in b's mailbox, from user@p
+	inb := b.request(map[string]interface{}{"t": "inbox", "rid": 2})
+	mails := inb["mails"].([]interface{})
+	found := false
+	for _, m := range mails {
+		mm := m.(map[string]interface{})
+		if mm["id"] == userMailID {
+			found = true
+			fr := mm["from"].(map[string]interface{})
+			if fr["session"] != "user" || fr["project"] != "p" {
+				t.Fatalf("from should be user@p: %v", fr)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("user mail not in b's inbox: %v", inb)
+	}
+
+	// the user mailbox exists now: an agent can reply to user@p via plain WS send
+	if m := b.request(map[string]interface{}{
+		"t": "send", "rid": 3,
+		"target":  map[string]string{"project": "p", "session": "user"},
+		"subject": "Re: from the web", "body": "agent reply",
+		"refs": []map[string]string{{"project": "p", "session": "s2", "mail": userMailID}},
+	}); m["t"] != "sent" {
+		t.Fatalf("agent reply to user failed: %v", m)
+	}
+
+	// the user's mailbox is readable through the API and shows the reply
+	resp, body = nil, nil
+	resp2, err := http.Get(base + "/api/mailbox/user@p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	var ub map[string]interface{}
+	json.NewDecoder(resp2.Body).Decode(&ub)
+	if resp2.StatusCode != 200 || int(ub["total"].(float64)) != 1 {
+		t.Fatalf("user mailbox: %v %v", resp2.StatusCode, ub)
+	}
+	umail := ub["mails"].([]interface{})[0].(map[string]interface{})
+	if umail["subject"] != "Re: from the web" {
+		t.Fatalf("user reply mail: %v", umail)
+	}
+
+	// the user session appears in listings (offline, agent from registration)
+	resp3, err := http.Get(base + "/api/sessions?includeOffline=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp3.Body.Close()
+	var sb map[string]interface{}
+	json.NewDecoder(resp3.Body).Decode(&sb)
+	hasUser := false
+	for _, s := range sb["sessions"].([]interface{}) {
+		sm := s.(map[string]interface{})
+		if sm["session"] == "user" && sm["project"] == "p" {
+			hasUser = true
+		}
+	}
+	if !hasUser {
+		t.Fatalf("user session not listed: %v", sb)
+	}
+
+	// GC never collects the user mailbox even without a pi session file
+	moved, err := projStore(t, tmp, "p").GCOrphans(root, 0, map[string]bool{})
+	if err != nil || moved != 0 {
+		t.Fatalf("GC should keep the user mailbox: moved=%d err=%v", moved, err)
+	}
+	if _, err := os.Stat(filepath.Join(root, ".pi", "mailbox", "user.jsonl")); err != nil {
+		t.Fatalf("user mailbox file should exist: %v", err)
+	}
+}
+
+// projStore opens a raw Store for a project directory (GC assertion helper).
+func projStore(t *testing.T, tmp, project string) *Store {
+	store, err := NewStore(filepath.Join(tmp, "proj", ".pi", "mailbox"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return store
+}
+
+// TestHTTPDelete covers POST /api/delete: the mailbox (mails, meta,
+// registration) is removed entirely, online sessions are refused, the pi
+// session file is untouched, and refs from other mailboxes simply stop
+// resolving.
+func TestHTTPDelete(t *testing.T) {
+	tmp := t.TempDir()
+	root := filepath.Join(tmp, "proj")
+	os.MkdirAll(filepath.Join(root, ".pi", "mailbox"), 0o755)
+	sessionDir := filepath.Join(tmp, "sessions")
+	os.MkdirAll(sessionDir, 0o755)
+	piSession := filepath.Join(sessionDir, "2026-01-01_s2.jsonl")
+	os.WriteFile(piSession, []byte("{}\n"), 0o644)
+	port, stop := bootDaemon(t, tmp, "", false)
+	defer stop()
+	base := fmt.Sprintf("http://127.0.0.1:%d", port)
+
+	a := dialTest(t, port)
+	a.hello(1, "p", root, "s1", "a", nil)
+	b := dialTest(t, port)
+	b.hello(1, "p", root, "s2", "b", map[string]string{"name": "bee"})
+	// mail into b's mailbox
+	if m := a.request(map[string]interface{}{
+		"t": "send", "rid": 2,
+		"target":  map[string]string{"project": "p", "session": "s2"},
+		"subject": "to be deleted", "body": "x",
+	}); m["t"] != "sent" {
+		t.Fatalf("send failed: %v", m)
+	}
+
+	post := func(path string, payload any) (*http.Response, map[string]interface{}) {
+		data, _ := json.Marshal(payload)
+		resp, err := http.Post(base+path, "application/json", bytes.NewReader(data))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var body map[string]interface{}
+		json.NewDecoder(resp.Body).Decode(&body)
+		return resp, body
+	}
+
+	// online session: refused
+	if resp, body := post("/api/delete", map[string]any{"address": "s2@p"}); resp.StatusCode != 409 {
+		t.Fatalf("online session should be 409: %v %v", resp.StatusCode, body)
+	}
+
+	// disconnect b, then delete
+	b.ws.Close(websocket.StatusNormalClosure, "")
+	time.Sleep(100 * time.Millisecond)
+	if resp, body := post("/api/delete", map[string]any{"address": "s2@p"}); resp.StatusCode != 200 {
+		t.Fatalf("delete: %v %v", resp.StatusCode, body)
+	}
+
+	// the session is gone from listings and the API
+	resp, err := http.Get(base + "/api/sessions?includeOffline=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sb map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&sb)
+	resp.Body.Close()
+	for _, s := range sb["sessions"].([]interface{}) {
+		if s.(map[string]interface{})["session"] == "s2" {
+			t.Fatalf("s2 should be gone from listings: %v", sb)
+		}
+	}
+	if resp, _ := post("/api/delete", map[string]any{"address": "s2@p"}); resp.StatusCode != 404 {
+		t.Fatalf("second delete should 404: %v", resp.StatusCode)
+	}
+
+	// the mailbox file is gone; the pi session file is untouched
+	if _, err := os.Stat(filepath.Join(root, ".pi", "mailbox", "s2.jsonl")); !os.IsNotExist(err) {
+		t.Fatalf("mailbox file should be gone: %v", err)
+	}
+	if _, err := os.Stat(piSession); err != nil {
+		t.Fatalf("pi session file must not be touched: %v", err)
+	}
+
+	// s1 is untouched and a ref to the deleted mail no longer resolves
+	// (the referencing mail becomes an orphan root in thread listings)
+	if m := a.request(map[string]interface{}{
+		"t": "send", "rid": 3,
+		"target":  map[string]string{"project": "p", "session": "s2"},
+		"subject": "after delete", "body": "x",
+	}); m["code"] != "no_mailbox" {
+		t.Fatalf("send to deleted mailbox should fail: %v", m)
+	}
+
+	// unknown project / bad address
+	if resp, _ := post("/api/delete", map[string]any{"address": "s2@nope"}); resp.StatusCode != 404 {
+		t.Fatalf("unknown project: %v", resp.StatusCode)
+	}
+	if resp, _ := post("/api/delete", map[string]any{"address": "garbage"}); resp.StatusCode != 400 {
+		t.Fatalf("bad address: %v", resp.StatusCode)
 	}
 }

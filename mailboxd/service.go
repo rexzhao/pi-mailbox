@@ -188,6 +188,11 @@ func (c *conn) handleHello(rid int, data []byte) error {
 		c.send(ErrorReply{T: "error", Rid: &ridCopy, Code: "bad_hello", Message: "invalid project or session"})
 		return nil
 	}
+	if msg.Session == webUserSession {
+		ridCopy := rid
+		c.send(ErrorReply{T: "error", Rid: &ridCopy, Code: "bad_hello", Message: "session id 'user' is reserved for the web UI"})
+		return nil
+	}
 
 	proj, err := c.daemon.project(msg)
 	if err != nil {

@@ -85,8 +85,10 @@ func (d *Daemon) authorize(w http.ResponseWriter, r *http.Request) bool {
 }
 
 func (d *Daemon) serveAPI(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "GET only"})
+	// the API is read-only with a single exception: the web UI's own sends
+	if r.Method != http.MethodGet &&
+		!(r.Method == http.MethodPost && (r.URL.Path == "/api/send" || r.URL.Path == "/api/delete")) {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "GET only (POST /api/send, /api/delete excepted)"})
 		return
 	}
 	// cross-site requests: an Origin that disagrees with the Host is rejected
@@ -110,6 +112,10 @@ func (d *Daemon) serveAPI(w http.ResponseWriter, r *http.Request) {
 		d.apiThread(w, r)
 	case strings.HasPrefix(r.URL.Path, "/api/threads/"):
 		d.apiThreads(w, r)
+	case r.URL.Path == "/api/send":
+		d.apiSend(w, r)
+	case r.URL.Path == "/api/delete":
+		d.apiDelete(w, r)
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
 	}
@@ -522,4 +528,134 @@ func (d *Daemon) apiThreads(w http.ResponseWriter, r *http.Request) {
 		return threads[i].Mail.ID > threads[j].Mail.ID
 	})
 	writeJSON(w, http.StatusOK, map[string]any{"threads": threads})
+}
+
+// apiSend lets the web UI user send mail as user@<project> — the single
+// write endpoint of the web API. The first send implicitly registers the
+// user's mailbox in the target project so that agent replies and
+// agent-initiated mail can be delivered offline.
+func (d *Daemon) apiSend(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST only"})
+		return
+	}
+	var msg struct {
+		To      string   `json:"to"` // session@project
+		Subject string   `json:"subject"`
+		Body    string   `json:"body"`
+		Refs    []string `json:"refs"` // session@project/mailId
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 256*1024)
+	if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unparsable body"})
+		return
+	}
+	if len(msg.Subject) > subjectMax {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "subject too long"})
+		return
+	}
+	if len(msg.Body) > bodyMax {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "body too large"})
+		return
+	}
+	if len(msg.Refs) > refsMax {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "too many refs"})
+		return
+	}
+	session, projectID, ok := parseSessionRef(msg.To)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "expected <session>@<project>"})
+		return
+	}
+	proj := d.projectByID(projectID)
+	if proj == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown project"})
+		return
+	}
+	if !proj.Store.HasMailbox(session) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no mailbox"})
+		return
+	}
+	refs := []MailRef{}
+	for _, s := range msg.Refs {
+		// "session@project/mailId": split the mail id off first
+		slash := strings.LastIndex(s, "/")
+		if slash <= 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid ref: " + s})
+			return
+		}
+		rs, rp, ok := parseSessionRef(s[:slash])
+		if !ok {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid ref: " + s})
+			return
+		}
+		refs = append(refs, MailRef{Project: rp, Session: rs, Mail: s[slash+1:]})
+	}
+	// ensure the user's mailbox exists in this project so replies (and
+	// agent-initiated mail) can be delivered
+	if !proj.Store.HasMailbox(webUserSession) {
+		if _, err := proj.Store.HelloMerge(webUserSession, "user-web", "", nil); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+	}
+	mail := &MailRecord{
+		ID:      newShortID(),
+		From:    AgentRef{Project: projectID, Session: webUserSession},
+		Subject: msg.Subject,
+		Body:    msg.Body,
+		Refs:    refsOrNil(refs),
+	}
+	if err := proj.Store.AppendSend(session, mail); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	// push updated unread count to the recipient (only when online)
+	if tc := proj.lookupOnline(session); tc != nil {
+		if unread, err := proj.Store.UnreadCount(session); err == nil {
+			tc.send(NotifyMsg{T: "notify", Unread: unread})
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ref":  session + "@" + projectID + "/" + mail.ID,
+		"mail": mail,
+	})
+}
+
+// apiDelete removes a session's mailbox entirely (mails, meta, registration)
+// at the user's request. Online sessions are refused — the connection would
+// recreate state immediately; disconnect first. The pi session file is never
+// touched.
+func (d *Daemon) apiDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST only"})
+		return
+	}
+	var msg struct {
+		Address string `json:"address"` // session@project
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
+	if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unparsable body"})
+		return
+	}
+	session, projectID, ok := parseSessionRef(msg.Address)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "expected <session>@<project>"})
+		return
+	}
+	proj := d.projectByID(projectID)
+	if proj == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown project"})
+		return
+	}
+	if proj.IsOnline(session) {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "session is online; it would recreate its mailbox — disconnect first"})
+		return
+	}
+	if err := proj.Store.DeleteMailbox(session); err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": msg.Address})
 }

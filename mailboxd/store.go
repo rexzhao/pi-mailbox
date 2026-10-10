@@ -25,6 +25,12 @@ import (
 
 var sessionIDRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
+// webUserSession is the session id of the human user in the web UI. It is
+// reserved: WS hello rejects it, and the lifecycle GC never collects it
+// (it has no pi session file to check). Mail from the browser is written
+// with this identity; agents can send and reply to it like any session.
+const webUserSession = "user"
+
 // timeStampLayout is fixed-width so lexicographic comparison matches
 // chronological order for strings this daemon writes (RFC3339Nano trims
 // trailing zeros and misorders). Historical TS records use millisecond
@@ -527,6 +533,9 @@ func (s *Store) GCOrphans(sessionDir string, grace time.Duration, onlineSnapshot
 		return 0, nil
 	}
 	alive := func(sessionID string) bool {
+		if sessionID == webUserSession {
+			return true // the web user has no pi session file
+		}
 		// resolve the mailbox's origin (the client's full session id) for
 		// the session-file check; fall back to the mailbox filename for
 		// legacy/origin-less mailboxes
@@ -624,4 +633,30 @@ func replayLine(st *SessionState, line string) bool {
 		return false
 	}
 	return true
+}
+
+// DeleteMailbox removes a session's mailbox entirely: mails, meta, and the
+// registration (ListSessionIDs is file-based, so the session disappears from
+// listings). The file is hard-deleted on request; the pi session file in the
+// session directory is never touched. Mails in other mailboxes keep their
+// refs; those refs simply no longer resolve (they surface as orphan roots
+// in thread listings).
+func (s *Store) DeleteMailbox(sessionID string) error {
+	path, err := s.sessionFile(sessionID)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("no such mailbox")
+		}
+		return err
+	}
+	if err := os.Remove(path); err != nil {
+		return err
+	}
+	delete(s.states, sessionID)
+	return nil
 }

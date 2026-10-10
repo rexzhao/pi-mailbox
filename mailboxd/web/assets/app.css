@@ -139,6 +139,26 @@ h1 .counts { color: var(--muted); font-weight: normal; font-size: 13px; margin-l
 .reply h3 { margin: 8px 10px 4px; font-size: 14px; }
 .reply .body { margin: 0 10px 10px; }
 
+.reply-head .spacer { flex: 1; }
+.reply-head .reply-btn { padding: 1px 10px; font-size: 12px; }
+.reply-slot:empty { display: none; }
+
+button.danger { border-color: #6e2b2b; color: #ff7b72; }
+
+.compose { max-width: 70ch; margin: 10px 0; }
+.compose input, .compose textarea {
+	display: block;
+	width: 100%;
+	background: var(--panel);
+	color: var(--fg);
+	border: 1px solid var(--line);
+	border-radius: 4px;
+	padding: 6px 8px;
+	font: inherit;
+	margin: 6px 0;
+}
+.compose .actions { display: flex; gap: 8px; align-items: center; }
+
 /* Reddit-style nesting: each level indents with a guide line */
 .children {
 	margin-left: 14px;
