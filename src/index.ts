@@ -86,12 +86,16 @@ function formatMailList(mails: MailRecord[]): string {
 		.join("\n");
 }
 
-function formatSessions(sessions: SessionInfo[]): string {
+/** Render a sessions listing; `self` (own project + short session id) gets a "(you)" marker. */
+function formatSessions(sessions: SessionInfo[], self?: { project: string; session: string }): string {
 	if (sessions.length === 0) return "no sessions";
 	return sessions
 		.map((s) => {
 			const mark = s.online ? "*" : "-";
+			const isSelf =
+				self !== undefined && s.session === self.session && (s.project === undefined || s.project === self.project);
 			const address = s.project ? `${s.session}@${s.project}` : s.session;
+			const you = isSelf ? " (you)" : "";
 			const agent = s.agent ? `  ${s.agent}` : "";
 			const name = s.name ? `  name=${s.name}` : "";
 			const tags = s.tags && s.tags.length > 0 ? `  tags=${s.tags.join(",")}` : "";
@@ -99,7 +103,7 @@ function formatSessions(sessions: SessionInfo[]): string {
 				.filter(([k]) => k !== "name" && k !== "tags" && k !== "_agent" && k !== "_origin")
 				.map(([k, v]) => `  ${k}=${v}`)
 				.join("");
-			return `[${mark}] ${address}${agent}${name}${tags}${extra}`;
+			return `[${mark}] ${address}${you}${agent}${name}${tags}${extra}`;
 		})
 		.join("\n");
 }
@@ -611,7 +615,10 @@ export default function (pi: ExtensionAPI) {
 					const online = sessions.filter((s) => s.online).length;
 					const scope =
 						arg === "list client all" ? `${online} online / ${sessions.length} total` : `${online} online`;
-					ctx.ui.notify(`mailbox: ${scope}\n${formatSessions(sessions)}`, "info");
+					ctx.ui.notify(
+						`mailbox: ${scope}\n${formatSessions(sessions, { project: c.mailbox.project!, session: c.shortSession })}`,
+						"info",
+					);
 					return;
 				}
 				if (arg === "name" || arg === "tag" || arg === "meta") {
@@ -848,17 +855,20 @@ ${formatMailList(mails)}${more}`,
 		label: "Mailbox sessions",
 		description:
 			"List sessions in this project's mailbox with their name, tags, and other " +
-			"meta (model, host, ...). By default only online sessions; set " +
-			"includeOffline to also list sessions that registered before but are " +
-			"currently disconnected (marked '-' vs '*').",
+			"meta (model, host, ...). Your own session is marked '(you)'. By default only " +
+			"online sessions; set includeOffline to also list sessions that registered " +
+			"before but are currently disconnected (marked '-' vs '*').",
 		parameters: Type.Object({
 			includeOffline: Type.Optional(Type.Boolean({ description: "Also list offline (registered but disconnected) sessions" })),
 		}),
 		exposure: "deferred",
 		async execute(_toolCallId, params) {
-			const sessions = await requireConnection().mailbox.sessions(params.includeOffline);
+			const c = requireConnection();
+			const sessions = await c.mailbox.sessions(params.includeOffline);
 			return {
-				content: [{ type: "text", text: formatSessions(sessions) }],
+				content: [
+					{ type: "text", text: formatSessions(sessions, { project: c.mailbox.project!, session: c.shortSession }) },
+				],
 				details: { sessions },
 			};
 		},

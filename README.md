@@ -84,8 +84,9 @@ below.
 - `/mailbox host:port [token]` — connect to a remote mailboxd (token
   required by remote-mode daemons)
 - `/mailbox list [client [all]|mail]` — list online sessions, all
-  mailboxes (with `all`, including offline ones marked `-`), or this
-  session's mail (default: mail, same as `/mailbox`)
+  mailboxes (with `all`, including offline ones marked `-`; the own
+  session is marked `(you)`), or this session's mail (default: mail,
+  same as `/mailbox`)
 - `/mailbox name <name>` — set this session's display name (persists across
   reconnects; a name set once is not overwritten by later registration
   defaults)
@@ -116,7 +117,8 @@ or until the user runs `/mailbox`):
 - `mailbox_reply <mail> <body> [wake]` — reply to a mail (auto recipient, refs,
   and `Re:` subject)
 - `mailbox_sessions [includeOffline]` — list sessions with name, tags, and
-  meta; offline mailboxes included on request
+  meta (your own session is marked `(you)`); offline mailboxes included on
+  request
 
 ## Protocol
 
