@@ -290,7 +290,8 @@ export class MailboxConnection {
 	private generation = 0;
 
 	private readonly mode: ConnectionMode;
-	private readonly projectDir: string;
+	/** Project root directory (workspace cwd for the herdr wake). */
+	readonly projectDir: string;
 	/** Remote target this connection dials (null in local mode). */
 	get remoteTarget(): RemoteTarget | null {
 		return this.remote;

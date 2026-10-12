@@ -22,6 +22,7 @@ import { hostname, platform } from "node:os";
 import { Type } from "typebox";
 import { MailboxConnection, type RemoteTarget } from "./client.ts";
 import { connectLocalDaemonIfRunning, findMailboxdBinary } from "./daemon.ts";
+import { wakeOfflineSession } from "./herdr.ts";
 import type { MailRecord, MailRef, SessionInfo } from "./protocol.ts";
 
 const TOOL_NAMES = ["mailbox_list", "mailbox_read", "mailbox_send", "mailbox_reply", "mailbox_sessions"] as const;
@@ -131,10 +132,30 @@ export default function (pi: ExtensionAPI) {
 	pi.on("agent_start", () => {
 		busy = true;
 	});
-	pi.on("agent_end", () => {
+	const settle = (): void => {
 		busy = false;
+		// a notify held through the final settlement window has no turn_end
+		// left to flush it; deliver it once the run has fully settled
+		if (pendingUnread > 0) scheduleIdleFlush();
+	};
+	// agent_end closes one low-level run, but retries, compaction, and
+	// follow-up work can still continue; agent_settled is the final
+	// boundary. Both clear busy: sendUserMessage always passes
+	// deliverAs:"steer" (see flushNotifications), which pi applies only
+	// while streaming, so an early clear during the settlement window is
+	// safe — and a missing agent_settled must never wedge notifications.
+	pi.on("agent_end", settle);
+	pi.on("agent_settled", settle);
+	// turn boundary: steered messages are delivered right after turn_end
+	// handlers run, so a notification flushed here is seen by the very next
+	// LLM call — and everything that arrived during the finished turn is
+	// coalesced into that single message
+	pi.on("turn_end", async () => {
+		if (pendingUnread > 0) await flushNotifications();
 	});
 	pi.on("session_shutdown", async () => {
+		if (flushTimer !== null) clearTimeout(flushTimer);
+		flushTimer = null;
 		await conn?.stop();
 		conn = null;
 	});
@@ -147,16 +168,114 @@ export default function (pi: ExtensionAPI) {
 		pi.setActiveTools(next);
 	}
 
-	function inject(unread: number): void {
-		if (!interactive) return;
-		const text = busy
-				? `[mailbox] You have ${unread} new mail(s). Finish your current task, then check with mailbox_list.`
-				: `[mailbox] You have ${unread} new mail(s); use mailbox_list to read them.`
-		try {
-			pi.sendUserMessage(text, busy ? { deliverAs: "steer" } : undefined);
-		} catch {
-			// injection races with run state; the next notify will retry
+	// -----------------------------------------------------------------------
+	// new-mail notification: hold-and-flush at turn boundaries
+	// -----------------------------------------------------------------------
+	// Notifies are held while the agent runs and flushed as ONE coalesced
+	// steer message at the next turn_end (the earliest moment a steered
+	// message can be processed); while idle they go out directly after a
+	// short debounce. The flushed message lists mail subjects, dedups
+	// against already-announced mail ids, and gives mail from the web UI
+	// 'user' session (the human operator) priority instructions.
+
+	let pendingUnread = 0;
+	let flushing = false;
+	let flushTimer: NodeJS.Timeout | null = null;
+	/** Mail ids already included in a notification (bounded). */
+	let announced = new Set<string>();
+
+	const SUBJECT_MAX = 80;
+
+	function truncateSubject(s: string): string {
+		// normalize whitespace: a subject containing newlines must not be able
+		// to forge extra lines inside the injected notification
+		const norm = s.replace(/\s+/g, " ").trim();
+		if (norm.length === 0) return "(no subject)";
+		return norm.length > SUBJECT_MAX ? `${norm.slice(0, SUBJECT_MAX - 1)}…` : norm;
+	}
+
+	function composeNotification(unread: number, fresh: MailRecord[]): string {
+		const userMails = fresh.filter((m) => m.from.session === "user");
+		const agentMails = fresh.filter((m) => m.from.session !== "user");
+		const lines = [`[mailbox] You have ${unread} unread mail(s).`];
+		if (userMails.length > 0) {
+			lines.push("New mail from the user (your human operator):");
+			for (const m of userMails) lines.push(`  * ${m.id}: ${truncateSubject(m.subject)}`);
+			lines.push(
+				"User mail takes priority: if it is quick to handle, do it now and reply with mailbox_reply; " +
+					"if it is a large task, briefly acknowledge it now, finish your current work, then handle it and reply when done.",
+			);
 		}
+		if (agentMails.length > 0) {
+			lines.push("New mail:");
+			for (const m of agentMails)
+				lines.push(`  * ${m.id} from ${m.from.session}@${m.from.project}: ${truncateSubject(m.subject)}`);
+		}
+		lines.push(busy ? "Finish your current task, then check with mailbox_list." : "Use mailbox_list to read them.");
+		return lines.join("\n");
+	}
+
+	function scheduleIdleFlush(): void {
+		if (!interactive || flushTimer !== null) return;
+		// short debounce: bursts of notifies while idle become one message
+		flushTimer = setTimeout(() => {
+			flushTimer = null;
+			void flushNotifications();
+		}, 300);
+	}
+
+	async function flushNotifications(): Promise<void> {
+		if (flushing || !interactive) return;
+		const c = conn;
+		if (!c?.connected) {
+			pendingUnread = 0;
+			return;
+		}
+		flushing = true;
+		try {
+			const unread = pendingUnread;
+			pendingUnread = 0;
+			if (unread <= 0) return;
+			// subjects + the authoritative unread count (reads do not emit
+			// notifies, so the notify snapshot can be stale); on failure fall
+			// back to the snapshot with a count-only text
+			let mails: MailRecord[] = [];
+			let count = unread;
+			try {
+				const reply = await c.mailbox.inbox({ unreadOnly: true }, { limit: 8 });
+				mails = reply.mails;
+				count = reply.totalUnread;
+			} catch {
+				// daemon hiccup: announce by count alone
+			}
+			const fresh = mails.filter((m) => !announced.has(m.id));
+			if (count <= 0 && fresh.length === 0) return; // everything got read in the meantime
+			// deliverAs "steer" is always safe: pi applies it only while
+			// streaming (mid-run) and ignores it otherwise — so an injection
+			// racing the settlement window steers instead of being rejected.
+			// Note: sendUserMessage is fire-and-forget; a rejected injection
+			// cannot be caught here, hence the unconditional steer.
+			try {
+				pi.sendUserMessage(composeNotification(count, fresh), { deliverAs: "steer" });
+				for (const m of mails) announced.add(m.id);
+				if (announced.size > 200) announced = new Set([...announced].slice(-200));
+			} catch {
+				// synchronous rejection: retry at the next boundary
+				pendingUnread = count > 0 ? count : unread;
+			}
+		} finally {
+			flushing = false;
+			// a notify that arrived while this flush was in flight must not be
+			// lost: re-arm the idle path (the busy path flushes at turn_end)
+			if (pendingUnread > 0 && !busy) scheduleIdleFlush();
+		}
+	}
+
+	/** Notify hook: hold while busy (flushed at turn_end), debounce while idle. */
+	function handleNotify(unread: number): void {
+		if (!interactive) return;
+		pendingUnread = unread;
+		if (!busy) scheduleIdleFlush();
 	}
 
 	async function startConnection(
@@ -194,7 +313,7 @@ export default function (pi: ExtensionAPI) {
 			session,
 			agent,
 			{
-				onNotify: inject,
+				onNotify: handleNotify,
 				onConnected: () => activateTools(true),
 				onDisconnected: () => activateTools(false),
 			},
@@ -213,6 +332,38 @@ export default function (pi: ExtensionAPI) {
 	function requireConnection(): MailboxConnection {
 		if (!conn?.connected) throw new Error("mailbox not connected; run /mailbox start service or the mailbox_connect tool first");
 		return conn;
+	}
+
+	/**
+	 * Best-effort herdr wake after a send to an offline target: resume the
+	 * target's pi session in a herdr pane and prompt it to check its mail.
+	 * Returns a suffix for the send reply (empty when not applicable).
+	 * Never throws and never fails the send.
+	 */
+	async function maybeWake(c: MailboxConnection, target: { project: string; session: string }): Promise<string> {
+		try {
+			// cross-project targets: the target project's root is unknown here (v1)
+			if (target.project !== c.mailbox.project) return "";
+			const sessions = await c.mailbox.sessions(true);
+			const info = sessions.find((s) => s.session === target.session);
+			if (!info || info.online) return ""; // online: the daemon's notify covers it
+			const meta = info.meta ?? {};
+			// wake only same-host sessions (_host is set by local-mode connections)
+			if (meta._host !== hostname()) return "";
+			const origin = meta._origin;
+			if (!origin) return ""; // e.g. the web UI 'user' mailbox: nothing to resume
+			const result = await wakeOfflineSession({
+				session: target.session,
+				origin,
+				projectRoot: c.projectDir,
+				label: info.name,
+			});
+			if (result.ok) return ` (target offline — woke via herdr: ${result.detail})`;
+			if (result.silent) return ""; // no herdr environment: behave as if wake were off
+			return ` (target offline — herdr wake failed: ${result.reason})`;
+		} catch {
+			return ""; // wake is best-effort
+		}
 	}
 
 	async function statusSummary(c: MailboxConnection): Promise<string> {
@@ -618,7 +769,10 @@ ${formatMailList(mails)}${more}`,
 			"'Re:'-style reply sent through mailbox_send breaks the thread chain. The " +
 			"target must have registered at least once (its mailbox exists); it does " +
 			"not need to be online — offline mail is delivered as unread on its next " +
-			"connection (use mailbox_sessions to find sessions).",
+			"connection (use mailbox_sessions to find sessions). When the target is " +
+			"offline, runs on this machine, and herdr is available, it is woken by " +
+			"resuming its pi session in a herdr pane and prompted to handle this mail " +
+			"(disable with wake: false).",
 		parameters: Type.Object({
 			address: Type.String({ description: "Target mailbox address 'session@project'; a bare session id means this project. The session must have registered once (see mailbox_sessions)" }),
 			subject: Type.String({ description: "Subject line" }),
@@ -629,6 +783,12 @@ ${formatMailList(mails)}${more}`,
 					{ description: "Referenced mails as 'session@project/mail' (a bare mail id means your own mailbox)" },
 				),
 			),
+			wake: Type.Optional(
+				Type.Boolean({
+					description:
+					"When the target is offline and herdr is running on this machine, resume its pi session in a herdr pane and prompt it to handle this mail (default true)",
+				}),
+			),
 		}),
 		exposure: "deferred",
 		async execute(_toolCallId, params) {
@@ -637,8 +797,9 @@ ${formatMailList(mails)}${more}`,
 			const target = parseAddress(params.address, own.project);
 			const refs = params.refs?.map((r) => parseMailRef(r, own));
 			const ref = await c.mailbox.sendMail(target, params.subject, params.body ?? "", refs);
+			const wakeNote = params.wake === false ? "" : await maybeWake(c, target);
 			return {
-				content: [{ type: "text", text: `sent: ${formatMailRef(ref)}` }],
+				content: [{ type: "text", text: `sent: ${formatMailRef(ref)}${wakeNote}` }],
 				details: { ref },
 			};
 		},
@@ -656,6 +817,12 @@ ${formatMailList(mails)}${more}`,
 			mail: Type.String({ description: "Mail being replied to: 'session@project/mail'; a bare mail id means your own mailbox" }),
 			body: Type.String({ description: "Reply body" }),
 			subject: Type.Optional(Type.String({ description: "Override the 'Re: <subject>' default" })),
+			wake: Type.Optional(
+				Type.Boolean({
+					description:
+					"When the original sender is offline and herdr is running on this machine, resume its pi session in a herdr pane and prompt it to handle this reply (default true)",
+				}),
+			),
 		}),
 		exposure: "deferred",
 		async execute(_toolCallId, params) {
@@ -668,8 +835,9 @@ ${formatMailList(mails)}${more}`,
 			if (!params.subject && !/^Re: /u.test(subject)) subject = `Re: ${subject}`;
 			subject = subject.slice(0, 256);
 			const sent = await c.mailbox.sendMail(original.from, subject, params.body, [ref]);
+			const wakeNote = params.wake === false ? "" : await maybeWake(c, original.from);
 			return {
-				content: [{ type: "text", text: `replied: ${formatMailRef(sent)}` }],
+				content: [{ type: "text", text: `replied: ${formatMailRef(sent)}${wakeNote}` }],
 				details: { ref: sent },
 			};
 		},

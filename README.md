@@ -52,11 +52,30 @@ below.
   collects files idle for over an hour. Collected files land in
   `<project>/.pi/mailbox/.trash/`; unreadable or empty session directories
   disable the GC entirely.
-- Delivery: while the agent is running, a new-mail notice is steered in
-  ("You have N new mail(s). Finish your current task, then check with
-  mailbox_list."); while idle, a shorter notice is submitted directly
-  ("You have N new mail(s); use mailbox_list to read them."). After
-  reconnect, the unread count is backfilled.
+- Delivery: new-mail notices are coalesced at turn boundaries. While the
+  agent runs, arriving notifies are held and flushed as ONE steered
+  message at the next `turn_end` (the earliest moment a steered message is
+  processed — the next LLM call), listing the subjects of new, not yet
+  announced mails; while idle, the notice is submitted directly after a
+  short debounce. Mail from the web UI `user` session (the human operator)
+  is called out with priority instructions: quick tasks are handled and
+  replied to immediately, large ones get a brief acknowledgment now and a
+  full reply after the current work. After reconnect, the unread count is
+  backfilled through the same path.
+- herdr wake (opt-out): when a send targets an offline session that runs on
+  this machine and [herdr](https://herdr.dev) is up, the sender's extension
+  wakes it instead of waiting for its next connection: it finds (or creates)
+  the project's herdr workspace, opens a fresh tab, resumes the target's
+  exact pi session there (`pi --session-id`, same session id -> same
+  mailbox identity -> unread backfill applies), and prompts the agent to
+  connect and handle the mail. If the target's pi is already running in a
+  herdr pane (e.g. mailbox-disconnected), it is prompted in place. Wake is
+  best-effort and never fails the send; disable per send with `wake: false`.
+  When herdr is unavailable (no binary / server down) the wake is silently
+  skipped. The wake tab is opened with the project root as its cwd — pi
+  derives both its session directory and its mailbox identity from cwd.
+  Cross-project, remote-mailbox, and off-host targets are skipped (the
+  target must carry a local `_host` and an `_origin` in its meta).
 
 ## Commands
 
@@ -92,9 +111,9 @@ or until the user runs `/mailbox`):
   mail, newest first, paginated (default page 20, max 100); the reply carries
   a `cursor` token to fetch older mails
 - `mailbox_read <mail> [session] [project]` — read a mail by triple
-- `mailbox_send <session> <subject> [body] [refs]` — send to a registered
+- `mailbox_send <session> <subject> [body] [refs] [wake]` — send to a registered
   session (online or offline)
-- `mailbox_reply <mail> <body>` — reply to a mail (auto recipient, refs,
+- `mailbox_reply <mail> <body> [wake]` — reply to a mail (auto recipient, refs,
   and `Re:` subject)
 - `mailbox_sessions [includeOffline]` — list sessions with name, tags, and
   meta; offline mailboxes included on request
@@ -114,6 +133,16 @@ npm install --ignore-scripts
 npm run check          # tsc --noEmit
 node --experimental-strip-types --no-warnings test/smoke.mjs
 cd mailboxd && go test ./...
+```
+
+The herdr wake and the notification injection have manual end-to-end demos
+(real daemon + running herdr; they spawn live pi agents in new tabs and
+clean them up afterwards — see `src/herdr.ts` and the notification section
+in `src/index.ts`):
+
+```
+node --experimental-strip-types --no-warnings test/wake-demo.mjs
+node --experimental-strip-types --no-warnings test/notif-live-test.mjs
 ```
 
 ## mailboxd
