@@ -25,6 +25,64 @@ import (
 
 var sessionIDRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
+// mailboxNameRe is the grammar for named mailboxes (login names): 3-32
+// chars, lowercase, starting with a letter, no dots (filename safety).
+var mailboxNameRe = regexp.MustCompile(`^[a-z][a-z0-9_-]{2,31}$`)
+
+// derivedIDRe is the shape of client-derived session ids (10 base36 chars);
+// login names must not collide with it so addresses stay unambiguous.
+var derivedIDRe = regexp.MustCompile(`^[0-9a-z]{10}$`)
+
+// windowsReserved lists filenames Windows treats as devices; a mailbox
+// file must never be named after one.
+var windowsReserved = map[string]bool{
+	"con": true, "prn": true, "aux": true, "nul": true,
+	"com1": true, "com2": true, "com3": true, "com4": true, "com5": true,
+	"com6": true, "com7": true, "com8": true, "com9": true,
+	"lpt1": true, "lpt2": true, "lpt3": true, "lpt4": true, "lpt5": true,
+	"lpt6": true, "lpt7": true, "lpt8": true, "lpt9": true,
+}
+
+// ValidateMailboxName checks a login name: grammar, no collision with the
+// derived-id shape, no reserved ids. Returns a user-facing reason.
+func ValidateMailboxName(name string) error {
+	if !mailboxNameRe.MatchString(name) {
+		return fmt.Errorf("name must match [a-z][a-z0-9_-]{2,31} (3-32 chars, lowercase)")
+	}
+	if derivedIDRe.MatchString(name) {
+		return fmt.Errorf("name must not be 10 lowercase alphanumerics (reserved for derived session ids)")
+	}
+	if name == webUserSession || windowsReserved[name] {
+		return fmt.Errorf("name %q is reserved", name)
+	}
+	return nil
+}
+
+// globalNSMu/globalMaxNS make assigned mail timestamps strictly increasing
+// across ALL mailboxes in this daemon: per-state monotonicity only breaks
+// ties within one mailbox, and cross-mailbox ties (same clock tick) made
+// thread/list ordering random.
+var (
+	globalNSMu  sync.Mutex
+	globalMaxNS int64
+)
+
+func nextGlobalNS(now int64) int64 {
+	globalNSMu.Lock()
+	defer globalNSMu.Unlock()
+	if now <= globalMaxNS {
+		now = globalMaxNS + 1
+	}
+	globalMaxNS = now
+	return now
+}
+
+// Claim carries login-time overrides for a named-mailbox registration.
+type Claim struct {
+	Name string // the mailbox name being claimed
+	Tags string // comma-separated; empty keeps the existing tags
+}
+
 // webUserSession is the session id of the human user in the web UI. It is
 // reserved: WS hello rejects it, and the lifecycle GC never collects it
 // (it has no pi session file to check). Mail from the browser is written
@@ -199,7 +257,7 @@ func (s *Store) AppendSend(sessionID string, mail *MailRecord) error {
 	if err != nil {
 		return err
 	}
-	ns := time.Now().UnixNano()
+	ns := nextGlobalNS(time.Now().UnixNano())
 	if ns <= st.maxNS {
 		ns = st.maxNS + 1
 	}
@@ -301,7 +359,7 @@ func (s *Store) UpdateMeta(sessionID string, set map[string]string, unset []stri
 //   - user keys apply only when absent
 //   - separate caps: user keys, system keys
 //   - stored system keys absent from the accepted set are unset
-func (s *Store) HelloMerge(sessionID, agent, origin string, meta map[string]string) (map[string]string, error) {
+func (s *Store) HelloMerge(sessionID, agent, origin string, meta map[string]string, claim *Claim) (map[string]string, error) {
 	path, err := s.sessionFile(sessionID)
 	if err != nil {
 		return nil, err
@@ -317,11 +375,24 @@ func (s *Store) HelloMerge(sessionID, agent, origin string, meta map[string]stri
 		metaSource["_origin"] = origin
 	}
 	for k, v := range meta {
+		// _named is server-owned: only the claim path may set it, so a
+		// client cannot self-exempt its mailbox from the lifecycle GC
+		if k == "_named" {
+			continue
+		}
 		metaSource[k] = v
 	}
 	metaSource["_agent"] = agent
 	if origin != "" {
 		metaSource["_origin"] = origin
+	}
+	if claim != nil {
+		// login semantics: identity overwrites beat the cookie-like merge
+		metaSource["name"] = claim.Name
+		metaSource["_named"] = "1"
+		if claim.Tags != "" {
+			metaSource["tags"] = claim.Tags
+		}
 	}
 
 	var set map[string]string
@@ -343,7 +414,9 @@ func (s *Store) HelloMerge(sessionID, agent, origin string, meta map[string]stri
 				}
 				set[k] = v
 			}
-		} else if _, exists := st.Meta[k]; !exists {
+		} else if _, exists := st.Meta[k]; !exists || (claim != nil && (k == "name" || (k == "tags" && claim.Tags != ""))) {
+			// user keys apply only when absent — except the login-time
+			// identity overwrites (name always, tags when provided)
 			if set == nil {
 				set = map[string]string{}
 			}
@@ -496,6 +569,18 @@ func (s *Store) MetaSnapshot(sessionID string) (map[string]string, error) {
 	return copyMeta(st.Meta), nil
 }
 
+// OriginOf returns the stored _origin meta (the last holder's full session
+// id); empty when the mailbox has none.
+func (s *Store) OriginOf(sessionID string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st, err := s.state(sessionID)
+	if err != nil {
+		return ""
+	}
+	return st.Meta["_origin"]
+}
+
 func (s *Store) UnreadCount(sessionID string) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -541,6 +626,11 @@ func (s *Store) GCOrphans(sessionDir string, grace time.Duration, onlineSnapshot
 		// legacy/origin-less mailboxes
 		origin := sessionID
 		if st, err := s.state(sessionID); err == nil {
+			// named mailboxes are persistent accounts: they outlive any pi
+			// session and are only removed explicitly (web UI / cleanup)
+			if st.Meta["_named"] != "" {
+				return true
+			}
 			if o := st.Meta["_origin"]; o != "" {
 				origin = o
 			}

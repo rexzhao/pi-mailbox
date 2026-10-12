@@ -20,7 +20,7 @@ import { VERSION, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { spawn, spawnSync } from "node:child_process";
 import { hostname, platform } from "node:os";
 import { Type } from "typebox";
-import { MailboxConnection, type RemoteTarget } from "./client.ts";
+import { isFatalLoginError, MailboxConnection, type RemoteTarget } from "./client.ts";
 import { connectLocalDaemonIfRunning, findMailboxdBinary } from "./daemon.ts";
 import { wakeOfflineSession } from "./herdr.ts";
 import type { MailRecord, MailRef, SessionInfo } from "./protocol.ts";
@@ -282,16 +282,69 @@ export default function (pi: ExtensionAPI) {
 		if (!busy) scheduleIdleFlush();
 	}
 
+	// -----------------------------------------------------------------------
+	// named-mailbox login binding (persisted in the pi session file)
+	// -----------------------------------------------------------------------
+
+	const LOGIN_ENTRY = "pi-mailbox-login";
+
+	/** Read the stored login binding: the last pi-mailbox-login entry wins. */
+	function readStoredLogin(ctx: {
+		sessionManager: { getEntries?(): Array<{ type: string; customType?: string; data?: unknown }> };
+	}): { as: string } | null {
+		try {
+			const entries = ctx.sessionManager.getEntries?.() ?? [];
+			for (let i = entries.length - 1; i >= 0; i--) {
+				const e = entries[i];
+				if (e.type === "custom" && e.customType === LOGIN_ENTRY) {
+					const data = e.data as { name?: string | null } | undefined | null;
+					return data?.name ? { as: data.name } : null;
+				}
+			}
+		} catch {
+			// entries unavailable (older pi): manual login only
+		}
+		return null;
+	}
+
+	/** Persist (or clear, name=null) the login binding in the session file. */
+	function storeLogin(name: string | null): void {
+		try {
+				const api = pi as { appendEntry?: (t: string, data?: unknown) => void };
+			api.appendEntry?.(LOGIN_ENTRY, { name });
+		} catch {
+			// best-effort: the login still works for this connection
+		}
+	}
+
+	const WINDOWS_RESERVED = new Set([
+		"con", "prn", "aux", "nul",
+		"com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
+		"lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+	]);
+
+	/** Client-side mirror of the daemon's name grammar (early UX; the daemon is the authority). */
+	function validMailboxName(name: string): boolean {
+		return /^[a-z][a-z0-9_-]{2,31}$/.test(name) && !/^[0-9a-z]{10}$/.test(name) && name !== "user" && !WINDOWS_RESERVED.has(name);
+	}
+
 	async function startConnection(
 		ctx: {
-			sessionManager: { getSessionId(): string; getCwd(): string; getSessionDir(): string };
+			sessionManager: {
+				getSessionId(): string;
+				getCwd(): string;
+				getSessionDir(): string;
+				getEntries?(): Array<{ type: string; customType?: string; data?: unknown }>;
+			};
 			model?: { id: string; provider: string } | undefined;
 		},
 		remote: RemoteTarget | null,
 		canSpawn = false,
+		login?: { as: string; tags?: string } | null,
 	): Promise<MailboxConnection> {
-		await conn?.stop();
-		conn = null;
+		// the previous connection is only torn down after the new one is
+		// live: a rejected login must leave the previous identity connected
+		const previous = conn;
 		const session = ctx.sessionManager.getSessionId();
 		// Stable agent kind: the session-id derivation and the wire identity
 		// must never change. The user-renamable display name (/name) is meta
@@ -310,6 +363,10 @@ export default function (pi: ExtensionAPI) {
 			helloMeta._platform = platform();
 		}
 		if (ctx.model) helloMeta._model = `${ctx.model.provider}/${ctx.model.id}`;
+		// explicit login beats the stored binding; no explicit login falls
+		// back to it (auto-login on resume/reconnect)
+		const fromBinding = login === undefined;
+		const effectiveLogin = login !== undefined ? login : readStoredLogin(ctx);
 		const connection = new MailboxConnection(
 			remote ? "remote" : "local",
 			ctx.sessionManager.getCwd(),
@@ -322,6 +379,7 @@ export default function (pi: ExtensionAPI) {
 				onDisconnected: () => activateTools(false),
 			},
 			{
+				login: effectiveLogin ?? undefined,
 				helloMeta,
 				canSpawn,
 			},
@@ -329,7 +387,47 @@ export default function (pi: ExtensionAPI) {
 		// the daemon's lifecycle GC needs the pi session directory (local mode)
 		connection.sessionDirProvider = () => ctx.sessionManager.getSessionDir();
 		conn = connection;
-		await connection.start();
+		try {
+			await connection.start();
+		} catch (err) {
+			if (
+				fromBinding &&
+				effectiveLogin !== null &&
+				isFatalLoginError(err) &&
+				!previous?.connected
+			) {
+				// a stored binding whose name is now held must not brick
+				// the mailbox: connect as the derived identity instead and
+				// say so (the wake prompt's fallback depends on this).
+				// `previous` may be a dead socket with an armed reconnect
+				// loop — stop it or it ping-pongs registrations with the
+				// fallback connection forever.
+				await previous?.stop();
+				await connection.stop();
+				const fallback = await startConnection(ctx, remote, canSpawn, null);
+				fallback.loginFallback = effectiveLogin.as;
+				return fallback;
+			}
+			if (previous?.connected) {
+				// identity switch failed (rejected login, or a transient error
+				// mid-switch): stay on the previous identity — no half-open
+				// second connection, no retry loop; the user retries explicitly
+				await connection.stop();
+				conn = previous;
+				activateTools(true);
+			} else if (isFatalLoginError(err)) {
+				// permanent login rejection on a fresh connection: no retry loop
+				await connection.stop();
+				conn = null;
+				activateTools(false);
+			} else {
+				// first connection, transient failure: keep the retry loop armed
+				// (a late-starting daemon is picked up automatically)
+				activateTools(false);
+			}
+			throw err;
+		}
+		await previous?.stop();
 		return connection;
 	}
 
@@ -356,11 +454,22 @@ export default function (pi: ExtensionAPI) {
 			if (meta._host !== hostname()) return "";
 			const origin = meta._origin;
 			if (!origin) return ""; // e.g. the web UI 'user' mailbox: nothing to resume
+			// named mailbox (not a derived-id shape): the wake prompt must
+			// carry the name so the woken agent can claim it, and the last
+			// holder must never be hijacked: if it is online under a
+			// different identity, spawn a fresh session instead of resuming
+			const named = !/^[0-9a-z]{10}$/.test(target.session);
+			const spawnFresh =
+				named &&
+				sessions.some((x) => x.online && x.session !== target.session && (x.meta ?? {})._origin === origin);
 			const result = await wakeOfflineSession({
 				session: target.session,
 				origin,
 				projectRoot: c.projectDir,
 				label: info.name,
+				named,
+				spawnFresh,
+				sender: c.address ?? undefined,
 			});
 			if (result.ok) return ` (target offline — woke via herdr: ${result.detail})`;
 			if (result.silent) return ""; // no herdr environment: behave as if wake were off
@@ -372,6 +481,10 @@ export default function (pi: ExtensionAPI) {
 
 	async function statusSummary(c: MailboxConnection): Promise<string> {
 		const { total, totalUnread } = await c.mailbox.inbox();
+		const identity = `as ${c.address}`;
+		const fallbackNote = c.loginFallback
+			? ` (login as '${c.loginFallback}' failed — held; /mailbox logout clears the stale binding)`
+			: "";
 		let onlinePart = "";
 		try {
 			const online = (await c.mailbox.sessions()).filter((s) => s.online).length;
@@ -379,7 +492,7 @@ export default function (pi: ExtensionAPI) {
 		} catch {
 			// best-effort; keep the mail counts when the sessions query fails
 		}
-		return `${total} mails (${totalUnread} unread)${onlinePart}`;
+		return `${identity}: ${total} mails (${totalUnread} unread)${onlinePart}${fallbackNote}`;
 	}
 
 	// -----------------------------------------------------------------------
@@ -446,11 +559,55 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			if (arg === "off") {
+			if (arg === "login" || arg.startsWith("login ")) {
+				const rest = arg.slice(5).trim();
+				if (!rest) {
+					ctx.ui.notify("Usage: /mailbox login <name> [tags=a,b,...]  (log in to a named mailbox)", "warning");
+					return;
+				}
+				const m = /^(\S+)(?:\s+(\S.*))?$/.exec(rest);
+				const name = (m?.[1] ?? "").toLowerCase();
+				let tags: string | undefined;
+				if (m?.[2]) {
+					const tm = /^tags=(.*)$/.exec(m[2].trim());
+					if (!tm) {
+						ctx.ui.notify("Usage: /mailbox login <name> [tags=a,b,...]", "warning");
+						return;
+					}
+					tags = tm[1];
+				}
+				if (!validMailboxName(name)) {
+					ctx.ui.notify(
+						"mailbox: invalid name (3-32 chars, lowercase [a-z0-9_-], not a derived-id shape, 'user' reserved)",
+						"warning",
+					);
+					return;
+				}
+				try {
+					// reconnect under the new identity (same-origin relogin
+					// replaces; a held name rejects with mailbox_in_use and we
+					// stay on the previous identity)
+					const prev = conn?.connected ? conn.address : null;
+					const connection = await startConnection(ctx, null, true, { as: name, tags });
+					storeLogin(name);
+					const meta = connection.mailbox.sessionMeta ?? {};
+					const inherited = tags ? "" : ` (tags inherited: ${meta.tags ?? "(none)"})`;
+					ctx.ui.notify(
+						`mailbox: logged in as ${connection.address}${inherited}${prev ? `; was ${prev}` : ""}`,
+						"info",
+					);
+				} catch (err) {
+					ctx.ui.notify(`mailbox: login failed: ${err instanceof Error ? err.message : String(err)}`, "error");
+				}
+				return;
+			}
+
+			if (arg === "logout" || arg === "off") {
 				await conn?.stop();
 				conn = null;
 				activateTools(false);
-				ctx.ui.notify("mailbox: disconnected (daemon keeps running)", "info");
+				storeLogin(null); // release the binding: resumes no longer auto-login
+				ctx.ui.notify("mailbox: logged out (daemon keeps running)", "info");
 				return;
 			}
 
@@ -577,7 +734,7 @@ export default function (pi: ExtensionAPI) {
 				const m = /^([A-Za-z0-9.-]+):(\d+)(?:\s+(\S+))?$/.exec(arg);
 				if (!m) {
 					ctx.ui.notify(
-						"Usage: /mailbox [start service | stop service | restart service | view | off | status | list [client [all]|mail] | meta | name <n> | tag <a,b> | set k=v | unset k | read <mail-ref> | more <cursor> | host:port [token]]",
+						"Usage: /mailbox [start service | stop service | restart service | view | logout | status | login <name> [tags=a,b] | list [client [all]|mail] | meta | name <n> | tag <a,b> | set k=v | unset k | read <mail-ref> | more <cursor> | host:port [token]]",
 						"warning",
 					);
 					return;
@@ -616,7 +773,7 @@ export default function (pi: ExtensionAPI) {
 					const scope =
 						arg === "list client all" ? `${online} online / ${sessions.length} total` : `${online} online`;
 					ctx.ui.notify(
-						`mailbox: ${scope}\n${formatSessions(sessions, { project: c.mailbox.project!, session: c.shortSession })}`,
+						`mailbox: ${scope}\n${formatSessions(sessions, { project: c.mailbox.project!, session: c.mailboxId })}`,
 						"info",
 					);
 					return;
@@ -633,7 +790,7 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				if (readId) {
-					const own = { project: c.mailbox.project!, session: c.shortSession };
+					const own = { project: c.mailbox.project!, session: c.mailboxId };
 					const ref = parseMailRef(readId, own);
 					const mail = await c.mailbox.read(ref);
 					if (!mail) {
@@ -678,16 +835,35 @@ ${formatMailList(mails)}${more}`,
 			"when you need to communicate with other Pi agent sessions in this project: send or " +
 			"reply to mail, check your inbox, or discover peer sessions. After connecting, incoming " +
 			"mail is announced as notifications and the other mailbox tools become available. " +
+			"Optional 'as' logs in to a named mailbox (a persistent, human-named identity that " +
+			"survives sessions; use it when instructed to claim a role mailbox, e.g. as='reviewer') " +
+			"with optional 'tags' overwrite; a held name rejects with mailbox_in_use. " +
 			"Returns a status summary (mail counts, online clients, this session's address).",
-		parameters: Type.Object({}),
+		parameters: Type.Object({
+			as: Type.Optional(
+				Type.String({
+					description:
+						"Log in to this named mailbox (3-32 chars, lowercase [a-z0-9_-]) instead of the derived session id; inherits its mails and tags",
+				}),
+			),
+			tags: Type.Optional(
+				Type.String({ description: "Login-time tags overwrite as a comma-separated list; omit to inherit the mailbox's existing tags" }),
+			),
+		}),
 		// default exposure (direct, active): the model must see this tool so it
 		// can enable the mailbox on its own; it is not part of TOOL_NAMES, so
 		// activation toggling never withdraws it
-		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
-			if (conn?.connected) {
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			if (params.as !== undefined && !validMailboxName(params.as.toLowerCase())) {
+				throw new Error(
+					"mailbox: invalid name (3-32 chars, lowercase [a-z0-9_-], not a derived-id shape, 'user' reserved)",
+				);
+			}
+			const login = params.as !== undefined ? { as: params.as.toLowerCase(), tags: params.tags } : undefined;
+			if (conn?.connected && login === undefined) {
 				const summary = await statusSummary(conn);
 				return {
-					content: [{ type: "text", text: `mailbox already connected: ${summary}. Your address: ${conn.address}. ${ADDRESS_FORMAT_DOC}` }],
+					content: [{ type: "text", text: `mailbox already connected: ${summary}. ${ADDRESS_FORMAT_DOC}` }],
 					details: { alreadyConnected: true },
 				};
 			}
@@ -698,7 +874,8 @@ ${formatMailList(mails)}${more}`,
 					"mailbox: no running mailboxd daemon found. Ask the user to run `/mailbox start service` to start it.",
 				);
 			}
-			const connection = await startConnection(ctx, null);
+			const connection = await startConnection(ctx, null, false, login);
+			if (login) storeLogin(login.as); // persist: resumes auto-login
 			const summary = await statusSummary(connection);
 			return {
 				content: [
@@ -707,7 +884,7 @@ ${formatMailList(mails)}${more}`,
 						text: `mailbox connected: ${summary}. Your address: ${connection.address}. ${ADDRESS_FORMAT_DOC}`,
 					},
 				],
-				details: { alreadyConnected: false },
+				details: { alreadyConnected: false, loginFallback: connection.loginFallback },
 			};
 		},
 	});
@@ -753,7 +930,7 @@ ${formatMailList(mails)}${more}`,
 		exposure: "deferred",
 		async execute(_toolCallId, params) {
 			const c = requireConnection();
-			const own = { project: c.mailbox.project!, session: c.shortSession };
+			const own = { project: c.mailbox.project!, session: c.mailboxId };
 			const ref = parseMailRef(params.mail, own);
 			const mail = await c.mailbox.read(ref);
 			if (!mail) throw new Error(`mail ${params.mail} not found`);
@@ -800,7 +977,7 @@ ${formatMailList(mails)}${more}`,
 		exposure: "deferred",
 		async execute(_toolCallId, params) {
 			const c = requireConnection();
-			const own = { project: c.mailbox.project!, session: c.shortSession };
+			const own = { project: c.mailbox.project!, session: c.mailboxId };
 			const target = parseAddress(params.address, own.project);
 			const refs = params.refs?.map((r) => parseMailRef(r, own));
 			const ref = await c.mailbox.sendMail(target, params.subject, params.body ?? "", refs);
@@ -834,7 +1011,7 @@ ${formatMailList(mails)}${more}`,
 		exposure: "deferred",
 		async execute(_toolCallId, params) {
 			const c = requireConnection();
-			const own = { project: c.mailbox.project!, session: c.shortSession };
+			const own = { project: c.mailbox.project!, session: c.mailboxId };
 			const ref = parseMailRef(params.mail, own);
 			const original = await c.mailbox.read(ref);
 			if (!original) throw new Error(`mail ${params.mail} not found`);
@@ -867,7 +1044,7 @@ ${formatMailList(mails)}${more}`,
 			const sessions = await c.mailbox.sessions(params.includeOffline);
 			return {
 				content: [
-					{ type: "text", text: formatSessions(sessions, { project: c.mailbox.project!, session: c.shortSession }) },
+					{ type: "text", text: formatSessions(sessions, { project: c.mailbox.project!, session: c.mailboxId }) },
 				],
 				details: { sessions },
 			};

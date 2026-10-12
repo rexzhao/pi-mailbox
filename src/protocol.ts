@@ -46,6 +46,10 @@ export interface HelloMsg {
 	sessionDir?: string;
 	/** Session id (short base36, derived from agent + pi session id); the mailbox is keyed by this. */
 	session: string;
+	/** Login: claim this named mailbox instead of the derived session id. Rejected with mailbox_in_use while a different origin holds it; same-origin reconnection replaces the previous connection. */
+	as?: string;
+	/** Login-time tags overwrite (comma-separated); omitted keeps the named mailbox's existing tags. */
+	tags?: string;
 	/** Full pi session id; persisted as the `_origin` system meta for the lifecycle GC. */
 	origin?: string;
 	agent: string;
@@ -118,6 +122,8 @@ export interface WelcomeMsg {
 	t: "welcome";
 	rid: number;
 	project: string;
+	/** Effective mailbox id (the login name when hello carried `as`, else the session id); clients verify their login was applied. */
+	mailbox?: string;
 	instanceId: string;
 	protocolVersion?: number;
 	/** This session's full meta after the registration merge. */

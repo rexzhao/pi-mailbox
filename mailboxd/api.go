@@ -601,7 +601,7 @@ func (d *Daemon) apiSend(w http.ResponseWriter, r *http.Request) {
 	// ensure the user's mailbox exists in this project so replies (and
 	// agent-initiated mail) can be delivered
 	if !proj.Store.HasMailbox(webUserSession) {
-		if _, err := proj.Store.HelloMerge(webUserSession, "user-web", "", nil); err != nil {
+		if _, err := proj.Store.HelloMerge(webUserSession, "user-web", "", nil, nil); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
 		}

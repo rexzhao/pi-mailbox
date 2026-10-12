@@ -138,7 +138,7 @@ function referencesOrigin(value: string, origin: string): boolean {
 }
 
 export interface WakeTarget {
-	/** Mailbox session id of the offline target. */
+	/** Mailbox id of the offline target: a derived session id, or a named-mailbox login name. */
 	session: string;
 	/** Full pi session id (the mailbox `_origin` meta) used to resume. */
 	origin: string;
@@ -146,6 +146,12 @@ export interface WakeTarget {
 	projectRoot: string;
 	/** Human-readable label for the created tab (defaults to the session id). */
 	label?: string;
+	/** True when `session` is a named mailbox: the prompt carries the name so the woken agent claims it. */
+	named?: boolean;
+	/** Sender's mailbox address (this connection), for the claim-failure fallback instruction. */
+	sender?: string;
+	/** Spawn a fresh session (no resume, no live-agent prompt): used when the last holder is online under a different identity and must not be hijacked. */
+	spawnFresh?: boolean;
 }
 
 /**
@@ -157,9 +163,23 @@ export type WakeResult =
 	| { ok: true; detail: string; paneId?: string }
 	| { ok: false; reason: string; silent?: boolean };
 
-const WAKE_PROMPT =
-	"You have new mail in your project mailbox. Use the mailbox_connect tool to connect, " +
-	"then read the new mail with mailbox_list and handle what it asks.";
+/** Prompt for the woken agent: derived mailboxes just connect; named mailboxes must be claimed (the binding may be stale or absent on a fresh session), with an explicit exit when the claim loses a race. */
+function wakePrompt(target: WakeTarget): string {
+	if (!target.named) {
+		return (
+			"You have new mail in your project mailbox. Use the mailbox_connect tool to connect, " +
+			"then read the new mail with mailbox_list and handle what it asks."
+		);
+	}
+	return (
+		`You have new mail in the named mailbox '${target.session}' of this project. ` +
+		`Log in to it with the mailbox_connect tool (as='${target.session}'); ` +
+		"if your mailbox address is not that name you must claim it first. " +
+		"If the login fails because the mailbox is held by another session, connect with plain " +
+		`mailbox_connect (no name) and send a short note to ${target.sender ?? "(the sender)"} saying the mailbox ` +
+		"is held, then stop. Then read the new mail with mailbox_list and handle what it asks."
+	);
+}
 
 /** Wall-clock budget for one wake so the sending tool stays responsive. */
 const WAKE_BUDGET_MS = 15_000;
@@ -190,12 +210,16 @@ export async function wakeOfflineSession(target: WakeTarget): Promise<WakeResult
 	// minimal agent start + prompt); bail instead of spawning past the budget
 	if (deadline - Date.now() < 8_000) return { ok: false, reason: "wake budget exhausted before locating a pane" };
 	try {
-		for (const a of agents) {
-			if (!isRecord(a)) continue;
-			const sess = isRecord(a.agent_session) && typeof a.agent_session.value === "string" ? a.agent_session.value : null;
-			if (sess && referencesOrigin(sess, target.origin) && typeof a.pane_id === "string") {
-				await runHerdr(["agent", "prompt", a.pane_id, WAKE_PROMPT], cap(6_000));
-				return { ok: true, detail: `already running in pane ${a.pane_id}; prompt sent`, paneId: a.pane_id };
+		// spawnFresh: the last holder is online under a different identity —
+		// prompting it would hijack it, so never match live agents
+		if (!target.spawnFresh) {
+			for (const a of agents) {
+				if (!isRecord(a)) continue;
+				const sess = isRecord(a.agent_session) && typeof a.agent_session.value === "string" ? a.agent_session.value : null;
+				if (sess && referencesOrigin(sess, target.origin) && typeof a.pane_id === "string") {
+					await runHerdr(["agent", "prompt", a.pane_id, wakePrompt(target)], cap(6_000));
+					return { ok: true, detail: `already running in pane ${a.pane_id}; prompt sent`, paneId: a.pane_id };
+				}
 			}
 		}
 
@@ -246,10 +270,17 @@ export async function wakeOfflineSession(target: WakeTarget): Promise<WakeResult
 		const candidates = deadline - Date.now() > 9_000 ? [name, `${name.slice(0, 31)}2`] : [name];
 		for (const candidate of candidates) {
 			try {
-				await runHerdr(
-					["agent", "start", candidate, "--kind", "pi", "--pane", paneId, "--timeout", String(startTimeout), "--", "--session-id", target.origin],
-					cap(startTimeout + 4_000),
-				);
+				const args = ["agent", "start", candidate, "--kind", "pi", "--pane", paneId, "--timeout", String(startTimeout)];
+				// everything after "--" is passed unchanged to pi; the extra args
+				// (test-only escape hatch pointing the woken pi at a working-tree
+				// extension, never set in production) must land after it too, or
+				// herdr parses them as its own options
+				const piArgs: string[] = [];
+				if (!target.spawnFresh) piArgs.push("--session-id", target.origin);
+				const extra = process.env.PI_MAILBOX_TEST_PI_ARGS;
+				if (extra && extra.length > 0) piArgs.push(...extra.split(/\s+/).filter(Boolean));
+				if (piArgs.length > 0) args.push("--", ...piArgs);
+				await runHerdr(args, cap(startTimeout + 4_000));
 				usedName = candidate;
 				started = true;
 				break;
@@ -261,14 +292,14 @@ export async function wakeOfflineSession(target: WakeTarget): Promise<WakeResult
 			// readiness detection can lag the launch; the prompt still lands
 			// if the agent came up despite the detection failure
 			try {
-				await runHerdr(["agent", "prompt", paneId, WAKE_PROMPT], cap(6_000));
+				await runHerdr(["agent", "prompt", paneId, wakePrompt(target)], cap(6_000));
 				return { ok: true, detail: `pi resumed in pane ${paneId} (detection lagged); prompt sent`, paneId };
 			} catch {
 				return { ok: false, reason: startErr instanceof Error ? startErr.message : String(startErr) };
 			}
 		}
 		try {
-			await runHerdr(["agent", "prompt", paneId, WAKE_PROMPT], cap(6_000));
+			await runHerdr(["agent", "prompt", paneId, wakePrompt(target)], cap(6_000));
 		} catch (err) {
 			// the session is up; without the prompt it just sits idle — a
 			// later send re-prompts it via the live-agent branch
@@ -280,7 +311,8 @@ export async function wakeOfflineSession(target: WakeTarget): Promise<WakeResult
 				paneId,
 			};
 		}
-		return { ok: true, detail: `pi session resumed as '${usedName}' in pane ${paneId}; prompt sent`, paneId };
+		const how = target.spawnFresh ? "started (fresh session)" : "resumed";
+		return { ok: true, detail: `pi agent ${how} as '${usedName}' in pane ${paneId}; prompt sent`, paneId };
 	} catch (err) {
 		return { ok: false, reason: err instanceof Error ? err.message : String(err) };
 	}

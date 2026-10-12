@@ -46,6 +46,17 @@ func (p *Project) IsOnline(sessionID string) bool {
 	return ok && c.isOpen()
 }
 
+// LookupOnline returns the live connection for a session id, or nil.
+func (p *Project) LookupOnline(sessionID string) *conn {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	c, ok := p.online[sessionID]
+	if ok && c.isOpen() {
+		return c
+	}
+	return nil
+}
+
 // Register binds a session to a connection, replacing any previous one.
 func (p *Project) Register(sessionID string, c *conn) *conn {
 	p.mu.Lock()

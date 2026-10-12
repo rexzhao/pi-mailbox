@@ -24,6 +24,27 @@ import { deriveProjectId, deriveSessionId, resolveLocalDaemon, connectLocalDaemo
 
 const REQUEST_TIMEOUT_MS = 5_000;
 
+/** Error carrying the daemon's error code (also embedded in the message). */
+export class MailboxError extends Error {
+	readonly code: string;
+	constructor(code: string, message: string) {
+		super(`mailbox: ${code}: ${message}`);
+		this.name = "MailboxError";
+		this.code = code;
+	}
+}
+
+/**
+ * Login rejections that retrying can never fix: a held name, an invalid
+ * name, or a daemon that ignored the login (old daemon). These stop the
+ * reconnect loop instead of hammering the daemon with a doomed hello.
+ */
+const FATAL_LOGIN_CODES = new Set(["mailbox_in_use", "bad_name", "login_failed"]);
+
+export function isFatalLoginError(err: unknown): boolean {
+	return err instanceof MailboxError && FATAL_LOGIN_CODES.has(err.code);
+}
+
 export class MailboxClient {
 	private ws: WebSocket | null = null;
 	private nextRid = 1;
@@ -41,6 +62,8 @@ export class MailboxClient {
 		projectRoot?: string;
 		sessionDir?: string;
 		session: string;
+		as?: string;
+		tags?: string;
 		origin?: string;
 		agent: string;
 		token?: string;
@@ -56,6 +79,8 @@ export class MailboxClient {
 			projectRoot?: string;
 			sessionDir?: string;
 			session: string;
+			as?: string;
+			tags?: string;
 			origin?: string;
 			agent: string;
 			token?: string;
@@ -124,7 +149,7 @@ export class MailboxClient {
 				resolve: (reply) => {
 					clearTimeout(timer);
 					if (reply.t === "error") {
-						reject(new Error(`mailbox: ${reply.code}: ${reply.message}`));
+						reject(new MailboxError(reply.code, reply.message));
 					} else {
 						resolve(reply as T);
 					}
@@ -145,7 +170,7 @@ export class MailboxClient {
 	}
 
 	private handshake(): Promise<void> {
-		return this.request<{ project: string; meta?: Record<string, string>; protocolVersion?: number }>({
+		return this.request<{ project: string; mailbox?: string; meta?: Record<string, string>; protocolVersion?: number }>({
 			t: "hello",
 			rid: this.nextRid++,
 			...this.hello,
@@ -156,6 +181,23 @@ export class MailboxClient {
 					throw new Error(
 						`mailbox: protocol version mismatch (daemon ${reply.protocolVersion}, client ${PROTOCOL_VERSION})`,
 					);
+				}
+				// verify the login was applied, but only when one was
+				// requested: an old daemon never echoes `mailbox`, and
+				// non-login connections to it must stay compatible. With a
+				// login, a missing or wrong echo means the daemon ignored
+				// or mis-applied the claim.
+				if (this.hello.as !== undefined) {
+					const expected = this.hello.as;
+					if (reply.mailbox !== expected) {
+						this.ws?.terminate();
+						throw new MailboxError(
+							"login_failed",
+							reply.mailbox === undefined
+								? `daemon did not confirm the login as '${expected}' (old daemon?)`
+								: `daemon registered us as ${reply.mailbox}, expected ${expected}`,
+						);
+					}
 				}
 				this.project = reply.project;
 				this.sessionMeta = reply.meta ?? null;
@@ -262,6 +304,8 @@ export class MailboxClient {
 export type ConnectionMode = "local" | "remote";
 
 export interface ConnectionOptions {
+	/** Named-mailbox login: claim this name instead of the derived session id. */
+	login?: { as: string; tags?: string };
 	/** Registration-time meta defaults: system keys (`_`-prefixed) refresh on every connect; user keys apply only when absent. */
 	helloMeta?: Record<string, string>;
 	/** When true, the connection may spawn a new daemon when none is running. Only /mailbox start service sets this. */
@@ -286,6 +330,14 @@ export class MailboxConnection {
 	private client: MailboxClient | null = null;
 	private reconnectTimer: NodeJS.Timeout | null = null;
 	private stopped = false;
+	/** True when the last failure was a permanent login rejection (no retry). */
+	get loginRejected(): boolean {
+		return this.loginRejectedFlag;
+	}
+	/** Set by the extension when a stored binding was held and the connection
+	 *  fell back to the derived identity; surfaced in tool/command output. */
+	loginFallback: string | null = null;
+	private loginRejectedFlag = false;
 	/** Bumped on every drop so stale reconnect loops stop. */
 	private generation = 0;
 
@@ -327,9 +379,15 @@ export class MailboxConnection {
 		return this.client?.isOpen ?? false;
 	}
 
-	/** This session's mailbox address, `session@project`, once registered. */
+	/** The effective mailbox id: the login name when logged in, else the derived session id. */
+	get mailboxId(): string {
+		return this.options.login?.as ?? this.shortSession;
+	}
+
+	/** This session's mailbox address, `mailbox@project`, once registered (the login name when logged in). */
 	get address(): string | null {
-		return this.client?.project ? `${this.shortSession}@${this.client.project}` : null;
+		if (!this.client?.project) return null;
+		return `${this.mailboxId}@${this.client.project}`;
 	}
 
 	async start(): Promise<void> {
@@ -340,7 +398,12 @@ export class MailboxConnection {
 			await this.attempt();
 		} catch (err) {
 			this.events.onDisconnected();
-			this.scheduleReconnect(this.generation);
+			if (isFatalLoginError(err)) {
+				this.stopped = true; // permanent: no reconnect loop
+				this.loginRejectedFlag = true;
+			} else {
+				this.scheduleReconnect(this.generation);
+			}
 			throw err;
 		}
 	}
@@ -367,8 +430,15 @@ export class MailboxConnection {
 		if (this.stopped || generation !== this.generation) return;
 		try {
 			await this.attempt();
-		} catch {
+		} catch (err) {
 			this.events.onDisconnected();
+			// login rejections are permanent: retrying the same doomed
+			// hello forever would hammer the daemon
+			if (isFatalLoginError(err)) {
+				this.stopped = true;
+				this.loginRejectedFlag = true;
+				return;
+			}
 			this.scheduleReconnect(generation);
 		}
 	}
@@ -382,6 +452,8 @@ export class MailboxConnection {
 			projectRoot?: string;
 			sessionDir?: string;
 			session: string;
+			as?: string;
+			tags?: string;
 			origin: string;
 			agent: string;
 			token?: string;
@@ -389,6 +461,8 @@ export class MailboxConnection {
 		} = {
 			project: await deriveProjectId(this.projectDir),
 			session: this.shortSession,
+			as: this.options.login?.as,
+			tags: this.options.login?.tags,
 			origin: this.session,
 			agent: this.agent,
 			meta: this.options.helloMeta,
@@ -428,6 +502,9 @@ export class MailboxConnection {
 			projectRoot?: string;
 			sessionDir?: string;
 			session: string;
+			as?: string;
+			tags?: string;
+			origin?: string;
 			agent: string;
 			token?: string;
 			meta?: Record<string, string>;

@@ -194,13 +194,70 @@ try {
 	assert(meta3.role === "worker", "existing user key not clobbered by hello default");
 	await c3.stop();
 
-	// 10. findMailboxdBinary resolves the packaged binary without PI_MAILBOXD
+	// 10. named-mailbox login: claim, welcome echo, tags, exclusivity, inheritance
+	const logD1 = { notify: [], connected: 0, disconnected: 0 };
+	const d1 = new MailboxConnection("local", projectDir, null, "sessD1", "agent-d", events(logD1), {
+		login: { as: "smoke-reviewer", tags: "review,urgent" },
+		canSpawn: true,
+	});
+	await d1.start();
+	assert(d1.address === `smoke-reviewer@${d1.mailbox.project}`, "login address uses the claimed name");
+	assert(d1.mailboxId === "smoke-reviewer", "mailboxId is the login name");
+	const metaD1 = d1.mailbox.sessionMeta ?? {};
+	assert(metaD1.name === "smoke-reviewer", "login sets the display name");
+	assert(metaD1.tags === "review,urgent", "login tags overwrite");
+	assert(metaD1._named === "1", "named mailbox marker set");
+	// mail to the named mailbox is delivered to the holder (the push is
+	// async: poll briefly for it)
+	await a.mailbox.sendMail({ project: d1.mailbox.project, session: "smoke-reviewer" }, "named", "body");
+	for (let i = 0; i < 100 && !logD1.notify.includes(1); i++) await new Promise((r) => setTimeout(r, 30));
+	assert(logD1.notify.includes(1), "named mailbox holder got the notify");
+	// exclusivity: a different session claiming the held name is rejected
+	const logD2 = { notify: [], connected: 0, disconnected: 0 };
+	const d2 = new MailboxConnection("local", projectDir, null, "sessD2", "agent-d", events(logD2), {
+		login: { as: "smoke-reviewer" },
+	});
+	let inUseErr = null;
+	try {
+		await d2.start();
+	} catch (err) {
+		inUseErr = err;
+	}
+	assert(inUseErr && String(inUseErr).includes("mailbox_in_use"), "concurrent login from another session rejected");
+	assert(d2.loginRejected, "fatal login rejection stops the reconnect loop (no retry hammering)");
+	await d2.stop();
+	// same origin reconnecting replaces and inherits tags
+	await d1.stop();
+	const logD1b = { notify: [], connected: 0, disconnected: 0 };
+	const d1b = new MailboxConnection("local", projectDir, null, "sessD1", "agent-d", events(logD1b), {
+		login: { as: "smoke-reviewer" },
+	});
+	await d1b.start();
+	assert((d1b.mailbox.sessionMeta ?? {}).tags === "review,urgent", "relogin inherits tags when none given");
+	// (a held stored binding falling back to the derived identity is
+	// extension-level policy — covered by test/login-live-test.mjs)
+
+	// logout frees the name; the next claimant inherits mails and tags
+	await d1b.stop();
+	const logD3 = { notify: [], connected: 0, disconnected: 0 };
+	const d3 = new MailboxConnection("local", projectDir, null, "sessD3", "agent-d", events(logD3), {
+		login: { as: "smoke-reviewer", tags: "fresh" },
+	});
+	await d3.start();
+	for (let i = 0; i < 100 && !logD3.notify.includes(1); i++) await new Promise((r) => setTimeout(r, 30));
+	assert(logD3.notify.includes(1), "new claimant gets the unread backfill");
+	assert((d3.mailbox.sessionMeta ?? {}).tags === "fresh", "new claimant overwrites tags");
+	const inboxD3 = await d3.mailbox.inbox();
+	assert(inboxD3.total >= 1 && inboxD3.mails.some((m) => m.subject === "named"), "new claimant inherits the mail");
+	await d3.stop();
+
+	// 11. findMailboxdBinary resolves the packaged binary without PI_MAILBOXD
 	delete process.env.PI_MAILBOXD;
 	const { findMailboxdBinary } = await import("../src/daemon.ts");
 	const found = findMailboxdBinary();
 	assert(found !== null && found.endsWith(exe), `default binary path resolves (${found})`);
 
-	// 11. short ids: project id is a stable 8-char derivation, session ids
+	// 12. short ids: project id is a stable 8-char derivation, session ids
 	// are 10-char derivations of (agent, session)
 	const projectId = a.mailbox.project;
 	await a.stop();

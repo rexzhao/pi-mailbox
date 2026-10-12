@@ -188,38 +188,74 @@ func (c *conn) handleHello(rid int, data []byte) error {
 		c.send(ErrorReply{T: "error", Rid: &ridCopy, Code: "bad_hello", Message: "invalid project or session"})
 		return nil
 	}
-	if msg.Session == webUserSession {
+	// named-mailbox login: validate the name, then enforce exclusivity —
+	// a second concurrent session (different origin) is rejected, while
+	// the same origin reconnecting replaces the old connection below
+	var claim *Claim
+	mailboxID := msg.Session
+	var proj *Project
+	if msg.As != "" {
+		if err := ValidateMailboxName(msg.As); err != nil {
+			ridCopy := rid
+			c.send(ErrorReply{T: "error", Rid: &ridCopy, Code: "bad_name", Message: err.Error()})
+			return nil
+		}
+		var err error
+		proj, err = c.daemon.project(msg)
+		if err != nil {
+			ridCopy := rid
+			c.send(ErrorReply{T: "error", Rid: &ridCopy, Code: "bad_project", Message: err.Error()})
+			return nil
+		}
+		if online := proj.LookupOnline(msg.As); online != nil && online != c {
+			storedOrigin := proj.Store.OriginOf(msg.As)
+			if msg.Origin == "" || storedOrigin == "" || msg.Origin != storedOrigin {
+				ridCopy := rid
+				c.send(ErrorReply{T: "error", Rid: &ridCopy, Code: "mailbox_in_use", Message: "mailbox is held by another session"})
+				c.close()
+				return nil
+			}
+			// same origin: a reconnect of the current holder; Register below
+			// replaces the stale connection
+		}
+		claim = &Claim{Name: msg.As, Tags: msg.Tags}
+		mailboxID = msg.As
+	}
+	if mailboxID == webUserSession {
 		ridCopy := rid
 		c.send(ErrorReply{T: "error", Rid: &ridCopy, Code: "bad_hello", Message: "session id 'user' is reserved for the web UI"})
 		return nil
 	}
 
-	proj, err := c.daemon.project(msg)
-	if err != nil {
-		ridCopy := rid
-		c.send(ErrorReply{T: "error", Rid: &ridCopy, Code: "bad_project", Message: err.Error()})
-		return nil
+	if proj == nil {
+		var err error
+		proj, err = c.daemon.project(msg)
+		if err != nil {
+			ridCopy := rid
+			c.send(ErrorReply{T: "error", Rid: &ridCopy, Code: "bad_project", Message: err.Error()})
+			return nil
+		}
 	}
 
 	// same ws re-helloing as a different session: drop the old registration
-	if c.project != nil && c.session != "" && c.session != msg.Session {
+	if c.project != nil && c.session != "" && c.session != mailboxID {
 		c.project.Unregister(c.session, c)
 	}
 	c.project = proj
-	c.session = msg.Session
+	c.session = mailboxID
 	c.agent = msg.Agent
-	if old := proj.Register(msg.Session, c); old != nil && old != c {
+	if old := proj.Register(mailboxID, c); old != nil && old != c {
 		// same session reconnected elsewhere: replace the old connection
 		old.close()
 	}
 
 	// create the session file so offline delivery works from now on
-	if err := proj.Store.EnsureSession(msg.Session); err != nil {
-		log.Printf("ensure session %s: %v", msg.Session, err)
+	if err := proj.Store.EnsureSession(mailboxID); err != nil {
+		log.Printf("ensure session %s: %v", mailboxID, err)
 	}
 
 	// registration-time meta merge happens atomically inside the store
-	welcomeMeta, err := proj.Store.HelloMerge(msg.Session, msg.Agent, msg.Origin, msg.Meta)
+	welcomeMeta, err := proj.Store.HelloMerge(mailboxID, msg.Agent, msg.Origin, msg.Meta, claim)
 	if err != nil {
 		return err
 	}
@@ -228,6 +264,7 @@ func (c *conn) handleHello(rid int, data []byte) error {
 		T:               "welcome",
 		Rid:             rid,
 		Project:         msg.Project,
+		Mailbox:         mailboxID,
 		InstanceID:      c.daemon.instanceID,
 		ProtocolVersion: ProtocolVersion,
 		Meta:            welcomeMeta,
@@ -235,7 +272,7 @@ func (c *conn) handleHello(rid int, data []byte) error {
 	c.send(welcome)
 
 	// backfill: report unread count immediately after registration
-	if unread, err := proj.Store.UnreadCount(msg.Session); err == nil && unread > 0 {
+	if unread, err := proj.Store.UnreadCount(mailboxID); err == nil && unread > 0 {
 		c.send(NotifyMsg{T: "notify", Unread: unread})
 	}
 	return nil

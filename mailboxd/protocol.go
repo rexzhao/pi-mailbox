@@ -34,6 +34,13 @@ type HelloMsg struct {
 	SessionDir  string `json:"sessionDir,omitempty"`
 	// Session is the short mailbox session id the mailbox is keyed by.
 	Session string `json:"session"`
+	// As optionally logs in to a named mailbox: the connection is then keyed
+	// by that name instead of Session, inheriting the named mailbox's mails
+	// and meta. Rejected with mailbox_in_use while another origin holds it.
+	As string `json:"as,omitempty"`
+	// Tags optionally overwrites the named mailbox's tags at login time
+	// (comma-separated). Empty keeps the existing tags.
+	Tags string `json:"tags,omitempty"`
 	// Origin is the client's full session id (e.g. the pi session UUID);
 	// persisted as the _origin system meta, used by the lifecycle GC to
 	// match the client's session file. May be empty for non-pi agents.
@@ -125,9 +132,13 @@ type PongMsg struct {
 }
 
 type WelcomeMsg struct {
-	T               string            `json:"t"`
-	Rid             int               `json:"rid"`
-	Project         string            `json:"project"`
+	T       string `json:"t"`
+	Rid     int    `json:"rid"`
+	Project string `json:"project"`
+	// Mailbox is the effective mailbox id the connection is keyed by
+	// (the login name when hello carried "as", else Session). Clients
+	// verify their login was applied by comparing against the expectation.
+	Mailbox         string            `json:"mailbox,omitempty"`
 	InstanceID      string            `json:"instanceId"`
 	ProtocolVersion int               `json:"protocolVersion"`
 	Meta            map[string]string `json:"meta,omitempty"`

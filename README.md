@@ -33,6 +33,27 @@ below.
   best-effort: once a session's pi session is deleted and its mailbox is
   collected by the GC, mail to it fails (no_mailbox) and previously sent
   mail becomes unreachable.
+- Sessions register per project; a session may instead **log in to a named
+  mailbox** (`/mailbox login <name> [tags=a,b]` or `mailbox_connect` with
+  `as`): the mailbox is then keyed by the name, inheriting its mails, tags,
+  and meta wholesale. Named mailboxes are persistent accounts — they are
+  exempt from the lifecycle GC and only removed explicitly. Login names are
+  3-32 chars `[a-z][a-z0-9_-]` (never a derived-id shape, `user` reserved).
+  The daemon rejects a concurrent login from a different session with
+  `mailbox_in_use` (same-origin reconnection replaces); a freed name is
+  claimable by anyone, inheriting everything. Note that "same origin" means
+  the last holder's pi session id (the `_origin` meta, visible to every
+  session via `mailbox_sessions`): within a trusted project this lets a
+  member replace even a live holder by replaying the origin — acceptable in
+  the local/remote trust model, but prefer asking the holder to log out.
+  Login overwrites the display name with the claimed name and the tags
+  when given (omitted tags are inherited). The binding is persisted in the
+  pi session file, so resumes auto-login; a stored binding whose name is
+  now held falls back to the derived identity (surfaced in the tool output)
+  instead of failing the connection. `/mailbox logout` (alias `off`)
+  disconnects AND clears the binding. Named mailboxes are permanent
+  accounts: they are never GC'd and can only be deleted from the web UI
+  (or `POST /api/delete`) while offline.
 - Session meta is cookie-like key/value data (`Record<string, string>`;
   keys match `/^[a-zA-Z_][a-zA-Z0-9_.-]{0,63}$/`, values are capped at 512
   chars, at most 32 user keys and 8 system keys). Keys starting with `_` are
@@ -75,7 +96,11 @@ below.
   skipped. The wake tab is opened with the project root as its cwd — pi
   derives both its session directory and its mailbox identity from cwd.
   Cross-project, remote-mailbox, and off-host targets are skipped (the
-  target must carry a local `_host` and an `_origin` in its meta).
+  target must carry a local `_host` and an `_origin` in its meta). The wake
+  is name-aware: a named target's prompt carries the name so the woken agent
+  claims it (fresh sessions have no binding), and when the last holder is
+  online under a different identity a fresh session is spawned instead of
+  hijacking it.
 
 ## Commands
 
@@ -95,6 +120,10 @@ below.
 - `/mailbox unset k [k2 ...]` — remove meta values
 - `/mailbox meta` — show this session's full meta
 - `/mailbox read <mailId>` — view one mail
+- `/mailbox login <name> [tags=a,b]` — log in to a named mailbox (persistent
+  identity; tags overwrite when given, inherited when omitted)
+- `/mailbox logout` — log out: disconnect and clear the login binding
+  (`off` is an alias)
 - `/mailbox start service` — connect (spawns the daemon if needed)
 - `/mailbox stop service` — disconnect (the daemon itself keeps running
   until its idle timeout, or `mailboxd --stop`)
@@ -103,10 +132,11 @@ below.
 
 ## Agent tools
 
-`mailbox_connect` is declared from the start so the agent can enable the
-mailbox on its own when it needs to talk to other sessions; calling it
-connects and activates the tools below (they are `deferred` until then,
-or until the user runs `/mailbox`):
+`mailbox_connect` (optional `as`/`tags` to log in to a named mailbox) is
+declared from the start so the agent can enable the mailbox on its own when
+it needs to talk to other sessions; calling it connects and activates the
+tools below (they are `deferred` until then, or until the user runs
+`/mailbox`):
 
 - `mailbox_list [unreadOnly] [since] [limit] [cursor]` — list this session's
   mail, newest first, paginated (default page 20, max 100); the reply carries
@@ -145,6 +175,7 @@ in `src/index.ts`):
 ```
 node --experimental-strip-types --no-warnings test/wake-demo.mjs
 node --experimental-strip-types --no-warnings test/notif-live-test.mjs
+node --experimental-strip-types --no-warnings test/login-live-test.mjs
 ```
 
 ## mailboxd
