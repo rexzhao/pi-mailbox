@@ -39,7 +39,7 @@ export class MailboxError extends Error {
  * name, or a daemon that ignored the login (old daemon). These stop the
  * reconnect loop instead of hammering the daemon with a doomed hello.
  */
-const FATAL_LOGIN_CODES = new Set(["mailbox_in_use", "bad_name", "login_failed"]);
+const FATAL_LOGIN_CODES = new Set(["mailbox_in_use", "bad_name", "login_failed", "name_held", "session_bound"]);
 
 export function isFatalLoginError(err: unknown): boolean {
 	return err instanceof MailboxError && FATAL_LOGIN_CODES.has(err.code);
@@ -64,6 +64,7 @@ export class MailboxClient {
 		session: string;
 		as?: string;
 		tags?: string;
+		force?: boolean;
 		origin?: string;
 		agent: string;
 		token?: string;
@@ -81,6 +82,7 @@ export class MailboxClient {
 			session: string;
 			as?: string;
 			tags?: string;
+			force?: boolean;
 			origin?: string;
 			agent: string;
 			token?: string;
@@ -305,7 +307,7 @@ export type ConnectionMode = "local" | "remote";
 
 export interface ConnectionOptions {
 	/** Named-mailbox login: claim this name instead of the derived session id. */
-	login?: { as: string; tags?: string };
+	login?: { as: string; tags?: string; force?: boolean };
 	/** Registration-time meta defaults: system keys (`_`-prefixed) refresh on every connect; user keys apply only when absent. */
 	helloMeta?: Record<string, string>;
 	/** When true, the connection may spawn a new daemon when none is running. Only /mailbox start service sets this. */
@@ -451,6 +453,7 @@ export class MailboxConnection {
 			session: string;
 			as?: string;
 			tags?: string;
+			force?: boolean;
 			origin: string;
 			agent: string;
 			token?: string;
@@ -460,6 +463,7 @@ export class MailboxConnection {
 			session: this.shortSession,
 			as: this.options.login?.as,
 			tags: this.options.login?.tags,
+			force: this.options.login?.force,
 			origin: this.session,
 			agent: this.agent,
 			meta: this.options.helloMeta,
@@ -501,6 +505,7 @@ export class MailboxConnection {
 			session: string;
 			as?: string;
 			tags?: string;
+			force?: boolean;
 			origin?: string;
 			agent: string;
 			token?: string;

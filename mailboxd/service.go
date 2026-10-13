@@ -226,15 +226,28 @@ func (c *conn) handleHello(rid int, data []byte) error {
 			storedOrigin := proj.Store.OriginOf(msg.As)
 			if msg.Origin == "" || storedOrigin == "" || msg.Origin != storedOrigin {
 				ridCopy := rid
-				c.send(ErrorReply{T: "error", Rid: &ridCopy, Code: "mailbox_in_use", Message: "mailbox is held by another session"})
+				c.send(ErrorReply{T: "error", Rid: &ridCopy, Code: "mailbox_in_use",
+					Message: "mailbox is held by an online session; force cannot take it over. Ask that session to run /mailbox logout"})
 				c.close()
 				return nil
 			}
 			// same origin: a reconnect of the current holder; Register below
 			// replaces the stale connection
+		} else if !msg.Force && proj.Store.HasMailbox(msg.As) && proj.Store.OriginOf(msg.As) != msg.Origin {
+			// offline holder of a name that is not ours: taking over needs
+			// an explicit, user-confirmed force (never silently)
+			ridCopy := rid
+			c.send(ErrorReply{T: "error", Rid: &ridCopy, Code: "name_held",
+				Message: fmt.Sprintf("mailbox '%s' is held by another session (offline); ask the user whether to take it over, and if they confirm retry with force", msg.As)})
+			return nil
 		}
 		claim = &Claim{Name: msg.As, Tags: msg.Tags}
 		mailboxID = msg.As
+		if msg.Force {
+			if prevOrigin := proj.Store.OriginOf(msg.As); prevOrigin != "" && prevOrigin != msg.Origin {
+				log.Printf("mailbox %s taken over by origin %s (previous holder %s)", msg.As, msg.Origin, prevOrigin)
+			}
+		}
 	}
 	if mailboxID == webUserSession {
 		ridCopy := rid

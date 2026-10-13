@@ -185,10 +185,28 @@ for (let i = 0; i < 60; i++) {
 	await sleep(1000);
 }
 await holder2.stop();
-const taker = new MailboxConnection("local", projectDir, null, `name-taker-${Date.now().toString(36)}`, "pi", {
+// the takeover is the two-step: a normal attempt is rejected (name_held),
+// then the confirmed force takes the name
+const takerOrigin = `name-taker-${Date.now().toString(36)}`;
+const takerTry = new MailboxConnection("local", projectDir, null, takerOrigin, "pi", {
 	onNotify: () => {}, onConnected: () => {}, onDisconnected: () => {},
 }, { login: { as: NAME } });
+let heldErr = null;
+try {
+	await takerTry.start();
+} catch (err) {
+	heldErr = err;
+}
+if (!heldErr || !String(heldErr).includes("name_held")) {
+	throw new Error(`expected name_held on the normal takeover attempt, got: ${heldErr}`);
+}
+await takerTry.stop();
+console.log("phase 5: normal takeover attempt rejected with name_held");
+const taker = new MailboxConnection("local", projectDir, null, takerOrigin, "pi", {
+	onNotify: () => {}, onConnected: () => {}, onDisconnected: () => {},
+}, { login: { as: NAME, force: true } });
 await taker.start();
+console.log("phase 5: forced takeover succeeded");
 const wake2 = await wakeOfflineSession({
 	session: NAME, origin, projectRoot: projectDir, label: NAME, named: true, sessionDir: sessionsDir,
 });
@@ -210,6 +228,28 @@ if (!heldSessions.some((s) => s.session === NAME && s.online)) throw new Error("
 const tail = transcriptTail(10).join("\n");
 if (!tail.includes("mailbox_in_use")) throw new Error("agent transcript should show the rejected login");
 console.log("phase 5 ok: held binding rejected, no fallback, agent stopped");
+// the agent must not be able to force-retake while the taker is ONLINE.
+// Its forced attempt is refused client-side (force gate) or daemon-side
+// (mailbox_in_use) — asserted via the transcript, since the agent has no
+// mailbox connection to reply with.
+await herdr([
+	"agent", "prompt", paneId,
+	`Use the mailbox_connect tool with as='${NAME}' and force=true. It must be REJECTED — that is expected. Do not retry.`,
+]);
+let forceRefused = false;
+for (let i = 0; i < 60; i++) {
+	const tail = transcriptTail(12).join("\n");
+	if (tail.includes("force-refused") || tail.includes("force_not_allowed") || tail.includes("mailbox_in_use")) {
+		forceRefused = tail.includes("force_not_allowed") || tail.includes("mailbox_in_use");
+		break;
+	}
+	await sleep(1500);
+}
+if (!forceRefused) throw new Error("agent's forced attempt was not refused");
+if (!(await sender.mailbox.sessions(true)).some((s) => s.session === NAME && s.online)) {
+	throw new Error("taker must still hold the name after the refused force");
+}
+console.log("phase 5 ok: online holder cannot be displaced by force");
 await taker.stop();
 // close the phase-5 agent's pane: otherwise the live-agent branch could
 // match it and prompt it in place, making the dead-session phase flaky

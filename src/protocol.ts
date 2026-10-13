@@ -50,6 +50,8 @@ export interface HelloMsg {
 	as?: string;
 	/** Login-time tags overwrite (comma-separated); omitted keeps the named mailbox's existing tags. */
 	tags?: string;
+	/** Take over a name whose holder is OFFLINE and foreign. Online holders are never displaced; free names and same-origin reconnects never need it. */
+	force?: boolean;
 	/** Full pi session id; persisted as the `_origin` system meta for the lifecycle GC. */
 	origin?: string;
 	agent: string;

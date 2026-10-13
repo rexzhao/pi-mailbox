@@ -237,19 +237,33 @@ try {
 	// (a held stored binding falling back to the derived identity is
 	// extension-level policy — covered by test/login-live-test.mjs)
 
-	// logout frees the name; the next claimant inherits mails and tags
+	// logout leaves the name held (offline): the next claimant needs the
+	// normal attempt first (name_held), then a confirmed force
 	await d1b.stop();
 	const logD3 = { notify: [], connected: 0, disconnected: 0 };
 	const d3 = new MailboxConnection("local", projectDir, null, "sessD3", "agent-d", events(logD3), {
 		login: { as: "smoke-reviewer", tags: "fresh" },
 	});
-	await d3.start();
+	let heldErr = null;
+	try {
+		await d3.start();
+	} catch (err) {
+		heldErr = err;
+	}
+	assert(heldErr && String(heldErr).includes("name_held"), "offline foreign holder rejects with name_held");
+	assert(d3.loginRejected, "name_held is fatal (no reconnect loop)");
+	await d3.stop();
+	// forced retry takes over and inherits
+	const d3f = new MailboxConnection("local", projectDir, null, "sessD3", "agent-d", events(logD3), {
+		login: { as: "smoke-reviewer", tags: "fresh", force: true },
+	});
+	await d3f.start();
 	for (let i = 0; i < 100 && !logD3.notify.includes(1); i++) await new Promise((r) => setTimeout(r, 30));
 	assert(logD3.notify.includes(1), "new claimant gets the unread backfill");
-	assert((d3.mailbox.sessionMeta ?? {}).tags === "fresh", "new claimant overwrites tags");
-	const inboxD3 = await d3.mailbox.inbox();
+	assert((d3f.mailbox.sessionMeta ?? {}).tags === "fresh", "new claimant overwrites tags");
+	const inboxD3 = await d3f.mailbox.inbox();
 	assert(inboxD3.total >= 1 && inboxD3.mails.some((m) => m.subject === "named"), "new claimant inherits the mail");
-	await d3.stop();
+	await d3f.stop();
 
 	// 11. findMailboxdBinary resolves the packaged binary without PI_MAILBOXD
 	delete process.env.PI_MAILBOXD;

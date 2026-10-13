@@ -26,6 +26,20 @@ func (c *testClient) helloLogin(rid int, project, root, sessionDir, short, origi
 	return c.request(msg)
 }
 
+// helloLoginForce is helloLogin with force=true.
+func (c *testClient) helloLoginForce(rid int, project, root, sessionDir, short, origin, agent, as, tags string) map[string]interface{} {
+	msg := map[string]interface{}{
+		"t": "hello", "rid": rid, "project": project, "projectRoot": root,
+		"sessionDir": sessionDir,
+		"session":    short, "origin": origin, "agent": agent,
+		"as": as, "force": true,
+	}
+	if tags != "" {
+		msg["tags"] = tags
+	}
+	return c.request(msg)
+}
+
 func TestNamedMailboxLogin(t *testing.T) {
 	tmp := t.TempDir()
 	projectRoot := filepath.Join(tmp, "proj")
@@ -111,14 +125,18 @@ func TestNamedMailboxLogin(t *testing.T) {
 		}
 	}
 
-	// 7. logout (disconnect) frees the name; the next claimant inherits
-	//    mails and tags wholesale
+	// 7. an offline foreign holder now requires a confirmed force: the
+	//    normal attempt is rejected, the forced retry takes over and
+	//    inherits mails and tags wholesale
 	a2.ws.Close(websocket.StatusNormalClosure, "")
 	time.Sleep(100 * time.Millisecond)
 	b2 := dialTest(t, port) // b's socket was closed by the step-3 rejection
-	wb := b2.helloLogin(2, project, projectRoot, sessionDir, "shortbbbb", "originB", "agent-b", "reviewer", "")
+	if e := b2.helloLogin(2, project, projectRoot, sessionDir, "shortbbbb", "originB", "agent-b", "reviewer", ""); e["t"] != "error" || e["code"] != "name_held" {
+		t.Fatalf("expected name_held for the offline foreign holder, got %v", e)
+	}
+	wb := b2.helloLoginForce(3, project, projectRoot, sessionDir, "shortbbbb", "originB", "agent-b", "reviewer", "")
 	if wb["t"] != "welcome" || wb["mailbox"] != "reviewer" {
-		t.Fatalf("B login after logout: %v", wb)
+		t.Fatalf("forced B login after logout: %v", wb)
 	}
 	if metaB := wb["meta"].(map[string]interface{}); metaB["tags"] != "fresh" {
 		t.Fatalf("B should inherit tags, got %v", metaB)
@@ -181,6 +199,28 @@ func TestNamedMailboxLogin(t *testing.T) {
 		"agent": "agent-a", "as": "fresh-name",
 	}); w["t"] != "welcome" || w["mailbox"] != "fresh-name" {
 		t.Fatalf("stale _holds should self-heal and allow a new name, got %v", w)
+	}
+
+	// 7d. force edge cases: online holder still refuses; session_bound is
+	// not bypassed; force on a free name is a no-op. c4 is a fresh
+	// nameless session so the earlier checks cannot short-circuit.
+	// (b2's plain re-hello in 7b re-registered it under its derived id, so
+	// "reviewer" has no online holder; this re-login is the same-origin
+	// OFFLINE re-claim (row 2). Row 3 (same-origin online replace) is
+	// covered by step 4's a2 re-login.)
+	if w := b2.helloLogin(14, project, projectRoot, sessionDir, "shortbbbb", "originB", "agent-b", "reviewer", ""); w["t"] != "welcome" || w["mailbox"] != "reviewer" {
+		t.Fatalf("same-origin online re-login: %v", w)
+	}
+	c4 := dialTest(t, port)
+	if e := c4.helloLoginForce(11, project, projectRoot, sessionDir, "shortdddd", "originD", "agent-d", "reviewer", ""); e["t"] != "error" || e["code"] != "mailbox_in_use" {
+		t.Fatalf("force must never displace an online holder, got %v", e)
+	}
+	if e := b2.helloLoginForce(12, project, projectRoot, sessionDir, "shortbbbb", "originB", "agent-b", "fresh-name-two", ""); e["t"] != "error" || e["code"] != "session_bound" {
+		t.Fatalf("force must not bypass session_bound, got %v", e)
+	}
+	c5 := dialTest(t, port) // c4's socket was closed by the mailbox_in_use rejection
+	if w := c5.helloLoginForce(13, project, projectRoot, sessionDir, "shortdddd", "originD", "agent-d", "free-name-three", ""); w["t"] != "welcome" || w["mailbox"] != "free-name-three" {
+		t.Fatalf("force on a free name should be a no-op success, got %v", w)
 	}
 
 	// 8. named mailboxes are exempt from the lifecycle GC: delete the

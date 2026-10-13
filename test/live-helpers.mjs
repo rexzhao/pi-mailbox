@@ -43,12 +43,20 @@ export function setupIsolatedDaemon(label) {
 		try { rmSync(home, { recursive: true, force: true }); } catch { /* best effort */ }
 	});
 	const port = () => JSON.parse(readFileSync(registryPath, "utf8")).port;
-	const apiDelete = (address) =>
-		spawnSync(
-			"curl",
-			["-s", "-X", "POST", `http://127.0.0.1:${port()}/api/delete`, "-H", "Content-Type: application/json", "-d", JSON.stringify({ address })],
-			{ encoding: "utf8" },
-		);
+	const apiDelete = (address) => {
+		try {
+			const p = port();
+			return spawnSync(
+				"curl",
+				["-s", "-X", "POST", `http://127.0.0.1:${p}/api/delete`, "-H", "Content-Type: application/json", "-d", JSON.stringify({ address })],
+				{ encoding: "utf8" },
+			);
+		} catch {
+			// daemon or registry already gone (another exit handler cleaned
+			// up first): nothing to delete through
+			return null;
+		}
+	};
 	return { home, daemonBin, port, tabEnv, apiDelete, registryPath };
 }
 

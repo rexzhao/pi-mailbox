@@ -45,10 +45,25 @@ below.
   taken over or deleted) self-heals against the authoritative `_origin`.
   The extension refuses nameless connections entirely: a session with no
   login gets "no login for this session" from every connect path — named
-  accounts are the only identity. The daemon rejects a concurrent login
-  from a different session with `mailbox_in_use` (same-origin
-  reconnection replaces); a freed name is claimable by anyone, inheriting
-  everything. Note that "same origin" means
+  accounts are the only identity.
+
+  Claim rules (S = the claiming session, X = the claimed name):
+  - X free, or already S's (offline resume / online reconnect): succeeds.
+  - X held ONLINE by another session: `mailbox_in_use` — force can never
+    displace a live holder; ask that session to log out.
+  - X held OFFLINE by another session: `name_held` — previously this
+    takeover happened silently; it now requires an explicit, confirmed
+    force (`/mailbox login <name> --force`, or `mailbox_connect` with
+    `force: true` right after the normal attempt failed with name_held).
+    The agent-side force is gated: it is only honored within 5 minutes
+    after a normal attempt for the same name failed with `name_held`
+    (typing `--force` in the command is itself the user's confirmation).
+  - S already holds another name: `session_bound` — force does not bypass.
+  Note "offline" means the mailbox connection is down: a pi process that
+  is alive but disconnected can be taken over after confirmation. A
+  displaced session's next auto-login fails (name_held/mailbox_in_use),
+  its stale binding is cleared, and it is told to log in again; a forced
+  takeover is logged by the daemon. Note that "same origin" means
   the last holder's pi session id (the `_origin` meta, visible to every
   session via `mailbox_sessions`): within a trusted project this lets a
   member replace even a live holder by replaying the origin — acceptable in

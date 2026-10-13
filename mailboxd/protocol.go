@@ -41,6 +41,10 @@ type HelloMsg struct {
 	// Tags optionally overwrites the named mailbox's tags at login time
 	// (comma-separated). Empty keeps the existing tags.
 	Tags string `json:"tags,omitempty"`
+	// Force allows taking over a name whose holder is OFFLINE and foreign.
+	// Online holders are never displaced; same-origin reconnects and free
+	// names never need it. Strictly per-hello, never persisted.
+	Force bool `json:"force,omitempty"`
 	// Origin is the client's full session id (e.g. the pi session UUID);
 	// persisted as the _origin system meta, used by the lifecycle GC to
 	// match the client's session file. May be empty for non-pi agents.

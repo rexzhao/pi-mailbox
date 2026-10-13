@@ -20,7 +20,7 @@ import { VERSION, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { spawn, spawnSync } from "node:child_process";
 import { hostname, platform } from "node:os";
 import { Type } from "typebox";
-import { isFatalLoginError, MailboxConnection, type RemoteTarget } from "./client.ts";
+import { isFatalLoginError, MailboxConnection, MailboxError, type RemoteTarget } from "./client.ts";
 import { connectLocalDaemonIfRunning, findMailboxdBinary } from "./daemon.ts";
 import { wakeOfflineSession } from "./herdr.ts";
 import type { MailRecord, MailRef, SessionInfo } from "./protocol.ts";
@@ -328,6 +328,27 @@ export default function (pi: ExtensionAPI) {
 		return /^[a-z][a-z0-9_-]{2,31}$/.test(name) && !/^[0-9a-z]{10}$/.test(name) && name !== "user" && !WINDOWS_RESERVED.has(name);
 	}
 
+	// -----------------------------------------------------------------------
+	// force gate: a forced takeover is only allowed right after a normal
+	// attempt for the same name failed with name_held (anti-abuse; the
+	// human-facing /mailbox login --force path bypasses this — typing the
+	// flag IS the confirmation). Any non-forced explicit attempt sets the
+	// gate, including a failed human /mailbox login — a conscious choice:
+	// it still proves "normal was tried first".
+	// -----------------------------------------------------------------------
+
+	let lastHeld: { name: string; at: number } | null = null;
+	const FORCE_GATE_TTL_MS = 5 * 60 * 1000;
+
+	function gateAllowsForce(as: string): boolean {
+		return lastHeld !== null && lastHeld.name === as && Date.now() - lastHeld.at <= FORCE_GATE_TTL_MS;
+	}
+
+	/** Consume the gate permission (single use). */
+	function consumeForceGate(): void {
+		lastHeld = null;
+	}
+
 	async function startConnection(
 		ctx: {
 			sessionManager: {
@@ -340,7 +361,7 @@ export default function (pi: ExtensionAPI) {
 		},
 		remote: RemoteTarget | null,
 		canSpawn = false,
-		login?: { as: string; tags?: string } | null,
+		login?: { as: string; tags?: string; force?: boolean } | null,
 	): Promise<MailboxConnection> {
 		// the previous connection is only torn down after the new one is
 		// live: a rejected login must leave the previous identity connected
@@ -367,9 +388,15 @@ export default function (pi: ExtensionAPI) {
 		// back to it (auto-login on resume/reconnect). A session with no
 		// login at all is rejected: this project's mailboxes are named
 		// accounts, not anonymous derived identities.
-		const effectiveLogin = login !== undefined ? login : readStoredLogin(ctx);
+		const fromBinding = login === undefined;
+		const effectiveLogin: { as: string; tags?: string; force?: boolean } | null =
+			login != null ? { ...login } : readStoredLogin(ctx);
 		if (!effectiveLogin) {
 			throw new Error("mailbox: no login for this session — use /mailbox login <name> first (or mailbox_connect with as='<name>')");
+		}
+		if (effectiveLogin.force && fromBinding) {
+			// a stored binding never carries force; only explicit calls may
+			effectiveLogin.force = false;
 		}
 		const connection = new MailboxConnection(
 			remote ? "remote" : "local",
@@ -393,7 +420,16 @@ export default function (pi: ExtensionAPI) {
 		conn = connection;
 		try {
 			await connection.start();
+			lastHeld = null; // any success clears the force gate
 		} catch (err) {
+			// force-gate bookkeeping for explicit (non-binding) logins
+			if (!fromBinding) {
+				if (err instanceof MailboxError && err.code === "name_held" && !effectiveLogin.force) {
+					lastHeld = { name: effectiveLogin.as, at: Date.now() };
+				} else if (!(err instanceof MailboxError && err.code === "name_held" && effectiveLogin.force)) {
+					lastHeld = null; // any other error code clears it
+				}
+			}
 			if (previous?.connected) {
 				// identity switch failed (rejected login, or a transient error
 				// mid-switch): stay on the previous identity — no half-open
@@ -410,6 +446,23 @@ export default function (pi: ExtensionAPI) {
 				// first connection, transient failure: keep the retry loop armed
 				// (a late-starting daemon is picked up automatically)
 				activateTools(false);
+			}
+			// displaced from our stored binding: the name was taken over
+			// (online or offline). Clear the binding so resumes do not die
+			// on it forever, and say what happened. (Placed after the
+			// identity handling above so it never depends on which branch
+			// ran; fromBinding call sites never have a live previous anyway.)
+			if (
+				fromBinding &&
+				err instanceof MailboxError &&
+				(err.code === "mailbox_in_use" || err.code === "name_held")
+			) {
+				storeLogin(null);
+				throw new MailboxError(
+					err.code,
+					`you were displaced from '${effectiveLogin.as}' by another session (${err.message}); ` +
+						"log in again with /mailbox login <name> (add --force to take it back if the new holder is offline and the user confirms)",
+				);
 			}
 			throw err;
 		}
@@ -590,16 +643,18 @@ export default function (pi: ExtensionAPI) {
 			if (arg === "login" || arg.startsWith("login ")) {
 				const rest = arg.slice(5).trim();
 				if (!rest) {
-					ctx.ui.notify("Usage: /mailbox login <name> [tags=a,b,...]  (log in to a named mailbox)", "warning");
+					ctx.ui.notify("Usage: /mailbox login <name> [tags=a,b,...] [--force]  (log in to a named mailbox)", "warning");
 					return;
 				}
-				const m = /^(\S+)(?:\s+(\S.*))?$/.exec(rest);
+				const forceFlag = /(^|\s)--force(\s|$)/.test(rest);
+				const restClean = rest.replace(/(^|\s)--force(\s|$)/, " ").trim();
+				const m = /^(\S+)(?:\s+(\S.*))?$/.exec(restClean);
 				const name = (m?.[1] ?? "").toLowerCase();
 				let tags: string | undefined;
 				if (m?.[2]) {
 					const tm = /^tags=(.*)$/.exec(m[2].trim());
 					if (!tm) {
-						ctx.ui.notify("Usage: /mailbox login <name> [tags=a,b,...]", "warning");
+						ctx.ui.notify("Usage: /mailbox login <name> [tags=a,b,...] [--force]", "warning");
 						return;
 					}
 					tags = tm[1];
@@ -613,10 +668,12 @@ export default function (pi: ExtensionAPI) {
 				}
 				try {
 					// reconnect under the new identity (same-origin relogin
-					// replaces; a held name rejects with mailbox_in_use and we
-					// stay on the previous identity)
+					// replaces; a held name rejects with name_held /
+					// mailbox_in_use and we stay on the previous identity).
+					// --force is the human's confirmation for an offline
+					// takeover, so this path bypasses the agent-side gate.
 					const prev = conn?.connected ? conn.address : null;
-					const connection = await startConnection(ctx, null, true, { as: name, tags });
+					const connection = await startConnection(ctx, null, true, { as: name, tags, force: forceFlag });
 					storeLogin(name);
 					const meta = connection.mailbox.sessionMeta ?? {};
 					const inherited = tags ? "" : ` (tags inherited: ${meta.tags ?? "(none)"})`;
@@ -762,7 +819,7 @@ export default function (pi: ExtensionAPI) {
 				const m = /^([A-Za-z0-9.-]+):(\d+)(?:\s+(\S+))?$/.exec(arg);
 				if (!m) {
 					ctx.ui.notify(
-						"Usage: /mailbox [login <name> [tags=a,b] | logout | open <name> | start service | stop service | restart service | view | status | list [client [all]|mail] | meta | name <n> | tag <a,b> | set k=v | unset k | read <mail-ref> | more <cursor> | host:port [token]]",
+						"Usage: /mailbox [login <name> [tags=a,b] [--force] | logout | open <name> | start service | stop service | restart service | view | status | list [client [all]|mail] | meta | name <n> | tag <a,b> | set k=v | unset k | read <mail-ref> | more <cursor> | host:port [token]]",
 						"warning",
 					);
 					return;
@@ -878,6 +935,12 @@ ${formatMailList(mails)}${more}`,
 			tags: Type.Optional(
 				Type.String({ description: "Login-time tags overwrite as a comma-separated list; omit to inherit the mailbox's existing tags" }),
 			),
+			force: Type.Optional(
+				Type.Boolean({
+					description:
+						"Take over the name from an OFFLINE holder. Only valid right after a normal attempt for the same name failed with name_held AND the user confirmed the takeover; never displaces an online holder",
+				}),
+			),
 		}),
 		// default exposure (direct, active): the model must see this tool so it
 		// can enable the mailbox on its own; it is not part of TOOL_NAMES, so
@@ -888,7 +951,21 @@ ${formatMailList(mails)}${more}`,
 					"mailbox: invalid name (3-32 chars, lowercase [a-z0-9_-], not a derived-id shape, 'user' reserved)",
 				);
 			}
-			const login = params.as !== undefined ? { as: params.as.toLowerCase(), tags: params.tags } : undefined;
+			const login =
+				params.as !== undefined
+					? { as: params.as.toLowerCase(), tags: params.tags, force: params.force === true }
+					: undefined;
+			if (login?.force) {
+				// anti-abuse gate: force is only allowed right after a normal
+				// attempt for the same name failed with name_held
+				if (!gateAllowsForce(login.as)) {
+					lastHeld = null;
+					throw new Error(
+						"mailbox: force_not_allowed: attempted force before a normal login — call mailbox_connect without force first, and only use force after the user confirms the name is taken",
+					);
+				}
+				consumeForceGate();
+			}
 			if (conn?.connected && login === undefined) {
 				const summary = await statusSummary(conn);
 				return {
