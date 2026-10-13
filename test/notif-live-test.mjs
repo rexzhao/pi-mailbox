@@ -11,7 +11,9 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { MailboxConnection } from "../src/client.ts";
-import { setupIsolatedDaemon, herdr, newProjectTab, sessionsDirFor , sweepTestMailboxes } from "./live-helpers.mjs";
+import { setupIsolatedDaemon, herdr, newProjectTab, sessionsDirFor ,
+	sweepTestMailboxes,
+} from "./live-helpers.mjs";
 
 const projectDir = process.cwd();
 const origin = `notif-test-${Date.now().toString(36)}`;
@@ -38,6 +40,14 @@ function mailboxEntries(file) {
 console.log(`test session origin: ${origin}, named mailbox: ${NAME}`);
 
 // 1. fresh tab + start pi (new extension code) with a long-ish task
+// sweep BEFORE this run's agent exists, so it can never consider it
+const preSender = new MailboxConnection("local", projectDir, null, `notif-sweep-${Date.now().toString(36)}`, "pi", {
+	onNotify: () => {}, onConnected: () => {}, onDisconnected: () => {},
+}, { canSpawn: true });
+await preSender.start();
+await sweepTestMailboxes(preSender, apiDelete, preSender.mailbox.project);
+await preSender.stop();
+
 const paneId = await newProjectTab(projectDir, "notif-test");
 process.on("exit", () => {
 	try { spawnSync("herdr", ["pane", "close", paneId], { stdio: "ignore" }); } catch { /* best effort */ }
@@ -57,7 +67,6 @@ const sender = new MailboxConnection("local", projectDir, null, `notif-sender-${
 	onNotify: () => {}, onConnected: () => {}, onDisconnected: () => {},
 }, { canSpawn: true });
 await sender.start();
-await sweepTestMailboxes(sender, apiDelete, sender.mailbox.project);
 let online = false;
 for (let i = 0; i < 200; i++) {
 	const sessions = await sender.mailbox.sessions();

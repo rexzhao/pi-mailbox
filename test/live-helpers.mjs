@@ -54,12 +54,27 @@ export function setupIsolatedDaemon(label) {
 
 /** Delete leftover test mailboxes from earlier runs (idempotent, survives
  *  hard kills of previous runs — exit handlers do not fire on SIGKILL).
- *  Only offline named mailboxes with the test prefixes are removed. */
-export async function sweepTestMailboxes(connection, apiDelete, project, prefixes = ["nr-", "nt-", "held-", "pr-"]) {
+ *
+ * The predicate matches the mailbox's _origin (the creating client's
+ * session id): every mailbox a live test creates carries one of the
+ * TEST_ORIGIN_PREFIXES, while a real account's origin is a genuine pi
+ * session id — so real mailboxes can never match, even when their names
+ * merely start with a test-ish prefix (e.g. a legit "pr-lead"). The name
+ * shape check (prefix + base36 timestamp) is a secondary guard. */
+const TEST_ORIGIN_PREFIXES = ["login-test-", "notif-test-", "held-holder-", "name-taker-"];
+const TEST_NAME_SHAPE = /^(nr|nt|held|pr)-[0-9a-z]{6,}$/;
+
+export async function sweepTestMailboxes(connection, apiDelete, project) {
 	try {
 		const sessions = await connection.mailbox.sessions(true);
 		for (const s of sessions) {
-			if (!s.online && (s.meta ?? {})._named === "1" && prefixes.some((p) => s.session.startsWith(p))) {
+			const origin = (s.meta ?? {})._origin ?? "";
+			if (
+				!s.online &&
+				(s.meta ?? {})._named === "1" &&
+				TEST_ORIGIN_PREFIXES.some((p) => origin.startsWith(p)) &&
+				TEST_NAME_SHAPE.test(s.session)
+			) {
 				apiDelete(`${s.session}@${project}`);
 			}
 		}

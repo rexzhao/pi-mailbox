@@ -18,7 +18,9 @@ import { spawnSync } from "node:child_process";
 import { MailboxConnection } from "../src/client.ts";
 import { deriveSessionId } from "../src/daemon.ts";
 import { wakeOfflineSession } from "../src/herdr.ts";
-import { setupIsolatedDaemon, herdr, newProjectTab, sessionsDirFor , sweepTestMailboxes } from "./live-helpers.mjs";
+import { setupIsolatedDaemon, herdr, newProjectTab, sessionsDirFor ,
+	sweepTestMailboxes,
+} from "./live-helpers.mjs";
 
 const projectDir = process.cwd();
 const origin = `login-test-${Date.now().toString(36)}`;
