@@ -100,7 +100,7 @@ function formatSessions(sessions: SessionInfo[], self?: { project: string; sessi
 			const name = s.name ? `  name=${s.name}` : "";
 			const tags = s.tags && s.tags.length > 0 ? `  tags=${s.tags.join(",")}` : "";
 			const extra = Object.entries(s.meta ?? {})
-				.filter(([k]) => k !== "name" && k !== "tags" && k !== "_agent" && k !== "_origin")
+				.filter(([k]) => k !== "name" && k !== "tags" && k !== "_agent" && k !== "_origin" && k !== "_holds" && k !== "_named")
 				.map(([k, v]) => `  ${k}=${v}`)
 				.join("");
 			return `[${mark}] ${address}${you}${agent}${name}${tags}${extra}`;
