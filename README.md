@@ -39,9 +39,16 @@ below.
   and meta wholesale. Named mailboxes are persistent accounts — they are
   exempt from the lifecycle GC and only removed explicitly. Login names are
   3-32 chars `[a-z][a-z0-9_-]` (never a derived-id shape, `user` reserved).
-  The daemon rejects a concurrent login from a different session with
-  `mailbox_in_use` (same-origin reconnection replaces); a freed name is
-  claimable by anyone, inheriting everything. Note that "same origin" means
+  A session may hold at most one name: the daemon tracks the reverse
+  binding (`_holds` on the session's own record, O(1) at login) and rejects
+  a second name with `session_bound`; a stale reverse binding (the name was
+  taken over or deleted) self-heals against the authoritative `_origin`.
+  The extension refuses nameless connections entirely: a session with no
+  login gets "no login for this session" from every connect path — named
+  accounts are the only identity. The daemon rejects a concurrent login
+  from a different session with `mailbox_in_use` (same-origin
+  reconnection replaces); a freed name is claimable by anyone, inheriting
+  everything. Note that "same origin" means
   the last holder's pi session id (the `_origin` meta, visible to every
   session via `mailbox_sessions`): within a trusted project this lets a
   member replace even a live holder by replaying the origin — acceptable in
@@ -97,10 +104,17 @@ below.
   derives both its session directory and its mailbox identity from cwd.
   Cross-project, remote-mailbox, and off-host targets are skipped (the
   target must carry a local `_host` and an `_origin` in its meta). The wake
-  is name-aware: a named target's prompt carries the name so the woken agent
-  claims it (fresh sessions have no binding), and when the last holder is
-  online under a different identity a fresh session is spawned instead of
-  hijacking it.
+  is resume-only and name-aware: a named target's prompt carries the name
+  so the woken agent claims it, and when the last holder's pi session file
+  no longer exists the wake fails cleanly (never a fresh identity-less
+  spawn) — the name can then be claimed manually. Legacy derived mailboxes
+  are not woken (the extension cannot connect nameless).
+
+  Upgrade note: with named-only logins, a session whose mailbox is a
+  derived id can no longer connect, read, or reply at all — its existing
+  mail is readable only in the web UI. Log such sessions in with
+  `/mailbox login <name>` (a fresh, empty named mailbox; nothing is
+  inherited from the derived one).
 
 ## Commands
 
@@ -124,6 +138,9 @@ below.
   identity; tags overwrite when given, inherited when omitted)
 - `/mailbox logout` — log out: disconnect and clear the login binding
   (`off` is an alias)
+- `/mailbox open <name>` — resume the named mailbox's last-holder session
+  in a herdr tab (fails when the session file is gone; the name can then be
+  claimed manually)
 - `/mailbox start service` — connect (spawns the daemon if needed)
 - `/mailbox stop service` — disconnect (the daemon itself keeps running
   until its idle timeout, or `mailboxd --stop`)
@@ -173,10 +190,12 @@ clean them up afterwards — see `src/herdr.ts` and the notification section
 in `src/index.ts`):
 
 ```
-node --experimental-strip-types --no-warnings test/wake-demo.mjs
 node --experimental-strip-types --no-warnings test/notif-live-test.mjs
 node --experimental-strip-types --no-warnings test/login-live-test.mjs
 ```
+
+Both build an isolated mailboxd from the current sources (own registry, go
+required) and never touch the running daemon.
 
 ## mailboxd
 
@@ -208,7 +227,10 @@ resolving and surface as orphan roots).
 **Remote mode** (`--listen` on a non-loopback address): serves external
   machines, requires `--token`/`--token-file`, stores all projects under
   `--data-dir` (client paths are never trusted), and stays up (idle exit is
-  disabled unless `--idle-exit` is set explicitly).
+  disabled unless `--idle-exit` is set explicitly). `/mailbox login` dials
+  the local daemon; to log in on a remote daemon, first connect with
+  `/mailbox host:port token` using a session that already carries a stored
+  login binding (tags are set afterwards via `/mailbox tag`).
 
 Note on identity changes: ids are derivations, so any change to the
   derivation inputs (agent kind, session id, host id, project path) maps a

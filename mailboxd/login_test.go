@@ -131,6 +131,58 @@ func TestNamedMailboxLogin(t *testing.T) {
 		t.Fatalf("B should inherit the mail, got %v", in)
 	}
 
+	// 7b. one name per session (session_bound):
+	// B (originB, now holding "reviewer") tries a second name -> rejected
+	if e := b2.request(map[string]interface{}{
+		"t": "hello", "rid": 5, "project": project, "projectRoot": projectRoot,
+		"sessionDir": sessionDir, "session": "shortbbbb", "origin": "originB",
+		"agent": "agent-b", "as": "reviewer-two",
+	}); e["t"] != "error" || e["code"] != "session_bound" {
+		t.Fatalf("expected session_bound, got %v", e)
+	}
+	// same-name re-login is fine (checked above as step 4/5)
+	// the reverse marker survives a plain re-hello of the derived record
+	if w := b2.request(map[string]interface{}{
+		"t": "hello", "rid": 6, "project": project, "projectRoot": projectRoot,
+		"sessionDir": sessionDir, "session": "shortbbbb", "origin": "originB",
+		"agent": "agent-b",
+	}); w["t"] != "welcome" {
+		t.Fatalf("plain re-hello after login: %v", w)
+	}
+	if e := b2.request(map[string]interface{}{
+		"t": "hello", "rid": 7, "project": project, "projectRoot": projectRoot,
+		"sessionDir": sessionDir, "session": "shortbbbb", "origin": "originB",
+		"agent": "agent-b", "as": "reviewer-three",
+	}); e["t"] != "error" || e["code"] != "session_bound" {
+		t.Fatalf("session_bound must survive a plain re-hello, got %v", e)
+	}
+	// _holds is not forgeable via hello meta
+	if w := s.request(map[string]interface{}{
+		"t": "hello", "rid": 8, "project": project, "projectRoot": projectRoot,
+		"sessionDir": sessionDir, "session": "shortcccc", "origin": "originC",
+		"agent": "agent-c", "meta": map[string]string{"_holds": "reviewer"},
+	}); w["t"] != "welcome" {
+		t.Fatalf("forge attempt hello: %v", w)
+	}
+	if e := s.request(map[string]interface{}{
+		"t": "hello", "rid": 9, "project": project, "projectRoot": projectRoot,
+		"sessionDir": sessionDir, "session": "shortcccc", "origin": "originC",
+		"agent": "agent-c", "as": "someother",
+	}); e["t"] != "welcome" {
+		t.Fatalf("forged _holds must be ignored (claim should succeed), got %v", e)
+	}
+
+	// 7c. self-heal: the ORIGINAL holder (originA) lost "reviewer" to B
+	// (takeover in step 7); its stale _holds must not block a new name
+	a3 := dialTest(t, port)
+	if w := a3.request(map[string]interface{}{
+		"t": "hello", "rid": 10, "project": project, "projectRoot": projectRoot,
+		"sessionDir": sessionDir, "session": "shortaaaa", "origin": "originA",
+		"agent": "agent-a", "as": "fresh-name",
+	}); w["t"] != "welcome" || w["mailbox"] != "fresh-name" {
+		t.Fatalf("stale _holds should self-heal and allow a new name, got %v", w)
+	}
+
 	// 8. named mailboxes are exempt from the lifecycle GC: delete the
 	//    holder's pi session file, disconnect, run cleanup — the mailbox
 	//    must survive

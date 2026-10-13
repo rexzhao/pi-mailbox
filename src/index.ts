@@ -364,9 +364,13 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (ctx.model) helloMeta._model = `${ctx.model.provider}/${ctx.model.id}`;
 		// explicit login beats the stored binding; no explicit login falls
-		// back to it (auto-login on resume/reconnect)
-		const fromBinding = login === undefined;
+		// back to it (auto-login on resume/reconnect). A session with no
+		// login at all is rejected: this project's mailboxes are named
+		// accounts, not anonymous derived identities.
 		const effectiveLogin = login !== undefined ? login : readStoredLogin(ctx);
+		if (!effectiveLogin) {
+			throw new Error("mailbox: no login for this session — use /mailbox login <name> first (or mailbox_connect with as='<name>')");
+		}
 		const connection = new MailboxConnection(
 			remote ? "remote" : "local",
 			ctx.sessionManager.getCwd(),
@@ -390,24 +394,6 @@ export default function (pi: ExtensionAPI) {
 		try {
 			await connection.start();
 		} catch (err) {
-			if (
-				fromBinding &&
-				effectiveLogin !== null &&
-				isFatalLoginError(err) &&
-				!previous?.connected
-			) {
-				// a stored binding whose name is now held must not brick
-				// the mailbox: connect as the derived identity instead and
-				// say so (the wake prompt's fallback depends on this).
-				// `previous` may be a dead socket with an armed reconnect
-				// loop — stop it or it ping-pongs registrations with the
-				// fallback connection forever.
-				await previous?.stop();
-				await connection.stop();
-				const fallback = await startConnection(ctx, remote, canSpawn, null);
-				fallback.loginFallback = effectiveLogin.as;
-				return fallback;
-			}
 			if (previous?.connected) {
 				// identity switch failed (rejected login, or a transient error
 				// mid-switch): stay on the previous identity — no half-open
@@ -454,22 +440,19 @@ export default function (pi: ExtensionAPI) {
 			if (meta._host !== hostname()) return "";
 			const origin = meta._origin;
 			if (!origin) return ""; // e.g. the web UI 'user' mailbox: nothing to resume
-			// named mailbox (not a derived-id shape): the wake prompt must
-			// carry the name so the woken agent can claim it, and the last
-			// holder must never be hijacked: if it is online under a
-			// different identity, spawn a fresh session instead of resuming
-			const named = !/^[0-9a-z]{10}$/.test(target.session);
-			const spawnFresh =
-				named &&
-				sessions.some((x) => x.online && x.session !== target.session && (x.meta ?? {})._origin === origin);
+			// legacy derived mailboxes are no longer woken: the current
+			// extension cannot connect nameless, so a woken legacy session
+			// could never see this mail
+			if (/^[0-9a-z]{10}$/.test(target.session)) {
+				return " (target offline — wake skipped: legacy derived mailbox, named login required)";
+			}
 			const result = await wakeOfflineSession({
 				session: target.session,
 				origin,
 				projectRoot: c.projectDir,
 				label: info.name,
-				named,
-				spawnFresh,
-				sender: c.address ?? undefined,
+				named: true,
+				sessionDir: c.sessionDirProvider?.(),
 			});
 			if (result.ok) return ` (target offline — woke via herdr: ${result.detail})`;
 			if (result.silent) return ""; // no herdr environment: behave as if wake were off
@@ -482,9 +465,6 @@ export default function (pi: ExtensionAPI) {
 	async function statusSummary(c: MailboxConnection): Promise<string> {
 		const { total, totalUnread } = await c.mailbox.inbox();
 		const identity = `as ${c.address}`;
-		const fallbackNote = c.loginFallback
-			? ` (login as '${c.loginFallback}' failed — held; /mailbox logout clears the stale binding)`
-			: "";
 		let onlinePart = "";
 		try {
 			const online = (await c.mailbox.sessions()).filter((s) => s.online).length;
@@ -492,7 +472,7 @@ export default function (pi: ExtensionAPI) {
 		} catch {
 			// best-effort; keep the mail counts when the sessions query fails
 		}
-		return `${identity}: ${total} mails (${totalUnread} unread)${onlinePart}${fallbackNote}`;
+		return `${identity}: ${total} mails (${totalUnread} unread)${onlinePart}`;
 	}
 
 	// -----------------------------------------------------------------------
@@ -553,6 +533,54 @@ export default function (pi: ExtensionAPI) {
 						"info",
 					);
 					openBrowser(fullUrl);
+				} catch (err) {
+					ctx.ui.notify(`mailbox: ${err instanceof Error ? err.message : String(err)}`, "error");
+				}
+				return;
+			}
+
+			if (arg === "open" || arg.startsWith("open ")) {
+				const name = arg.slice(4).trim().toLowerCase();
+				if (!name) {
+					ctx.ui.notify("Usage: /mailbox open <name>  (resume the named mailbox's session in herdr)", "warning");
+					return;
+				}
+				try {
+					const c = requireConnection();
+					const sessions = await c.mailbox.sessions(true);
+					const info = sessions.find((s) => s.session === name);
+					if (!info) {
+						ctx.ui.notify(`mailbox: no such named mailbox '${name}' in this project`, "error");
+						return;
+					}
+					if ((info.meta ?? {})._named !== "1") {
+						ctx.ui.notify(`mailbox: '${name}' is not a named mailbox`, "error");
+						return;
+					}
+					if (info.online) {
+						ctx.ui.notify(`mailbox: '${name}' is already online (${name}@${info.project})`, "info");
+						return;
+					}
+					const origin = (info.meta ?? {})._origin;
+					if (!origin) {
+						ctx.ui.notify(`mailbox: '${name}' has no recorded session to resume`, "error");
+						return;
+					}
+					const result = await wakeOfflineSession({
+						session: name,
+						origin,
+						projectRoot: c.projectDir,
+						label: info.name,
+						named: true,
+						sessionDir: c.sessionDirProvider?.(),
+						prompt: null, // the human asked for it: no mail prompt
+					});
+					ctx.ui.notify(
+						result.ok
+							? `mailbox: opened '${name}' — ${result.detail}`
+							: `mailbox: open failed: ${result.reason}`,
+						result.ok ? "info" : "error",
+					);
 				} catch (err) {
 					ctx.ui.notify(`mailbox: ${err instanceof Error ? err.message : String(err)}`, "error");
 				}
@@ -734,7 +762,7 @@ export default function (pi: ExtensionAPI) {
 				const m = /^([A-Za-z0-9.-]+):(\d+)(?:\s+(\S+))?$/.exec(arg);
 				if (!m) {
 					ctx.ui.notify(
-						"Usage: /mailbox [start service | stop service | restart service | view | logout | status | login <name> [tags=a,b] | list [client [all]|mail] | meta | name <n> | tag <a,b> | set k=v | unset k | read <mail-ref> | more <cursor> | host:port [token]]",
+						"Usage: /mailbox [login <name> [tags=a,b] | logout | open <name> | start service | stop service | restart service | view | status | list [client [all]|mail] | meta | name <n> | tag <a,b> | set k=v | unset k | read <mail-ref> | more <cursor> | host:port [token]]",
 						"warning",
 					);
 					return;
@@ -835,9 +863,10 @@ ${formatMailList(mails)}${more}`,
 			"when you need to communicate with other Pi agent sessions in this project: send or " +
 			"reply to mail, check your inbox, or discover peer sessions. After connecting, incoming " +
 			"mail is announced as notifications and the other mailbox tools become available. " +
-			"Optional 'as' logs in to a named mailbox (a persistent, human-named identity that " +
-			"survives sessions; use it when instructed to claim a role mailbox, e.g. as='reviewer') " +
-			"with optional 'tags' overwrite; a held name rejects with mailbox_in_use. " +
+			"'as' logs in to a named mailbox (a persistent, human-named identity that survives " +
+			"sessions, e.g. as='reviewer') with optional 'tags' overwrite; it is REQUIRED unless " +
+			"this session already logged in before (a stored binding auto-applies). A held name " +
+			"rejects with mailbox_in_use; a session may hold only one name (session_bound). " +
 			"Returns a status summary (mail counts, online clients, this session's address).",
 		parameters: Type.Object({
 			as: Type.Optional(
@@ -884,7 +913,7 @@ ${formatMailList(mails)}${more}`,
 						text: `mailbox connected: ${summary}. Your address: ${connection.address}. ${ADDRESS_FORMAT_DOC}`,
 					},
 				],
-				details: { alreadyConnected: false, loginFallback: connection.loginFallback },
+				details: { alreadyConnected: false },
 			};
 		},
 	});

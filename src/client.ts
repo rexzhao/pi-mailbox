@@ -334,9 +334,6 @@ export class MailboxConnection {
 	get loginRejected(): boolean {
 		return this.loginRejectedFlag;
 	}
-	/** Set by the extension when a stored binding was held and the connection
-	 *  fell back to the derived identity; surfaced in tool/command output. */
-	loginFallback: string | null = null;
 	private loginRejectedFlag = false;
 	/** Bumped on every drop so stale reconnect loops stop. */
 	private generation = 0;

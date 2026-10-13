@@ -375,9 +375,10 @@ func (s *Store) HelloMerge(sessionID, agent, origin string, meta map[string]stri
 		metaSource["_origin"] = origin
 	}
 	for k, v := range meta {
-		// _named is server-owned: only the claim path may set it, so a
-		// client cannot self-exempt its mailbox from the lifecycle GC
-		if k == "_named" {
+		// _named and _holds are server-owned: only the claim path may set
+		// them, so a client cannot self-exempt its mailbox from the
+		// lifecycle GC or forge a name binding
+		if k == "_named" || k == "_holds" {
 			continue
 		}
 		metaSource[k] = v
@@ -443,7 +444,11 @@ func (s *Store) HelloMerge(sessionID, agent, origin string, meta map[string]stri
 			}
 		}
 	}
-	// authoritative unset: stored system keys not kept by this hello
+	// authoritative unset: stored system keys not kept by this hello.
+	// _holds is exempt: it is the session's name binding, managed only by
+	// the claim path (BindName/UnbindName) — a plain re-hello must not
+	// wash it away.
+	sysKept["_holds"] = true
 	var unset []string
 	for k := range st.Meta {
 		if strings.HasPrefix(k, "_") && !sysKept[k] {
@@ -567,6 +572,62 @@ func (s *Store) MetaSnapshot(sessionID string) (map[string]string, error) {
 		return nil, err
 	}
 	return copyMeta(st.Meta), nil
+}
+
+// HoldsOf returns the name this session's derived mailbox is bound to
+// (the _holds marker); empty when it holds none.
+func (s *Store) HoldsOf(sessionID string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st, err := s.state(sessionID)
+	if err != nil {
+		return ""
+	}
+	return st.Meta["_holds"]
+}
+
+// BindName records the reverse login marker on the session's own derived
+// mailbox: _holds (the claimed name) plus _origin (so the lifecycle GC keeps
+// the record alive while the pi session lives). name == "" unbinds.
+func (s *Store) BindName(sessionID, origin, name string) error {
+	path, err := s.sessionFile(sessionID)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st, err := s.state(sessionID)
+	if err != nil {
+		return err
+	}
+	set := map[string]string{}
+	unset := []string{}
+	if name != "" {
+		if st.Meta["_holds"] != name {
+			set["_holds"] = name
+		}
+		if origin != "" && st.Meta["_origin"] != origin {
+			set["_origin"] = origin
+		}
+	} else if st.Meta["_holds"] != "" {
+		unset = append(unset, "_holds")
+	}
+	if len(set) == 0 && len(unset) == 0 {
+		return nil
+	}
+	ev := map[string]interface{}{"t": "meta"}
+	if len(set) > 0 {
+		ev["set"] = set
+	}
+	if len(unset) > 0 {
+		ev["unset"] = unset
+	}
+	data, _ := json.Marshal(ev)
+	if err := appendLine(path, string(data)); err != nil {
+		return err
+	}
+	applyMeta(st, set, unset)
+	return nil
 }
 
 // OriginOf returns the stored _origin meta (the last holder's full session

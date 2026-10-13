@@ -207,6 +207,21 @@ func (c *conn) handleHello(rid int, data []byte) error {
 			c.send(ErrorReply{T: "error", Rid: &ridCopy, Code: "bad_project", Message: err.Error()})
 			return nil
 		}
+		// one name per session: the reverse marker (_holds on the
+		// session's own derived record) makes this O(1). A stale marker
+		// (the name was taken over or deleted meanwhile) self-heals
+		// against the authoritative _origin.
+		if holds := proj.Store.HoldsOf(msg.Session); holds != "" && holds != msg.As {
+			if proj.Store.HasMailbox(holds) && proj.Store.OriginOf(holds) == msg.Origin {
+				ridCopy := rid
+				c.send(ErrorReply{T: "error", Rid: &ridCopy, Code: "session_bound",
+					Message: fmt.Sprintf("session already holds mailbox '%s'; a session may not log in with a second name", holds)})
+				return nil
+			}
+			if err := proj.Store.BindName(msg.Session, msg.Origin, ""); err != nil {
+				log.Printf("heal _holds for %s: %v", msg.Session, err)
+			}
+		}
 		if online := proj.LookupOnline(msg.As); online != nil && online != c {
 			storedOrigin := proj.Store.OriginOf(msg.As)
 			if msg.Origin == "" || storedOrigin == "" || msg.Origin != storedOrigin {
@@ -258,6 +273,16 @@ func (c *conn) handleHello(rid int, data []byte) error {
 	welcomeMeta, err := proj.Store.HelloMerge(mailboxID, msg.Agent, msg.Origin, msg.Meta, claim)
 	if err != nil {
 		return err
+	}
+	// named login: maintain the reverse marker on the session's own
+	// derived record (session -> name), the counterpart of _origin
+	if claim != nil {
+		if err := proj.Store.EnsureSession(msg.Session); err != nil {
+			log.Printf("ensure derived session %s: %v", msg.Session, err)
+		}
+		if err := proj.Store.BindName(msg.Session, msg.Origin, claim.Name); err != nil {
+			return err
+		}
 	}
 
 	welcome := WelcomeMsg{

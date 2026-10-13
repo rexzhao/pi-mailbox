@@ -28,6 +28,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { readdirSync } from "node:fs";
 import { basename, resolve } from "node:path";
 
 interface HerdrResponse {
@@ -148,10 +149,10 @@ export interface WakeTarget {
 	label?: string;
 	/** True when `session` is a named mailbox: the prompt carries the name so the woken agent claims it. */
 	named?: boolean;
-	/** Sender's mailbox address (this connection), for the claim-failure fallback instruction. */
-	sender?: string;
-	/** Spawn a fresh session (no resume, no live-agent prompt): used when the last holder is online under a different identity and must not be hijacked. */
-	spawnFresh?: boolean;
+	/** pi session directory (the project's), to verify the last holder's session file exists before resuming. */
+	sessionDir?: string;
+	/** Prompt override for the woken agent: undefined = the built-in mail prompt, null = no prompt (e.g. /mailbox open), string = custom. */
+	prompt?: string | null;
 }
 
 /**
@@ -175,10 +176,28 @@ function wakePrompt(target: WakeTarget): string {
 		`You have new mail in the named mailbox '${target.session}' of this project. ` +
 		`Log in to it with the mailbox_connect tool (as='${target.session}'); ` +
 		"if your mailbox address is not that name you must claim it first. " +
-		"If the login fails because the mailbox is held by another session, connect with plain " +
-		`mailbox_connect (no name) and send a short note to ${target.sender ?? "(the sender)"} saying the mailbox ` +
-		"is held, then stop. Then read the new mail with mailbox_list and handle what it asks."
+		"If the login fails because the mailbox is held by another session, stop and state that in your final response. " +
+		"Then read the new mail with mailbox_list and handle what it asks."
 	);
+}
+
+/** The effective prompt: override, the built-in, or none. */
+function effectivePrompt(target: WakeTarget): string | null {
+	if (target.prompt === null) return null;
+	if (target.prompt !== undefined) return target.prompt;
+	return wakePrompt(target);
+}
+
+/** Does the pi session directory still hold the last holder's session file? */
+function sessionFileExists(sessionDir: string, origin: string): boolean {
+	try {
+		for (const f of readdirSync(sessionDir)) {
+			if (f.endsWith(`_${origin}.jsonl`)) return true;
+		}
+	} catch {
+		// directory missing entirely: no sessions ever ran here
+	}
+	return false;
 }
 
 /** Wall-clock budget for one wake so the sending tool stays responsive. */
@@ -209,17 +228,25 @@ export async function wakeOfflineSession(target: WakeTarget): Promise<WakeResult
 	// room for the remaining steps (pane list + workspace/tab create + a
 	// minimal agent start + prompt); bail instead of spawning past the budget
 	if (deadline - Date.now() < 8_000) return { ok: false, reason: "wake budget exhausted before locating a pane" };
+
+	// resume-only wake: the last holder's pi session must still exist.
+	// (pi --session-id would silently create a fresh empty session for a
+	// dead id — an identity-less shell that never sees the mail.) Checked
+	// before any tab is created so a failure leaks nothing.
+	if (target.sessionDir !== undefined && !sessionFileExists(target.sessionDir, target.origin)) {
+		return {
+			ok: false,
+			reason: "the last holder's session file is gone; the mailbox can only be claimed manually (/mailbox login)",
+		};
+	}
 	try {
-		// spawnFresh: the last holder is online under a different identity —
-		// prompting it would hijack it, so never match live agents
-		if (!target.spawnFresh) {
-			for (const a of agents) {
-				if (!isRecord(a)) continue;
-				const sess = isRecord(a.agent_session) && typeof a.agent_session.value === "string" ? a.agent_session.value : null;
-				if (sess && referencesOrigin(sess, target.origin) && typeof a.pane_id === "string") {
-					await runHerdr(["agent", "prompt", a.pane_id, wakePrompt(target)], cap(6_000));
-					return { ok: true, detail: `already running in pane ${a.pane_id}; prompt sent`, paneId: a.pane_id };
-				}
+		for (const a of agents) {
+			if (!isRecord(a)) continue;
+			const sess = isRecord(a.agent_session) && typeof a.agent_session.value === "string" ? a.agent_session.value : null;
+			if (sess && referencesOrigin(sess, target.origin) && typeof a.pane_id === "string") {
+				const p = effectivePrompt(target);
+				if (p !== null) await runHerdr(["agent", "prompt", a.pane_id, p], cap(6_000));
+				return { ok: true, detail: `already running in pane ${a.pane_id}${p === null ? "" : "; prompt sent"}`, paneId: a.pane_id };
 			}
 		}
 
@@ -236,9 +263,17 @@ export async function wakeOfflineSession(target: WakeTarget): Promise<WakeResult
 				break;
 			}
 		}
+		const testEnv: string[] = [];
+		// test-only escape hatch: env vars for the wake's tab, so live
+		// tests can point the woken pi at an isolated daemon (never set in
+		// production); format: KEY=VALUE;KEY=VALUE
+		const envSpec = process.env.PI_MAILBOX_TEST_TAB_ENV;
+		if (envSpec && envSpec.length > 0) {
+			for (const kv of envSpec.split(";").filter(Boolean)) testEnv.push("--env", kv);
+		}
 		if (workspaceId !== null) {
 			const tab = await runHerdr(
-				["tab", "create", "--workspace", workspaceId, "--cwd", target.projectRoot, "--label", tabLabel],
+				["tab", "create", "--workspace", workspaceId, "--cwd", target.projectRoot, "--label", tabLabel, ...testEnv],
 				cap(6_000),
 			);
 			paneId =
@@ -247,7 +282,7 @@ export async function wakeOfflineSession(target: WakeTarget): Promise<WakeResult
 					: null;
 		} else {
 			const ws = await runHerdr(
-				["workspace", "create", "--cwd", target.projectRoot, "--label", basename(target.projectRoot), "--no-focus"],
+				["workspace", "create", "--cwd", target.projectRoot, "--label", basename(target.projectRoot), "--no-focus", ...testEnv],
 				cap(9_000),
 			);
 			paneId =
@@ -275,8 +310,7 @@ export async function wakeOfflineSession(target: WakeTarget): Promise<WakeResult
 				// (test-only escape hatch pointing the woken pi at a working-tree
 				// extension, never set in production) must land after it too, or
 				// herdr parses them as its own options
-				const piArgs: string[] = [];
-				if (!target.spawnFresh) piArgs.push("--session-id", target.origin);
+				const piArgs: string[] = ["--session-id", target.origin];
 				const extra = process.env.PI_MAILBOX_TEST_PI_ARGS;
 				if (extra && extra.length > 0) piArgs.push(...extra.split(/\s+/).filter(Boolean));
 				if (piArgs.length > 0) args.push("--", ...piArgs);
@@ -291,15 +325,23 @@ export async function wakeOfflineSession(target: WakeTarget): Promise<WakeResult
 		if (!started) {
 			// readiness detection can lag the launch; the prompt still lands
 			// if the agent came up despite the detection failure
-			try {
-				await runHerdr(["agent", "prompt", paneId, wakePrompt(target)], cap(6_000));
-				return { ok: true, detail: `pi resumed in pane ${paneId} (detection lagged); prompt sent`, paneId };
-			} catch {
-				return { ok: false, reason: startErr instanceof Error ? startErr.message : String(startErr) };
+			const p = effectivePrompt(target);
+			if (p !== null) {
+				try {
+					await runHerdr(["agent", "prompt", paneId, p], cap(6_000));
+					return { ok: true, detail: `pi agent resumed in pane ${paneId} (detection lagged); prompt sent`, paneId };
+				} catch {
+					// detection lagged AND the prompt failed: treat as failed
+				}
 			}
+			return { ok: false, reason: startErr instanceof Error ? startErr.message : String(startErr) };
+		}
+		const p = effectivePrompt(target);
+		if (p === null) {
+			return { ok: true, detail: `pi agent resumed as '${usedName}' in pane ${paneId}`, paneId };
 		}
 		try {
-			await runHerdr(["agent", "prompt", paneId, wakePrompt(target)], cap(6_000));
+			await runHerdr(["agent", "prompt", paneId, p], cap(6_000));
 		} catch (err) {
 			// the session is up; without the prompt it just sits idle — a
 			// later send re-prompts it via the live-agent branch
@@ -311,8 +353,7 @@ export async function wakeOfflineSession(target: WakeTarget): Promise<WakeResult
 				paneId,
 			};
 		}
-		const how = target.spawnFresh ? "started (fresh session)" : "resumed";
-		return { ok: true, detail: `pi agent ${how} as '${usedName}' in pane ${paneId}; prompt sent`, paneId };
+		return { ok: true, detail: `pi agent resumed as '${usedName}' in pane ${paneId}; prompt sent`, paneId };
 	} catch (err) {
 		return { ok: false, reason: err instanceof Error ? err.message : String(err) };
 	}
