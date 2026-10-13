@@ -52,6 +52,22 @@ export function setupIsolatedDaemon(label) {
 	return { home, daemonBin, port, tabEnv, apiDelete, registryPath };
 }
 
+/** Delete leftover test mailboxes from earlier runs (idempotent, survives
+ *  hard kills of previous runs — exit handlers do not fire on SIGKILL).
+ *  Only offline named mailboxes with the test prefixes are removed. */
+export async function sweepTestMailboxes(connection, apiDelete, project, prefixes = ["nr-", "nt-", "held-", "pr-"]) {
+	try {
+		const sessions = await connection.mailbox.sessions(true);
+		for (const s of sessions) {
+			if (!s.online && (s.meta ?? {})._named === "1" && prefixes.some((p) => s.session.startsWith(p))) {
+				apiDelete(`${s.session}@${project}`);
+			}
+		}
+	} catch {
+		// best effort: a failed sweep must not fail the test
+	}
+}
+
 /** Run one herdr CLI command; resolves with its `result` object. */
 export function herdr(args, timeoutMs = 15000) {
 	return new Promise((resolve, reject) => {

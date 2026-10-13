@@ -11,12 +11,12 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { MailboxConnection } from "../src/client.ts";
-import { setupIsolatedDaemon, herdr, newProjectTab, sessionsDirFor } from "./live-helpers.mjs";
+import { setupIsolatedDaemon, herdr, newProjectTab, sessionsDirFor , sweepTestMailboxes } from "./live-helpers.mjs";
 
 const projectDir = process.cwd();
 const origin = `notif-test-${Date.now().toString(36)}`;
 const NAME = `nt-${Date.now().toString(36)}`;
-const { port } = setupIsolatedDaemon("notif");
+const { port, apiDelete } = setupIsolatedDaemon("notif");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const sessionsDir = sessionsDirFor(projectDir);
@@ -57,6 +57,7 @@ const sender = new MailboxConnection("local", projectDir, null, `notif-sender-${
 	onNotify: () => {}, onConnected: () => {}, onDisconnected: () => {},
 }, { canSpawn: true });
 await sender.start();
+await sweepTestMailboxes(sender, apiDelete, sender.mailbox.project);
 let online = false;
 for (let i = 0; i < 200; i++) {
 	const sessions = await sender.mailbox.sessions();
