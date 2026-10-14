@@ -27,7 +27,14 @@ import { hostname, platform } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { Type } from "typebox";
 import { isFatalLoginError, MailboxConnection, MailboxError, type RemoteTarget } from "./client.ts";
-import { connectLocalDaemonIfRunning, deriveProjectId, fetchSessionsViaApi, findMailboxdBinary } from "./daemon.ts";
+import {
+	connectLocalDaemonIfRunning,
+	deleteMailboxViaApi,
+	deriveProjectId,
+	fetchSessionsViaApi,
+	findMailboxdBinary,
+	mailboxTotalsViaApi,
+} from "./daemon.ts";
 import { findLiveAgentPane, wakeOfflineSession } from "./herdr.ts";
 import type { MailRecord, MailRef, SessionInfo } from "./protocol.ts";
 
@@ -925,6 +932,52 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
+			if (arg === "delete" || arg.startsWith("delete ")) {
+				const name = arg.slice(7).trim().toLowerCase();
+				if (!name) {
+					ctx.ui.notify("Usage: /mailbox delete <name>  (hard-delete a mailbox in this project: mails, meta, registration)", "warning");
+					return;
+				}
+				try {
+					if (conn?.remoteTarget) {
+						ctx.ui.notify("mailbox: delete is local-mode only (the local daemon's project)", "error");
+						return;
+					}
+					// resolve through the read-only API: no login of one's own needed
+					const projectRoot = ctx.sessionManager.getCwd();
+					const projectId = await deriveProjectId(projectRoot);
+					const sessions = await fetchSessionsViaApi({ id: projectId, root: projectRoot });
+					const info = sessions.find((s) => s.session === name && s.project === projectId);
+					if (!info) {
+						ctx.ui.notify(`mailbox: no such mailbox '${name}' in this project`, "error");
+						return;
+					}
+					// online mailboxes are never deleted — the daemon refuses a
+					// live mailbox, and that includes one's own current login:
+					// log out explicitly first, then delete (the owner's
+					// decision: no implicit disconnect inside delete)
+					if (info.online) {
+						const own = conn?.connected && conn.mailboxId === name;
+						ctx.ui.notify(
+							own
+								? `mailbox: '${name}' is your own current login — run /mailbox logout first, then delete`
+								: `mailbox: '${name}' is online — its holder must disconnect first (the daemon refuses to delete a live mailbox)`,
+							"error",
+						);
+						return;
+					}
+					const totals = await mailboxTotalsViaApi(projectId, name);
+					await deleteMailboxViaApi(projectId, name);
+					ctx.ui.notify(
+						`mailbox: deleted '${name}'${totals ? ` (${totals.total} mails, ${totals.totalUnread} unread)` : ""} — irreversibly`,
+						"info",
+					);
+				} catch (err) {
+					ctx.ui.notify(`mailbox: delete failed: ${err instanceof Error ? err.message : String(err)}`, "error");
+				}
+				return;
+			}
+
 			if (arg === "list client" || arg === "list client all") {
 				try {
 					const includeOffline = arg === "list client all";
@@ -1133,7 +1186,7 @@ export default function (pi: ExtensionAPI) {
 				const m = /^([A-Za-z0-9.-]+):(\d+)(?:\s+(\S+))?$/.exec(arg);
 				if (!m) {
 					ctx.ui.notify(
-						"Usage: /mailbox [login <name> [tags=a,b] [--force] | logout | resume <name> | start service | stop service | restart service | view | status | list [client [all]|mail] | meta | name <n> | tag <a,b> | set k=v | unset k | read <mail-ref> | more <cursor> | host:port [token]]",
+						"Usage: /mailbox [login <name> [tags=a,b] [--force] | logout | resume <name> | delete <name> | start service | stop service | restart service | view | status | list [client [all]|mail] | meta | name <n> | tag <a,b> | set k=v | unset k | read <mail-ref> | more <cursor> | host:port [token]]",
 						"warning",
 					);
 					return;

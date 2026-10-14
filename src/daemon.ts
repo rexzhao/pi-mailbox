@@ -190,6 +190,42 @@ export async function fetchSessionsViaApi(
 	return body.sessions ?? [];
 }
 
+/** Hard-delete a mailbox through the daemon's HTTP API (the web UI's
+ *  delete: mails, meta, registration — irreversibly; the holder must be
+ *  offline). Local mode only. */
+export async function deleteMailboxViaApi(project: string, session: string): Promise<void> {
+	const endpoint = await resolveLocalDaemon();
+	const resp = await fetch(`http://127.0.0.1:${endpoint.port}/api/delete`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ address: `${session}@${project}` }),
+		signal: AbortSignal.timeout(5_000),
+	});
+	const body = (await resp.json().catch(() => ({}))) as { deleted?: string; error?: string };
+	if (!resp.ok || body.deleted === undefined) {
+		throw new Error(body.error ?? `daemon HTTP ${resp.status}`);
+	}
+}
+
+/** Mailbox totals through the read-only HTTP API (for delete reports). */
+export async function mailboxTotalsViaApi(
+	project: string,
+	session: string,
+): Promise<{ total: number; totalUnread: number } | null> {
+	try {
+		const endpoint = await resolveLocalDaemon();
+		const resp = await fetch(
+			`http://127.0.0.1:${endpoint.port}/api/mailbox/${encodeURIComponent(`${session}@${project}`)}`,
+			{ signal: AbortSignal.timeout(5_000) },
+		);
+		if (!resp.ok) return null;
+		const body = (await resp.json()) as { total?: number; totalUnread?: number };
+		return { total: body.total ?? 0, totalUnread: body.totalUnread ?? 0 };
+	} catch {
+		return null; // count is a nicety, never a gate
+	}
+}
+
 // ---------------------------------------------------------------------------
 // identity derivation
 // ---------------------------------------------------------------------------
