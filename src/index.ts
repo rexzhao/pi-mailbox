@@ -18,11 +18,13 @@
 
 import { VERSION, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { spawn, spawnSync } from "node:child_process";
+import { readdirSync } from "node:fs";
 import { hostname, platform } from "node:os";
+import { join } from "node:path";
 import { Type } from "typebox";
 import { isFatalLoginError, MailboxConnection, MailboxError, type RemoteTarget } from "./client.ts";
 import { connectLocalDaemonIfRunning, findMailboxdBinary } from "./daemon.ts";
-import { wakeOfflineSession } from "./herdr.ts";
+import { findLiveAgentPane, wakeOfflineSession } from "./herdr.ts";
 import type { MailRecord, MailRef, SessionInfo } from "./protocol.ts";
 
 const TOOL_NAMES = ["mailbox_list", "mailbox_read", "mailbox_send", "mailbox_reply", "mailbox_sessions"] as const;
@@ -129,9 +131,12 @@ export default function (pi: ExtensionAPI) {
 	let conn: MailboxConnection | null = null;
 	let busy = false;
 	let interactive = true;
+	/** Set by session_shutdown: in-flight connects must not adopt the dead runtime. */
+	let shuttingDown = false;
 
-	pi.on("session_start", (_event, ctx) => {
+	pi.on("session_start", (event, ctx) => {
 		interactive = ctx.mode === "tui" || ctx.mode === "rpc";
+		void autoConnect(event, ctx);
 	});
 	pi.on("agent_start", () => {
 		busy = true;
@@ -157,10 +162,11 @@ export default function (pi: ExtensionAPI) {
 	pi.on("turn_end", async () => {
 		if (pendingUnread > 0) await flushNotifications();
 	});
-	pi.on("session_shutdown", async () => {
+	pi.on("session_shutdown", () => {
+		shuttingDown = true;
 		if (flushTimer !== null) clearTimeout(flushTimer);
 		flushTimer = null;
-		await conn?.stop();
+		conn?.stop();
 		conn = null;
 	});
 
@@ -347,6 +353,54 @@ export default function (pi: ExtensionAPI) {
 	/** Consume the gate permission (single use). */
 	function consumeForceGate(): void {
 		lastHeld = null;
+	}
+
+	/**
+	 * Silent auto-connect on startup: a session that has logged in before
+	 * (a stored binding) reconnects automatically when the daemon is
+	 * already running. Never spawns the daemon; stays silent on success
+	 * and on transient failures — only permanent login rejections (e.g.
+	 * the name was taken over) surface to the user.
+	 */
+	async function autoConnect(
+		_event: unknown,
+		ctx: {
+			sessionManager: {
+				getSessionId(): string;
+				getCwd(): string;
+				getSessionDir(): string;
+				getEntries?(): Array<{ type: string; customType?: string; data?: unknown }>;
+			};
+			model?: { id: string; provider: string } | undefined;
+		},
+	): Promise<void> {
+		try {
+			if (shuttingDown || !interactive || conn?.connected) return;
+			if (!readStoredLogin(ctx)) return; // never logged in: nothing to do
+			const endpoint = await connectLocalDaemonIfRunning();
+			if (shuttingDown) return; // session ended during the probe
+			if (!endpoint) return; // daemon down: stay silent, no spawn
+			await startConnection(ctx, null, false); // binding auto-applies
+			// the runtime may have been torn down (resume/quit) while the
+			// connect was in flight: do not leave an adopted orphan
+			if (shuttingDown) {
+				conn?.stop();
+				conn = null;
+			}
+		} catch (err) {
+			// silent, except permanent login rejections — being displaced
+			// from your name is something the user must learn about
+			if (isFatalLoginError(err)) {
+				try {
+					pi.sendUserMessage(
+						`[mailbox] auto-login failed: ${err instanceof Error ? err.message : String(err)}`,
+						{ deliverAs: "steer" },
+					);
+				} catch {
+					// injection races with run state; the next manual connect surfaces it
+				}
+			}
+		}
 	}
 
 	async function startConnection(
@@ -592,10 +646,10 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			if (arg === "open" || arg.startsWith("open ")) {
-				const name = arg.slice(4).trim().toLowerCase();
+			if (arg === "resume" || arg.startsWith("resume ")) {
+				const name = arg.slice(6).trim().toLowerCase();
 				if (!name) {
-					ctx.ui.notify("Usage: /mailbox open <name>  (resume the named mailbox's session in herdr)", "warning");
+					ctx.ui.notify("Usage: /mailbox resume <name>  (switch this terminal to the named mailbox's session)", "warning");
 					return;
 				}
 				try {
@@ -610,30 +664,58 @@ export default function (pi: ExtensionAPI) {
 						ctx.ui.notify(`mailbox: '${name}' is not a named mailbox`, "error");
 						return;
 					}
-					if (info.online) {
-						ctx.ui.notify(`mailbox: '${name}' is already online (${name}@${info.project})`, "info");
-						return;
-					}
 					const origin = (info.meta ?? {})._origin;
 					if (!origin) {
 						ctx.ui.notify(`mailbox: '${name}' has no recorded session to resume`, "error");
 						return;
 					}
-					const result = await wakeOfflineSession({
-						session: name,
-						origin,
-						projectRoot: c.projectDir,
-						label: info.name,
-						named: true,
-						sessionDir: c.sessionDirProvider?.(),
-						prompt: null, // the human asked for it: no mail prompt
-					});
-					ctx.ui.notify(
-						result.ok
-							? `mailbox: opened '${name}' — ${result.detail}`
-							: `mailbox: open failed: ${result.reason}`,
-						result.ok ? "info" : "error",
-					);
+					// self-check FIRST: resuming your own name while connected
+					// as it must say "already this session", not "holder
+					// running elsewhere"
+					if (origin === ctx.sessionManager.getSessionId()) {
+						ctx.ui.notify(`mailbox: '${name}' is already this session`, "info");
+						return;
+					}
+					if (info.online) {
+						ctx.ui.notify(
+							`mailbox: '${name}' is online — its holder session is running elsewhere; close it first (or send it a note instead)`,
+							"error",
+						);
+						return;
+					}
+					// the session file must exist (switching to a dead id would
+					// silently create an empty session)
+					const sessionDir = ctx.sessionManager.getSessionDir();
+					let sessionFile: string | null = null;
+					try {
+						for (const f of readdirSync(sessionDir)) {
+							if (f.endsWith(`_${origin}.jsonl`)) sessionFile = join(sessionDir, f);
+						}
+					} catch { /* dir missing */ }
+					if (!sessionFile) {
+						ctx.ui.notify(
+							`mailbox: the session behind '${name}' is gone (file deleted); claim the name with /mailbox login ${name} [--force] instead`,
+							"error",
+						);
+						return;
+					}
+					// a live-but-disconnected pi on that session file would now be
+					// doubled; detect it through herdr when available
+					const livePane = await findLiveAgentPane(origin);
+					if (livePane) {
+						ctx.ui.notify(
+							`mailbox: the session behind '${name}' is still running in herdr pane ${livePane}; close it first`,
+							"error",
+						);
+						return;
+					}
+					// switch this terminal to the target session in place;
+					// session_shutdown (reason "resume") stops our mailbox
+					// connection on the way. Its stored binding auto-logins
+					// it as '<name>' on startup. On a vetoed switch the
+					// connection is untouched.
+					const { cancelled } = await ctx.switchSession(sessionFile);
+					if (cancelled) ctx.ui.notify("mailbox: resume cancelled (still connected as before)", "warning");
 				} catch (err) {
 					ctx.ui.notify(`mailbox: ${err instanceof Error ? err.message : String(err)}`, "error");
 				}
@@ -819,7 +901,7 @@ export default function (pi: ExtensionAPI) {
 				const m = /^([A-Za-z0-9.-]+):(\d+)(?:\s+(\S+))?$/.exec(arg);
 				if (!m) {
 					ctx.ui.notify(
-						"Usage: /mailbox [login <name> [tags=a,b] [--force] | logout | open <name> | start service | stop service | restart service | view | status | list [client [all]|mail] | meta | name <n> | tag <a,b> | set k=v | unset k | read <mail-ref> | more <cursor> | host:port [token]]",
+						"Usage: /mailbox [login <name> [tags=a,b] [--force] | logout | resume <name> | start service | stop service | restart service | view | status | list [client [all]|mail] | meta | name <n> | tag <a,b> | set k=v | unset k | read <mail-ref> | more <cursor> | host:port [token]]",
 						"warning",
 					);
 					return;

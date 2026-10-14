@@ -154,6 +154,30 @@ for (let i = 0; i < 150; i++) {
 if (!reply2) throw new Error("woken agent did not handle the mail");
 console.log("phase 3 ok: wake -> auto-login -> woke-ok");
 
+// 3b. pure auto-connect: resume the bound session with NO prompt at all —
+// the startup auto-connect must bring it online as the named mailbox
+console.log("closing the agent; resuming the bound session with no prompt (auto-connect)");
+spawnSync("herdr", ["pane", "close", paneId], { stdio: "ignore" });
+paneId = null;
+for (let i = 0; i < 60; i++) {
+	const sessions = await sender.mailbox.sessions(true);
+	if (sessions.some((s) => s.session === NAME && !s.online)) break;
+	await sleep(1000);
+}
+paneId = await newProjectTab(projectDir, "login-auto");
+await herdr(
+	["agent", "start", "login-auto", "--kind", "pi", "--pane", paneId, "--timeout", "30000", "--", "-ne", "-e", join(projectDir, "src", "index.ts"), "--session-id", origin],
+	40000,
+);
+let autoOnline = false;
+for (let i = 0; i < 60; i++) {
+	const sessions = await sender.mailbox.sessions(true);
+	if (sessions.some((s) => s.session === NAME && s.online)) { autoOnline = true; break; }
+	await sleep(1000);
+}
+if (!autoOnline) throw new Error("auto-connect did not bring the bound session online");
+console.log("phase 3b ok: auto-connect (no prompt, binding-driven)");
+
 // 4. failed login switch keeps the previous identity
 HELD = `held-${Date.now().toString(36)}`;
 const holder2 = new MailboxConnection("local", projectDir, null, `held-holder-${Date.now().toString(36)}`, "pi", {

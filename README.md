@@ -133,6 +133,13 @@ below.
 
 ## Commands
 
+- Sessions that have logged in before auto-connect silently on startup
+  when the daemon is already running (never spawning it): the stored
+  binding re-claims its name, and mail notifications resume. A permanent
+  login rejection during auto-connect (e.g. the name was taken over)
+  surfaces to the user; everything else stays silent. Auto-connect always
+  targets the LOCAL daemon: a remote target from `/mailbox host:port` is
+  not remembered — reconnect to it explicitly.
 - `/mailbox` — show a one-line status summary (mail counts, clients
   online); requires an active connection
 - `/mailbox host:port [token]` — connect to a remote mailboxd (token
@@ -153,9 +160,12 @@ below.
   identity; tags overwrite when given, inherited when omitted)
 - `/mailbox logout` — log out: disconnect and clear the login binding
   (`off` is an alias)
-- `/mailbox open <name>` — resume the named mailbox's last-holder session
-  in a herdr tab (fails when the session file is gone; the name can then be
-  claimed manually)
+- `/mailbox resume <name>` — switch THIS terminal to the named mailbox's
+  session in place (pi's switchSession). Fails when the name is unknown,
+  online (its holder runs elsewhere), or the session file is gone (claim it
+  with `/mailbox login <name> [--force]` instead); a live-but-disconnected
+  holder is detected through herdr when available. The switched-to session
+  auto-logins through its stored binding.
 - `/mailbox start service` — connect (spawns the daemon if needed)
 - `/mailbox stop service` — disconnect (the daemon itself keeps running
   until its idle timeout, or `mailboxd --stop`)

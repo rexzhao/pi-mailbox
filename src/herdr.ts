@@ -151,8 +151,6 @@ export interface WakeTarget {
 	named?: boolean;
 	/** pi session directory (the project's), to verify the last holder's session file exists before resuming. */
 	sessionDir?: string;
-	/** Prompt override for the woken agent: undefined = the built-in mail prompt, null = no prompt (e.g. /mailbox open), string = custom. */
-	prompt?: string | null;
 }
 
 /**
@@ -181,11 +179,23 @@ function wakePrompt(target: WakeTarget): string {
 	);
 }
 
-/** The effective prompt: override, the built-in, or none. */
-function effectivePrompt(target: WakeTarget): string | null {
-	if (target.prompt === null) return null;
-	if (target.prompt !== undefined) return target.prompt;
-	return wakePrompt(target);
+/**
+ * Is a pi process for this origin still running in a herdr pane? Returns
+ * the pane id, or null when it is not (or herdr is unavailable).
+ */
+export async function findLiveAgentPane(origin: string): Promise<string | null> {
+	try {
+		const result = await runHerdr(["agent", "list"], 3_000);
+		const agents = isRecord(result) && Array.isArray(result.agents) ? result.agents : [];
+		for (const a of agents) {
+			if (!isRecord(a)) continue;
+			const sess = isRecord(a.agent_session) && typeof a.agent_session.value === "string" ? a.agent_session.value : null;
+			if (sess && referencesOrigin(sess, origin) && typeof a.pane_id === "string") return a.pane_id;
+		}
+	} catch {
+		// herdr unavailable: no extra signal
+	}
+	return null;
 }
 
 /** Does the pi session directory still hold the last holder's session file? */
@@ -244,9 +254,8 @@ export async function wakeOfflineSession(target: WakeTarget): Promise<WakeResult
 			if (!isRecord(a)) continue;
 			const sess = isRecord(a.agent_session) && typeof a.agent_session.value === "string" ? a.agent_session.value : null;
 			if (sess && referencesOrigin(sess, target.origin) && typeof a.pane_id === "string") {
-				const p = effectivePrompt(target);
-				if (p !== null) await runHerdr(["agent", "prompt", a.pane_id, p], cap(6_000));
-				return { ok: true, detail: `already running in pane ${a.pane_id}${p === null ? "" : "; prompt sent"}`, paneId: a.pane_id };
+				await runHerdr(["agent", "prompt", a.pane_id, wakePrompt(target)], cap(6_000));
+				return { ok: true, detail: `already running in pane ${a.pane_id}; prompt sent`, paneId: a.pane_id };
 			}
 		}
 
@@ -325,23 +334,16 @@ export async function wakeOfflineSession(target: WakeTarget): Promise<WakeResult
 		if (!started) {
 			// readiness detection can lag the launch; the prompt still lands
 			// if the agent came up despite the detection failure
-			const p = effectivePrompt(target);
-			if (p !== null) {
-				try {
-					await runHerdr(["agent", "prompt", paneId, p], cap(6_000));
-					return { ok: true, detail: `pi agent resumed in pane ${paneId} (detection lagged); prompt sent`, paneId };
-				} catch {
-					// detection lagged AND the prompt failed: treat as failed
-				}
+			try {
+				await runHerdr(["agent", "prompt", paneId, wakePrompt(target)], cap(6_000));
+				return { ok: true, detail: `pi agent resumed in pane ${paneId} (detection lagged); prompt sent`, paneId };
+			} catch {
+				// detection lagged AND the prompt failed: treat as failed
 			}
 			return { ok: false, reason: startErr instanceof Error ? startErr.message : String(startErr) };
 		}
-		const p = effectivePrompt(target);
-		if (p === null) {
-			return { ok: true, detail: `pi agent resumed as '${usedName}' in pane ${paneId}`, paneId };
-		}
 		try {
-			await runHerdr(["agent", "prompt", paneId, p], cap(6_000));
+			await runHerdr(["agent", "prompt", paneId, wakePrompt(target)], cap(6_000));
 		} catch (err) {
 			// the session is up; without the prompt it just sits idle — a
 			// later send re-prompts it via the live-agent branch
