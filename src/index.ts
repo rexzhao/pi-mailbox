@@ -40,6 +40,17 @@ const ADDRESS_FORMAT_DOC =
 	"Threading rule: start NEW topics with mailbox_send; answer any existing mail with " +
 	"mailbox_reply ONLY (it references the original — a reply sent via mailbox_send breaks the thread).";
 
+/** Shared namespace for the mailbox tools: codemode groups them under one
+ *  heading, and describeNamespace('mailbox') returns the addressing guide. */
+const MAILBOX_NAMESPACE = {
+	name: "mailbox",
+	description: "Cross-session agent mail: named mailboxes, wake, and session coordination",
+	instructions: ADDRESS_FORMAT_DOC,
+} as const;
+
+/** Annotation for the mailbox tools with no server-side state changes. */
+const READ_ONLY = { readOnlyHint: true } as const;
+
 /** http base URL from host + port, bracketing IPv6 literals. */
 function httpBase(host: string, port: number): string {
 	const h = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
@@ -1205,6 +1216,7 @@ ${formatMailList(mails)}${more}`,
 	pi.registerTool({
 		name: "mailbox_connect",
 		label: "Mailbox connect",
+		namespace: MAILBOX_NAMESPACE,
 		description:
 			"Connect this session to the project's mailbox (the daemon must already be " +
 			"running; ask the user to run /mailbox start service if it is not) and " +
@@ -1220,8 +1232,18 @@ ${formatMailList(mails)}${more}`,
 		parameters: Type.Object({
 			as: Type.Optional(
 				Type.String({
+					minLength: 3,
+					maxLength: 32,
+					// case-tolerant: validation runs BEFORE execute's toLowerCase(),
+					// and "Reviewer" used to be accepted (and lowered); the
+					// lowercase grammar itself stays enforced by
+					// validMailboxName after normalisation
+					pattern: "^[A-Za-z][A-Za-z0-9_-]{2,31}$",
 					description:
-						"Log in to this named mailbox (3-32 chars, lowercase [a-z0-9_-]) instead of the derived session id; inherits its mails and tags",
+						"Log in to this named mailbox instead of the derived session id; inherits its mails and tags " +
+						"(case-insensitive; names are lowercase). The schema encodes the grammar only: the runtime " +
+						"additionally rejects derived-id-shaped names (10 lowercase base36) and reserved names " +
+						"(user, con, nul, com1-9, lpt1-9)",
 				}),
 			),
 			tags: Type.Optional(
@@ -1290,6 +1312,8 @@ ${formatMailList(mails)}${more}`,
 	pi.registerTool({
 		name: "mailbox_list",
 		label: "Mailbox list",
+		namespace: MAILBOX_NAMESPACE,
+		annotations: READ_ONLY,
 		description:
 			"List mails in this session's mailbox, newest first, paginated. Reading a mail with " +
 			"mailbox_read marks it read. Optional: unreadOnly, since (ISO timestamp, only mails " +
@@ -1298,7 +1322,9 @@ ${formatMailList(mails)}${more}`,
 		parameters: Type.Object({
 			unreadOnly: Type.Optional(Type.Boolean({ description: "Only list unread mails" })),
 			since: Type.Optional(Type.String({ description: "ISO timestamp; only mails created strictly after it" })),
-			limit: Type.Optional(Type.Number({ description: "Page size (default 20, max 100)" })),
+			limit: Type.Optional(
+				Type.Integer({ minimum: 1, maximum: 100, default: 20, description: "Page size" }),
+			),
 			cursor: Type.Optional(Type.String({ description: "Continuation token from a previous mailbox_list result" })),
 		}),
 		exposure: "deferred",
@@ -1318,6 +1344,7 @@ ${formatMailList(mails)}${more}`,
 	pi.registerTool({
 		name: "mailbox_read",
 		label: "Mailbox read",
+		namespace: MAILBOX_NAMESPACE,
 		description:
 			"Read a mail. A mail is referenced as 'session@project/mail' (the mailbox " +
 			"address plus the mail id); a bare mail id means this session's own mailbox. " +
@@ -1342,6 +1369,7 @@ ${formatMailList(mails)}${more}`,
 	pi.registerTool({
 		name: "mailbox_send",
 		label: "Mailbox send",
+		namespace: MAILBOX_NAMESPACE,
 		description:
 			"Start a NEW conversation thread: send a mail to another session, addressed " +
 			"as 'session@project' (a bare session id means this project). This tool " +
@@ -1357,7 +1385,7 @@ ${formatMailList(mails)}${more}`,
 			"(disable with wake: false).",
 		parameters: Type.Object({
 			address: Type.String({ description: "Target mailbox address 'session@project'; a bare session id means this project. The session must have registered once (see mailbox_sessions)" }),
-			subject: Type.String({ description: "Subject line" }),
+			subject: Type.String({ maxLength: 256, description: "Subject line" }),
 			body: Type.Optional(Type.String({ description: "Mail body" })),
 			refs: Type.Optional(
 				Type.Array(
@@ -1390,6 +1418,7 @@ ${formatMailList(mails)}${more}`,
 	pi.registerTool({
 		name: "mailbox_reply",
 		label: "Mailbox reply",
+		namespace: MAILBOX_NAMESPACE,
 		description:
 			"Reply to a mail: sends a new mail to the original sender, referencing the " +
 			"original (subject 'Re: <original subject>') so the reply joins its thread. " +
@@ -1398,7 +1427,7 @@ ${formatMailList(mails)}${more}`,
 		parameters: Type.Object({
 			mail: Type.String({ description: "Mail being replied to: 'session@project/mail'; a bare mail id means your own mailbox" }),
 			body: Type.String({ description: "Reply body" }),
-			subject: Type.Optional(Type.String({ description: "Override the 'Re: <subject>' default" })),
+			subject: Type.Optional(Type.String({ maxLength: 256, description: "Override the 'Re: <subject>' default" })),
 			wake: Type.Optional(
 				Type.Boolean({
 					description:
@@ -1428,6 +1457,8 @@ ${formatMailList(mails)}${more}`,
 	pi.registerTool({
 		name: "mailbox_sessions",
 		label: "Mailbox sessions",
+		namespace: MAILBOX_NAMESPACE,
+		annotations: READ_ONLY,
 		description:
 			"List sessions in this project's mailbox with their name, tags, and other " +
 			"meta (model, host, ...). Your own session is marked '(you)'. By default only " +
