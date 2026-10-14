@@ -568,6 +568,58 @@ try {
 		decremented = renderLine1().includes(`✉${unreadBefore - 1}`);
 	}
 	assert(decremented, `footer badge decremented to ${unreadBefore - 1} after a read: ${renderLine1()}`);
+
+	// startConnection race: a failing concurrent connect must not orphan a
+	// live one. A = same-origin reconnect (extsmoke, succeeds); B = claim of
+	// a name held ONLINE by a foreign-origin raw connection (mailbox_in_use,
+	// fatal). Old code: B's fatal rollback set conn=null, orphaning A. Fixed:
+	// identity-checked rollback restores B's captured previous, so the
+	// extension keeps a live connection either way.
+	const { MailboxConnection: RaceConn } = await import("../src/client.ts");
+	const holderLog = { notify: [], connected: 0, disconnected: 0 };
+	const holder = new RaceConn("local", projectDir, null, "race-holder-sess", "race-holder-agent", events(holderLog), {
+		login: { as: "race-b" },
+	});
+	await holder.start();
+	assert(holder.connected, "foreign-origin holder online for race-b");
+
+	// TRUE REPRODUCER (review-1's seam): delay the FIRST start() call, so A
+	// (fired first) assigns conn=A and then sits inside start() — the
+	// vulnerable window. 150ms later B's prologue clobbers conn=B and B
+	// fails fatally; the rollback must restore A, and A's start must then
+	// complete into a live, referenced connection.
+	const realStart = RaceConn.prototype.start;
+	let delayedFirst = false;
+	RaceConn.prototype.start = async function (...startArgs) {
+		if (!delayedFirst) {
+			delayedFirst = true;
+			await new Promise((r) => setTimeout(r, 1200));
+		}
+		return realStart.apply(this, startArgs);
+	};
+	try {
+		const pA = exec(connectTool, { as: "extsmoke" });
+		await new Promise((r) => setTimeout(r, 150)); // B fires inside A's window
+		const pB = exec(connectTool, { as: "race-b" }).then(
+			() => "unexpected-success",
+			(err) => String(err),
+		);
+		await pA.catch((err) => `A failed: ${err}`);
+		const bOutcome = await pB;
+		assert(
+			typeof bOutcome === "string" && /session_bound|mailbox_in_use/.test(bOutcome),
+			`race: B fails fatally (${bOutcome})`,
+		);
+		// the race outcome: the extension must still hold a LIVE connection
+		const afterRace = await exec(connectTool, {});
+		assert(
+			afterRace.structuredContent.alreadyConnected === true,
+			`race: A is not orphaned (extension still connected): ${afterRace.content[0].text.slice(0, 80)}`,
+		);
+	} finally {
+		RaceConn.prototype.start = realStart;
+	}
+	await holder.stop();
 } finally {
 	// the daemon is detached and holds the lock file in the temp home; stop
 	// it via the pid recorded in the registry so cleanup can remove the dir

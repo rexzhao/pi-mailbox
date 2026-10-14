@@ -822,17 +822,30 @@ export default function (pi: ExtensionAPI) {
 					lastHeld = null; // any other error code clears it
 				}
 			}
+			// identity-checked rollback: a failing connect may only undo ITS
+			// OWN assignment, restoring what its prologue clobbered. Two
+			// overlapping startConnection calls would otherwise race (A
+			// assigns conn=A and is still inside start(); B's prologue
+			// overwrites conn=B; B fails and wipes conn to null — A
+			// finishes live at the daemon but orphaned, invisible to tools,
+			// footer, and shutdown). Restoring `previous` (not null) also
+			// covers previous=A-still-starting: A keeps ownership of the
+			// slot and its own outcome resolves it. With no racing call,
+			// previous is the pre-prologue value, so single-call semantics
+			// are byte-identical.
 			if (previous?.connected) {
 				// identity switch failed (rejected login, or a transient error
 				// mid-switch): stay on the previous identity — no half-open
 				// second connection, no retry loop; the user retries explicitly
 				await connection.stop();
-				conn = previous;
+				if (conn === connection) conn = previous;
 				activateTools(true);
 			} else if (isFatalLoginError(err)) {
-				// permanent login rejection on a fresh connection: no retry loop
+				// permanent login rejection on a fresh connection: no retry
+				// loop (previous is null or dead here, so this is conn=null
+				// for every non-racing call)
 				await connection.stop();
-				conn = null;
+				if (conn === connection) conn = previous;
 				activateTools(false);
 			} else {
 				// first connection, transient failure: keep the retry loop armed
