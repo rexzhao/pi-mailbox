@@ -133,9 +133,14 @@ below.
 
 ## Commands
 
-- While connected, the session's mailbox address (name@project) shows in
-  the pi footer via the extension status line, below/after the project
-  path; it clears on disconnect.
+- While connected, the session's mailbox address (name@project) rides on
+  the pi footer's FIRST line, right after the project path and git branch
+  — a custom footer component subclassing pi's default (stats line and
+  extension statuses unchanged, no extra height). The address clears on
+  disconnect. The default footer's AgentSession dependency is served by a
+  small proxy over the extension context (two fidelity losses: the "(sub)"
+  cost suffix for subscription providers is not detected, and virtual-model
+  routing never shows its "→ <model>" suffix).
 - Sessions that have logged in before auto-connect silently on startup
   when the daemon is already running (never spawning it): the stored
   binding re-claims its name, and mail notifications resume. A permanent

@@ -16,11 +16,15 @@
  * mailbox_send, mailbox_sessions.
  */
 
-import { VERSION, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+	FooterComponent,
+	VERSION,
+	type ExtensionAPI,
+} from "@earendil-works/pi-coding-agent";
 import { spawn, spawnSync } from "node:child_process";
 import { readdirSync } from "node:fs";
 import { hostname, platform } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { Type } from "typebox";
 import { isFatalLoginError, MailboxConnection, MailboxError, type RemoteTarget } from "./client.ts";
 import { connectLocalDaemonIfRunning, deriveProjectId, fetchSessionsViaApi, findMailboxdBinary } from "./daemon.ts";
@@ -89,6 +93,107 @@ function formatMailList(mails: MailRecord[]): string {
 }
 
 /** Render a sessions listing; `self` (own project + short session id) gets a "(you)" marker. */
+/** pi's home-shortening for the footer's first line (cwd -> ~/...), copied
+ *  from its non-exported formatCwdForFooter so logged-in and logged-out
+ *  frames shorten identically (relative() + isAbsolute, not startsWith). */
+function shortCwd(cwd: string): string {
+	const home = process.env.HOME || process.env.USERPROFILE;
+	if (!home) return cwd;
+	const rel = relative(resolve(home), resolve(cwd));
+	if (rel === "") return "~";
+	if (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel)) return `~${sep}${rel}`;
+	return cwd;
+}
+
+/** Visual width in terminal columns: East Asian Wide/Fullwidth and emoji
+ *  ranges count as 2 (a UTF-16 .length check would clip mid-wide-char). */
+function visualWidth(s: string): number {
+	let w = 0;
+	for (const ch of s) {
+		const cp = ch.codePointAt(0) ?? 0;
+		const wide =
+			(cp >= 0x1100 && cp <= 0x115f) ||
+			(cp >= 0x2e80 && cp <= 0xa4cf) ||
+			(cp >= 0xac00 && cp <= 0xd7a3) ||
+			(cp >= 0xf900 && cp <= 0xfaff) ||
+			(cp >= 0xfe30 && cp <= 0xfe4f) ||
+			(cp >= 0xff00 && cp <= 0xff60) ||
+			(cp >= 0xffe0 && cp <= 0xffe6) ||
+			(cp >= 0x1f300 && cp <= 0x1f64f) ||
+			(cp >= 0x1f900 && cp <= 0x1f9ff);
+		w += wide ? 2 : 1;
+	}
+	return w;
+}
+
+/** Truncate to a visual width with an ellipsis (plain text only, pre-styling). */
+function truncateVisual(s: string, width: number): string {
+	if (visualWidth(s) <= width) return s;
+	let w = 0;
+	let out = "";
+	for (const ch of s) {
+		const cw = visualWidth(ch);
+		if (w + cw > width - 1) return `${out}…`;
+		out += ch;
+		w += cw;
+	}
+	return out;
+}
+
+type FooterSession = ConstructorParameters<typeof FooterComponent>[0];
+type FooterData = ConstructorParameters<typeof FooterComponent>[1];
+
+/**
+ * The default pi footer with the session's mailbox address riding on the
+ * FIRST line, right after the git branch — no extra footer height. The
+ * stats line and any extension statuses render unchanged through
+ * super.render(); only line 1 is recomposed (cwd (branch) <address>
+ * • sessionName, truncated before styling so ANSI codes stay intact).
+ */
+class MailboxFooterComponent extends FooterComponent {
+	private readonly footerTheme: { fg(style: string, text: string): string };
+	private readonly dataRef: FooterData;
+	private readonly sessionRef: FooterSession;
+	private readonly getAddress: () => string | null;
+
+	constructor(session: FooterSession, footerData: FooterData, theme: { fg(style: string, text: string): string }, getAddress: () => string | null) {
+		super(session, footerData);
+		this.footerTheme = theme;
+		this.dataRef = footerData;
+		this.sessionRef = session;
+		this.getAddress = getAddress;
+	}
+
+	render(width: number): string[] {
+		// containment: a pi upgrade reading a proxy field we do not have, or
+		// a frame against an invalidated context, must degrade to our own
+		// line 1 (or to whatever super produced) rather than take the footer
+		// or the frame down
+		let lines: string[] = [];
+		try {
+			lines = super.render(width);
+		} catch {
+			// proxy/pi drift: compose what we can below
+		}
+		try {
+			const address = this.getAddress();
+			if (!address && lines.length > 0) return lines; // byte-identical default
+			let line = shortCwd(this.sessionRef.sessionManager.getCwd());
+			const branch = this.dataRef.getGitBranch();
+			if (branch) line += ` (${branch})`;
+			if (address) line += ` ${address}`;
+			const sessionName = this.sessionRef.sessionManager.getSessionName();
+			if (sessionName) line += ` • ${sessionName}`;
+			const styled = this.footerTheme.fg("dim", truncateVisual(line, width));
+			if (lines.length === 0) return [styled]; // degraded: at least line 1
+			lines[0] = styled;
+			return lines;
+		} catch {
+			return lines; // even the composition failed: super's output stands
+		}
+	}
+}
+
 function formatSessions(sessions: SessionInfo[], self?: { project: string; session: string }): string {
 	if (sessions.length === 0) return "no sessions";
 	return sessions
@@ -131,28 +236,85 @@ export default function (pi: ExtensionAPI) {
 	let conn: MailboxConnection | null = null;
 	let busy = false;
 	let interactive = true;
-	/** ctx.ui captured at session_start; valid for this runtime's lifetime (re-captured after session replacement). */
-	let uiApi: {
-		setStatus(key: string, text: string | undefined): void;
-		theme: { fg(style: string, text: string): string };
-	} | null = null;
+	// -----------------------------------------------------------------------
+	// footer: the mailbox address on line 1, right after the git branch
+	// (a custom footer component subclassing pi's default; no extra height)
+	// -----------------------------------------------------------------------
 
-	/** Show the mailbox address in the footer (after the project path) while connected. */
-	function updateFooterStatus(): void {
-		if (!uiApi) return;
+	/** Captured at session_start; the footer's session proxy reads it lazily on every render. */
+	let sessCtx: {
+		sessionManager: {
+			getSessionId(): string;
+			getCwd(): string;
+			getSessionDir(): string;
+			getEntries?(): Array<{ type: string; customType?: string; data?: unknown }>;
+		};
+		model?: { id: string; provider: string } | undefined;
+		thinkingLevel?: string;
+		getContextUsage?(): { contextWindow?: number; percent?: number | null } | undefined;
+	} | null = null;
+	/** The tui from the footer factory; used to refresh on connection changes. */
+	let footerTui: { requestRender(force?: boolean): void } | null = null;
+
+	/** Repaint the footer (the address is read live, but idle frames need a nudge). */
+	function refreshFooter(): void {
 		try {
-			uiApi.setStatus("mailbox", conn?.connected ? uiApi.theme.fg("dim", `mailbox ${conn.address ?? ""}`) : undefined);
+			footerTui?.requestRender();
 		} catch {
-			// stale-context race around session replacement; the next runtime re-sets it
+			// footer not installed (non-interactive) or already disposed
 		}
+	}
+
+	function installFooter(ui: { setFooter(factory: unknown): void }): void {
+		ui.setFooter((
+			tui: { requestRender(force?: boolean): void },
+			theme: { fg(style: string, text: string): string },
+			footerData: FooterData,
+		) => {
+			footerTui = tui;
+			// A minimal stand-in for the AgentSession the default footer
+			// expects. Everything it reads is available from the extension
+			// context, except modelRuntime.isUsingSubscription (stubbed:
+			// subscription users lose the "(sub)" cost suffix) and
+			// routedModel (falls back to the model). Fields are read lazily
+			// per render through the current sessCtx.
+			const proxySession = {
+				get sessionManager() {
+					return sessCtx!.sessionManager;
+				},
+				get model() {
+					return sessCtx?.model;
+				},
+				routedModel: undefined,
+				get state() {
+					return {
+						get model() {
+							return sessCtx?.model;
+						},
+						get thinkingLevel() {
+							return sessCtx?.thinkingLevel;
+						},
+					};
+				},
+				getContextUsage: () => sessCtx?.getContextUsage?.(),
+				modelRuntime: { isUsingSubscription: () => false },
+			} as unknown as FooterSession;
+			return new MailboxFooterComponent(
+				proxySession,
+				footerData,
+				theme,
+				() => (conn?.connected ? conn.address : null),
+			);
+		});
 	}
 	/** Set by session_shutdown: in-flight connects must not adopt the dead runtime. */
 	let shuttingDown = false;
 
 	pi.on("session_start", (event, ctx) => {
 		interactive = ctx.mode === "tui" || ctx.mode === "rpc";
-		uiApi = ctx.ui;
-		updateFooterStatus();
+		sessCtx = ctx;
+		installFooter(ctx.ui); // replaces the default footer with the address-aware one
+		refreshFooter();
 		void autoConnect(event, ctx);
 	});
 	pi.on("agent_start", () => {
@@ -403,7 +565,7 @@ export default function (pi: ExtensionAPI) {
 			if (shuttingDown) {
 				conn?.stop();
 				conn = null;
-				updateFooterStatus();
+				refreshFooter();
 			}
 		} catch (err) {
 			// silent, except permanent login rejections — being displaced
@@ -480,11 +642,11 @@ export default function (pi: ExtensionAPI) {
 				onNotify: handleNotify,
 				onConnected: () => {
 					activateTools(true);
-					updateFooterStatus();
+					refreshFooter();
 				},
 				onDisconnected: () => {
 					activateTools(false);
-					updateFooterStatus();
+					refreshFooter();
 				},
 			},
 			{
@@ -542,10 +704,9 @@ export default function (pi: ExtensionAPI) {
 						"log in again with /mailbox login <name> (add --force to take it back if the new holder is offline and the user confirms)",
 				);
 			}
-			// the failed attempt's onDisconnected already cleared the footer;
 			// every end state here (restored previous identity included) must
-			// re-derive it from the final conn value
-			updateFooterStatus();
+			// repaint the footer, which reads the final conn value live
+			refreshFooter();
 			throw err;
 		}
 		await previous?.stop();
@@ -832,7 +993,7 @@ export default function (pi: ExtensionAPI) {
 				await conn?.stop();
 				conn = null;
 				activateTools(false);
-				updateFooterStatus(); // stop() suppresses onDisconnected: refresh manually
+				refreshFooter(); // stop() suppresses onDisconnected: refresh manually
 				storeLogin(null); // release the binding: resumes no longer auto-login
 				ctx.ui.notify("mailbox: logged out (daemon keeps running)", "info");
 				return;
@@ -843,7 +1004,7 @@ export default function (pi: ExtensionAPI) {
 					await conn?.stop();
 					conn = null;
 					activateTools(false);
-					updateFooterStatus(); // stop() suppresses onDisconnected: refresh manually
+					refreshFooter(); // stop() suppresses onDisconnected: refresh manually
 					// gracefully stop the daemon via the shutdown protocol
 					const bin = findMailboxdBinary();
 					if (bin) {
@@ -874,7 +1035,7 @@ export default function (pi: ExtensionAPI) {
 					await conn?.stop();
 					conn = null;
 					activateTools(false);
-					updateFooterStatus(); // stop() suppresses onDisconnected: refresh manually
+					refreshFooter(); // stop() suppresses onDisconnected: refresh manually
 					const bin = findMailboxdBinary();
 					if (bin) {
 						const result = spawnSync(bin, ["stop"], {
