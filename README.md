@@ -171,11 +171,14 @@ below.
   identity; tags overwrite when given, inherited when omitted)
 - `/mailbox logout` — log out: disconnect and clear the login binding
   (`off` is an alias)
-- `/mailbox delete <name>` — hard-delete a mailbox in this project
-  (mails, meta, registration — irreversibly; local mode only, no login
-  required). Works for named and derived mailboxes; the holder must be
-  offline — an online mailbox (including your own current login) is
-  refused; log out first, then delete.
+- `/mailbox delete <name> [<name> ...]` — hard-delete mailboxes in this
+  project (mails, meta, registration — irreversibly; local mode only, no
+  login required). Works for named and derived mailboxes; the holder
+  must be offline — an online mailbox (including your own current login)
+  is skipped; log out first, then delete. Multiple names are processed
+  best-effort in the order given (whitespace-separated, deduplicated):
+  unknown or online names are skipped and reported in the summary, a
+  failed delete never aborts the rest of the batch.
 - `/mailbox resume <name>` — switch THIS terminal to the named mailbox's
   session in place (pi's switchSession). The name is resolved through the
   daemon's read-only HTTP API, so the current session needs NO mailbox of

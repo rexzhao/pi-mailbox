@@ -47,6 +47,42 @@ const ADDRESS_FORMAT_DOC =
 	"Threading rule: start NEW topics with mailbox_send; answer any existing mail with " +
 	"mailbox_reply ONLY (it references the original — a reply sent via mailbox_send breaks the thread).";
 
+export interface DeleteOutcome {
+	deleted: string[];
+	skipped: Array<{ name: string; reason: string }>;
+	failed: Array<{ name: string; error: string }>;
+	withTotals: boolean;
+	totalMails: number;
+	totalUnread: number;
+}
+
+/** Compact list rendering: after `max` entries, "…and N more". */
+function summarizeEntries(entries: string[], max = 6): string {
+	const shown = entries.slice(0, max).join(", ");
+	return entries.length > max ? `${shown}, …and ${entries.length - max} more` : shown;
+}
+
+/** Batch-delete summary text (N>1); the N=1 path keeps its own wording. */
+export function formatDeleteSummary(o: DeleteOutcome): { text: string; level: "info" | "warning" } {
+	const parts: string[] = [];
+	if (o.deleted.length > 0) {
+		parts.push(
+			`mailbox: deleted ${o.deleted.length} ${o.deleted.length === 1 ? "mailbox" : "mailboxes"}` +
+				(o.withTotals ? ` (${o.totalMails} mails, ${o.totalUnread} unread)` : "") +
+				" — irreversibly",
+		);
+	} else {
+		parts.push("mailbox: deleted 0");
+	}
+	if (o.skipped.length > 0) {
+		parts.push(`; skipped ${o.skipped.length} (${summarizeEntries(o.skipped.map((s) => `'${s.name}' — ${s.reason}`))})`);
+	}
+	if (o.failed.length > 0) {
+		parts.push(`; failed ${o.failed.length} (${summarizeEntries(o.failed.map((f) => `'${f.name}' — ${f.error}`))})`);
+	}
+	return { text: parts.join(""), level: o.failed.length > 0 || o.skipped.length > 0 ? "warning" : "info" };
+}
+
 /** Shared namespace for the mailbox tools: codemode groups them under one
  *  heading, and describeNamespace('mailbox') returns the addressing guide. */
 const MAILBOX_NAMESPACE = {
@@ -933,9 +969,10 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (arg === "delete" || arg.startsWith("delete ")) {
-				const name = arg.slice(7).trim().toLowerCase();
-				if (!name) {
-					ctx.ui.notify("Usage: /mailbox delete <name>  (hard-delete a mailbox in this project: mails, meta, registration)", "warning");
+				// whitespace-separated names (the grammar has no spaces), lowercased, deduped
+				const names = [...new Set(arg.slice(7).trim().split(/\s+/).filter(Boolean).map((n) => n.toLowerCase()))];
+				if (names.length === 0) {
+					ctx.ui.notify("Usage: /mailbox delete <name> [<name> ...]  (hard-delete mailboxes in this project: mails, meta, registration)", "warning");
 					return;
 				}
 				try {
@@ -947,31 +984,81 @@ export default function (pi: ExtensionAPI) {
 					const projectRoot = ctx.sessionManager.getCwd();
 					const projectId = await deriveProjectId(projectRoot);
 					const sessions = await fetchSessionsViaApi({ id: projectId, root: projectRoot });
-					const info = sessions.find((s) => s.session === name && s.project === projectId);
-					if (!info) {
-						ctx.ui.notify(`mailbox: no such mailbox '${name}' in this project`, "error");
-						return;
-					}
-					// online mailboxes are never deleted — the daemon refuses a
-					// live mailbox, and that includes one's own current login:
-					// log out explicitly first, then delete (the owner's
-					// decision: no implicit disconnect inside delete)
-					if (info.online) {
-						const own = conn?.connected && conn.mailboxId === name;
+					if (names.length === 1) {
+						const name = names[0];
+						const info = sessions.find((s) => s.session === name && s.project === projectId);
+						if (!info) {
+							ctx.ui.notify(`mailbox: no such mailbox '${name}' in this project`, "error");
+							return;
+						}
+						// online mailboxes are never deleted — the daemon refuses a
+						// live mailbox, and that includes one's own current login:
+						// log out explicitly first, then delete (the owner's
+						// decision: no implicit disconnect inside delete)
+						if (info.online) {
+							const own = conn?.connected && conn.mailboxId === name;
+							ctx.ui.notify(
+								own
+									? `mailbox: '${name}' is your own current login — run /mailbox logout first, then delete`
+									: `mailbox: '${name}' is online — its holder must disconnect first (the daemon refuses to delete a live mailbox)`,
+								"error",
+							);
+							return;
+						}
+						const totals = await mailboxTotalsViaApi(projectId, name);
+						await deleteMailboxViaApi(projectId, name);
 						ctx.ui.notify(
-							own
-								? `mailbox: '${name}' is your own current login — run /mailbox logout first, then delete`
-								: `mailbox: '${name}' is online — its holder must disconnect first (the daemon refuses to delete a live mailbox)`,
-							"error",
+							`mailbox: deleted '${name}'${totals ? ` (${totals.total} mails, ${totals.totalUnread} unread)` : ""} — irreversibly`,
+							"info",
 						);
 						return;
 					}
-					const totals = await mailboxTotalsViaApi(projectId, name);
-					await deleteMailboxViaApi(projectId, name);
-					ctx.ui.notify(
-						`mailbox: deleted '${name}'${totals ? ` (${totals.total} mails, ${totals.totalUnread} unread)` : ""} — irreversibly`,
-						"info",
-					);
+					// batch: best-effort in the order given; a per-name outcome
+					// never aborts the batch. Totals only for small batches
+					// (avoid 2N requests).
+					const withTotals = names.length <= 10;
+					const outcome: DeleteOutcome = {
+						deleted: [],
+						skipped: [],
+						failed: [],
+						// emitted only when every deleted name's totals were
+						// actually fetched — a null-tolerant fetch must not
+						// report misleading zeros (the N=1 rule, extended)
+						withTotals: false,
+						totalMails: 0,
+						totalUnread: 0,
+					};
+					let totalsFetched = 0;
+					for (const name of names) {
+						const info = sessions.find((s) => s.session === name && s.project === projectId);
+						if (!info) {
+							outcome.skipped.push({ name, reason: `no such mailbox '${name}' in this project` });
+							continue;
+						}
+						if (info.online) {
+							const own = conn?.connected && conn.mailboxId === name;
+							outcome.skipped.push({
+								name,
+								reason: own ? "own current login (logout first)" : "online",
+							});
+							continue;
+						}
+						try {
+							const totals = withTotals ? await mailboxTotalsViaApi(projectId, name) : null;
+							await deleteMailboxViaApi(projectId, name);
+							outcome.deleted.push(name);
+							if (totals) {
+								outcome.totalMails += totals.total;
+								outcome.totalUnread += totals.totalUnread;
+								totalsFetched++;
+							}
+						} catch (err) {
+							outcome.failed.push({ name, error: err instanceof Error ? err.message : String(err) });
+						}
+					}
+					outcome.withTotals = totalsFetched === outcome.deleted.length;
+					const summary = formatDeleteSummary(outcome);
+					ctx.ui.notify(summary.text, summary.level);
 				} catch (err) {
 					ctx.ui.notify(`mailbox: delete failed: ${err instanceof Error ? err.message : String(err)}`, "error");
 				}
@@ -1186,7 +1273,7 @@ export default function (pi: ExtensionAPI) {
 				const m = /^([A-Za-z0-9.-]+):(\d+)(?:\s+(\S+))?$/.exec(arg);
 				if (!m) {
 					ctx.ui.notify(
-						"Usage: /mailbox [login <name> [tags=a,b] [--force] | logout | resume <name> | delete <name> | start service | stop service | restart service | view | status | list [client [all]|mail] | meta | name <n> | tag <a,b> | set k=v | unset k | read <mail-ref> | more <cursor> | host:port [token]]",
+						"Usage: /mailbox [login <name> [tags=a,b] [--force] | logout | resume <name> | delete <name> [<name> ...] | start service | stop service | restart service | view | status | list [client [all]|mail] | meta | name <n> | tag <a,b> | set k=v | unset k | read <mail-ref> | more <cursor> | host:port [token]]",
 						"warning",
 					);
 					return;
