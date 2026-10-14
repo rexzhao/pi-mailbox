@@ -131,11 +131,28 @@ export default function (pi: ExtensionAPI) {
 	let conn: MailboxConnection | null = null;
 	let busy = false;
 	let interactive = true;
+	/** ctx.ui captured at session_start; valid for this runtime's lifetime (re-captured after session replacement). */
+	let uiApi: {
+		setStatus(key: string, text: string | undefined): void;
+		theme: { fg(style: string, text: string): string };
+	} | null = null;
+
+	/** Show the mailbox address in the footer (after the project path) while connected. */
+	function updateFooterStatus(): void {
+		if (!uiApi) return;
+		try {
+			uiApi.setStatus("mailbox", conn?.connected ? uiApi.theme.fg("dim", `mailbox ${conn.address ?? ""}`) : undefined);
+		} catch {
+			// stale-context race around session replacement; the next runtime re-sets it
+		}
+	}
 	/** Set by session_shutdown: in-flight connects must not adopt the dead runtime. */
 	let shuttingDown = false;
 
 	pi.on("session_start", (event, ctx) => {
 		interactive = ctx.mode === "tui" || ctx.mode === "rpc";
+		uiApi = ctx.ui;
+		updateFooterStatus();
 		void autoConnect(event, ctx);
 	});
 	pi.on("agent_start", () => {
@@ -386,6 +403,7 @@ export default function (pi: ExtensionAPI) {
 			if (shuttingDown) {
 				conn?.stop();
 				conn = null;
+				updateFooterStatus();
 			}
 		} catch (err) {
 			// silent, except permanent login rejections — being displaced
@@ -460,8 +478,14 @@ export default function (pi: ExtensionAPI) {
 			agent,
 			{
 				onNotify: handleNotify,
-				onConnected: () => activateTools(true),
-				onDisconnected: () => activateTools(false),
+				onConnected: () => {
+					activateTools(true);
+					updateFooterStatus();
+				},
+				onDisconnected: () => {
+					activateTools(false);
+					updateFooterStatus();
+				},
 			},
 			{
 				login: effectiveLogin ?? undefined,
@@ -518,6 +542,10 @@ export default function (pi: ExtensionAPI) {
 						"log in again with /mailbox login <name> (add --force to take it back if the new holder is offline and the user confirms)",
 				);
 			}
+			// the failed attempt's onDisconnected already cleared the footer;
+			// every end state here (restored previous identity included) must
+			// re-derive it from the final conn value
+			updateFooterStatus();
 			throw err;
 		}
 		await previous?.stop();
@@ -804,6 +832,7 @@ export default function (pi: ExtensionAPI) {
 				await conn?.stop();
 				conn = null;
 				activateTools(false);
+				updateFooterStatus(); // stop() suppresses onDisconnected: refresh manually
 				storeLogin(null); // release the binding: resumes no longer auto-login
 				ctx.ui.notify("mailbox: logged out (daemon keeps running)", "info");
 				return;
@@ -814,6 +843,7 @@ export default function (pi: ExtensionAPI) {
 					await conn?.stop();
 					conn = null;
 					activateTools(false);
+					updateFooterStatus(); // stop() suppresses onDisconnected: refresh manually
 					// gracefully stop the daemon via the shutdown protocol
 					const bin = findMailboxdBinary();
 					if (bin) {
@@ -844,6 +874,7 @@ export default function (pi: ExtensionAPI) {
 					await conn?.stop();
 					conn = null;
 					activateTools(false);
+					updateFooterStatus(); // stop() suppresses onDisconnected: refresh manually
 					const bin = findMailboxdBinary();
 					if (bin) {
 						const result = spawnSync(bin, ["stop"], {

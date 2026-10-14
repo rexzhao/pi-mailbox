@@ -133,6 +133,9 @@ below.
 
 ## Commands
 
+- While connected, the session's mailbox address (name@project) shows in
+  the pi footer via the extension status line, below/after the project
+  path; it clears on disconnect.
 - Sessions that have logged in before auto-connect silently on startup
   when the daemon is already running (never spawning it): the stored
   binding re-claims its name, and mail notifications resume. A permanent
