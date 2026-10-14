@@ -306,11 +306,14 @@ try {
 	const registeredTools = new Map();
 	const registeredCommands = new Map();
 	const recordedEntries = [];
+	const registeredEvents = new Map();
 	const piMock = {
 		registerTool: (t) => registeredTools.set(t.name, t),
 		registerCommand: (name, def) => registeredCommands.set(name, def),
-		on: () => {},
-		appendEntry: (type, data) => recordedEntries.push({ type, data }),
+		on: (ev, handler) => registeredEvents.set(ev, handler),
+		// mirror pi's entry shape: appendEntry(customType, data) surfaces via
+		// getEntries() as { type: "custom", customType, data }
+		appendEntry: (customType, data) => recordedEntries.push({ type: "custom", customType, data }),
 		getActiveTools: () => [],
 		setActiveTools: () => {},
 		getSessionName: () => "smoke-extension-agent",
@@ -505,6 +508,66 @@ try {
 	// liveness: the daemon must actually be back up after the restart
 	const { connectLocalDaemonIfRunning } = await import("../src/daemon.ts");
 	assert((await connectLocalDaemonIfRunning()) !== null, "daemon is live after restart service");
+
+	// footer unread badge: fire the captured session_start (installs the
+	// footer), reconnect (binding auto-applies), render the component
+	const sessionStart = registeredEvents.get("session_start");
+	assert(typeof sessionStart === "function", "session_start handler registered");
+	let footerFactory = null;
+	const footerCtx = {
+		mode: "tui",
+		ui: { setFooter: (f) => (footerFactory = f), notify: () => {} },
+		sessionManager: {
+			// same session id as fakeCtx: the stored binding must reconnect
+			// as the SAME origin (a second origin would hit name_held)
+			getSessionId: () => "smoke-ext-session-id",
+			getCwd: () => projectDir,
+			getSessionDir: () => join(projectDir, ".pi", "sessions", "smoke-foot"),
+			getSessionName: () => "smoke-footer-agent",
+			getEntries: () => recordedEntries,
+		},
+	};
+	await sessionStart({}, footerCtx);
+	assert(typeof footerFactory === "function", "session_start installed the footer");
+	const component = footerFactory(
+		{ requestRender: () => {} },
+		{ fg: (_style, text) => text },
+		{ getGitBranch: () => "main" },
+	);
+	const renderLine1 = () => component.render(200)[0];
+
+	// not connected: no address, no badge
+	let line = renderLine1();
+	assert(!line.includes("✉"), "disconnected footer has no unread badge");
+
+	// reconnect happens via the autoConnect fired by session_start (same
+	// session id as fakeCtx, so the stored binding extsmoke auto-applies
+	// as a same-origin reconnect; a different id would race the two
+	// connects — see the orphan note in the review mail)
+	let addressShown = false;
+	for (let i = 0; i < 40 && !addressShown; i++) {
+		await new Promise((r) => setTimeout(r, 100));
+		addressShown = renderLine1().includes("extsmoke@");
+	}
+	assert(addressShown, "footer shows the address after auto-connect");
+	line = renderLine1();
+	const inboxBefore = await exec(listTool, { unreadOnly: true });
+	const unreadBefore = inboxBefore.structuredContent.totalUnread;
+	assert(unreadBefore > 0, "precondition: unread mails exist");
+	assert(
+		line.includes(`✉${unreadBefore}`),
+		`footer badge matches inbox unread (${unreadBefore}): ${line}`,
+	);
+
+	// reading one unread mail decrements the badge (refreshUnread is async)
+	const oneUnread = inboxBefore.structuredContent.mails[0];
+	await exec(readTool, { mail: oneUnread.id });
+	let decremented = false;
+	for (let i = 0; i < 30 && !decremented; i++) {
+		await new Promise((r) => setTimeout(r, 100));
+		decremented = renderLine1().includes(`✉${unreadBefore - 1}`);
+	}
+	assert(decremented, `footer badge decremented to ${unreadBefore - 1} after a read: ${renderLine1()}`);
 } finally {
 	// the daemon is detached and holds the lock file in the temp home; stop
 	// it via the pid recorded in the registry so cleanup can remove the dir

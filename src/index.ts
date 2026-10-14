@@ -218,13 +218,21 @@ class MailboxFooterComponent extends FooterComponent {
 	private readonly dataRef: FooterData;
 	private readonly sessionRef: FooterSession;
 	private readonly getAddress: () => string | null;
+	private readonly getUnread: () => number | null;
 
-	constructor(session: FooterSession, footerData: FooterData, theme: { fg(style: string, text: string): string }, getAddress: () => string | null) {
+	constructor(
+		session: FooterSession,
+		footerData: FooterData,
+		theme: { fg(style: string, text: string): string },
+		getAddress: () => string | null,
+		getUnread: () => number | null,
+	) {
 		super(session, footerData);
 		this.footerTheme = theme;
 		this.dataRef = footerData;
 		this.sessionRef = session;
 		this.getAddress = getAddress;
+		this.getUnread = getUnread;
 	}
 
 	render(width: number): string[] {
@@ -245,6 +253,10 @@ class MailboxFooterComponent extends FooterComponent {
 			const branch = this.dataRef.getGitBranch();
 			if (branch) line += ` (${branch})`;
 			if (address) line += ` ${address}`;
+			// unread badge after the address: only while connected and only
+			// when there is something unread (U+2709, visual width 1)
+			const unread = this.getUnread();
+			if (address && unread !== null && unread > 0) line += ` ✉${unread}`;
 			const sessionName = this.sessionRef.sessionManager.getSessionName();
 			if (sessionName) line += ` • ${sessionName}`;
 			const styled = this.footerTheme.fg("dim", truncateVisual(line, width));
@@ -342,6 +354,23 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	/** Unread count for the footer badge; null = unknown/disconnected (no badge). */
+	let footerUnread: number | null = null;
+
+	/** Fetch the authoritative unread count and refresh the footer badge. */
+	async function refreshUnread(): Promise<void> {
+		const c = conn;
+		if (!c?.connected) return;
+		try {
+			const { totalUnread } = await c.mailbox.inbox();
+			if (conn !== c) return; // replaced mid-flight: not our count
+			footerUnread = totalUnread;
+		} catch {
+			return; // transient failure: keep the last known count
+		}
+		refreshFooter();
+	}
+
 	function installFooter(ui: { setFooter(factory: unknown): void }): void {
 		ui.setFooter((
 			tui: { requestRender(force?: boolean): void },
@@ -381,6 +410,7 @@ export default function (pi: ExtensionAPI) {
 				footerData,
 				theme,
 				() => (conn?.connected ? conn.address : null),
+				() => (conn?.connected ? footerUnread : null),
 			);
 		});
 	}
@@ -539,6 +569,8 @@ export default function (pi: ExtensionAPI) {
 
 	/** Notify hook: hold while busy (flushed at turn_end), debounce while idle. */
 	function handleNotify(unread: number): void {
+		footerUnread = unread; // authoritative: the daemon's own count
+		refreshFooter();
 		if (!interactive) return;
 		pendingUnread = unread;
 		if (!busy) scheduleIdleFlush();
@@ -752,6 +784,7 @@ export default function (pi: ExtensionAPI) {
 				onConnected: () => {
 					activateTools(true);
 					refreshFooter();
+					void refreshUnread(); // initial badge count
 					// clear the pending release ONLY when the daemon acked it
 					// (welcome.released === true). An old daemon that ignores
 					// the release field must leave it pending so the next
@@ -763,6 +796,7 @@ export default function (pi: ExtensionAPI) {
 				},
 				onDisconnected: () => {
 					activateTools(false);
+					footerUnread = null; // no badge while disconnected
 					refreshFooter();
 				},
 			},
@@ -1439,6 +1473,7 @@ export default function (pi: ExtensionAPI) {
 					const own = { project: c.mailbox.project!, session: c.mailboxId };
 					const ref = parseMailRef(readId, own);
 					const mail = await c.mailbox.read(ref);
+					if (mail) void refreshUnread(); // reading own mail marks it read
 					if (!mail) {
 						ctx.ui.notify(`mailbox: mail ${readId} not found`, "warning");
 					} else {
@@ -1646,6 +1681,7 @@ ${formatMailList(mails)}${more}`,
 			const ref = parseMailRef(params.mail, own);
 			const mail = await c.mailbox.read(ref);
 			if (!mail) throw new Error(`mail ${params.mail} not found`);
+			void refreshUnread(); // reading own mail marks it read
 			return {
 				content: [{ type: "text", text: formatMail(mail, ref) }],
 				details: { mail, ref },
