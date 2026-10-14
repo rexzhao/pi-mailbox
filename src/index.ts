@@ -38,10 +38,12 @@ import {
 import { findLiveAgentPane, wakeOfflineSession } from "./herdr.ts";
 import type { MailRecord, MailRef, SessionInfo } from "./protocol.ts";
 import {
+	MailboxConnectOutputSchema,
 	MailboxListOutputSchema,
 	MailboxReadOutputSchema,
 	MailboxSentOutputSchema,
 	MailboxSessionsOutputSchema,
+	MailCountsSchema,
 } from "./protocol.ts";
 
 const TOOL_NAMES = ["mailbox_list", "mailbox_read", "mailbox_send", "mailbox_reply", "mailbox_sessions"] as const;
@@ -873,17 +875,44 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	async function statusSummary(c: MailboxConnection): Promise<string> {
+	/**
+	 * Status snapshot for connect results: built once from one connection
+	 * (passed explicitly — never re-read from `conn` across an await), with
+	 * text rendered from the structure so the two cannot diverge.
+	 * `mails` is NOT wrapped: an inbox failure propagates and fails the whole
+	 * connect call — announcing "connected" without mail counts misleads
+	 * (deliberate asymmetry with the best-effort sessions query).
+	 */
+	interface ConnectionStatus {
+		address: string;
+		mails: Static<typeof MailCountsSchema>;
+		// null when the sessions query failed; counted from the same
+		// SessionInfo.online field the sessions tool exposes
+		onlineClients: number | null;
+	}
+
+	async function connectionStatus(c: MailboxConnection): Promise<ConnectionStatus> {
+		const address = c.address;
+		if (address === null) throw new Error("mailbox: connection has no address (not registered)");
 		const { total, totalUnread } = await c.mailbox.inbox();
-		const identity = `as ${c.address}`;
-		let onlinePart = "";
+		let onlineClients: number | null = null;
 		try {
-			const online = (await c.mailbox.sessions()).filter((s) => s.online).length;
-			onlinePart = `, ${online} clients online`;
+			onlineClients = (await c.mailbox.sessions()).filter((s) => s.online).length;
 		} catch {
-			// best-effort; keep the mail counts when the sessions query fails
+			// best-effort: keep the mail counts, report null (not 0)
 		}
-		return `${identity}: ${total} mails (${totalUnread} unread)${onlinePart}`;
+		return { address, mails: { total, unread: totalUnread }, onlineClients };
+	}
+
+	/** Render a ConnectionStatus as the historical summary text (byte-identical). */
+	function renderStatus(s: ConnectionStatus): string {
+		const identity = `as ${s.address}`;
+		const onlinePart = s.onlineClients === null ? "" : `, ${s.onlineClients} clients online`;
+		return `${identity}: ${s.mails.total} mails (${s.mails.unread} unread)${onlinePart}`;
+	}
+
+	async function statusSummary(c: MailboxConnection): Promise<string> {
+		return renderStatus(await connectionStatus(c));
 	}
 
 	// -----------------------------------------------------------------------
@@ -1468,6 +1497,7 @@ ${formatMailList(mails)}${more}`,
 		// default exposure (direct, active): the model must see this tool so it
 		// can enable the mailbox on its own; it is not part of TOOL_NAMES, so
 		// activation toggling never withdraws it
+		outputSchema: MailboxConnectOutputSchema,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			if (params.as !== undefined && !validMailboxName(params.as.toLowerCase())) {
 				throw new Error(
@@ -1490,10 +1520,21 @@ ${formatMailList(mails)}${more}`,
 				consumeForceGate();
 			}
 			if (conn?.connected && login === undefined) {
-				const summary = await statusSummary(conn);
+				// conn is read once here and passed explicitly: the builder must
+				// not re-read `conn` after its awaits (a reconnect in between
+				// would mix addresses/counts from different connections)
+				const status = await connectionStatus(conn);
 				return {
-					content: [{ type: "text", text: `mailbox already connected: ${summary}. ${ADDRESS_FORMAT_DOC}` }],
+					content: [
+						{ type: "text", text: `mailbox already connected: ${renderStatus(status)}. ${ADDRESS_FORMAT_DOC}` },
+					],
 					details: { alreadyConnected: true },
+					structuredContent: asStructured({
+						address: status.address,
+						alreadyConnected: true,
+						mails: status.mails,
+						onlineClients: status.onlineClients,
+					} satisfies Static<typeof MailboxConnectOutputSchema>),
 				};
 			}
 			// connect only if the daemon is already running; never spawn it
@@ -1505,15 +1546,21 @@ ${formatMailList(mails)}${more}`,
 			}
 			const connection = await startConnection(ctx, null, false, login);
 			if (login) storeLogin(login.as); // persist: resumes auto-login
-			const summary = await statusSummary(connection);
+			const status = await connectionStatus(connection);
 			return {
 				content: [
 					{
 						type: "text",
-						text: `mailbox connected: ${summary}. Your address: ${connection.address}. ${ADDRESS_FORMAT_DOC}`,
+						text: `mailbox connected: ${renderStatus(status)}. Your address: ${status.address}. ${ADDRESS_FORMAT_DOC}`,
 					},
 				],
 				details: { alreadyConnected: false },
+				structuredContent: asStructured({
+					address: status.address,
+					alreadyConnected: false,
+					mails: status.mails,
+					onlineClients: status.onlineClients,
+				} satisfies Static<typeof MailboxConnectOutputSchema>),
 			};
 		},
 	});

@@ -348,6 +348,10 @@ try {
 
 	const connected = await exec(connect, { as: "extsmoke" });
 	assert(/mailbox connected/.test(connected.content[0].text), "extension connects via mailbox_connect");
+	// fresh-connect path: structuredContent with alreadyConnected false
+	assert(connected.structuredContent.alreadyConnected === false, "connect fresh path: alreadyConnected false");
+	assert(/^extsmoke@/.test(connected.structuredContent.address), "connect fresh path: full address");
+	validate(connect, connected.structuredContent);
 
 	// empty mailbox: mails [] with totals, nextCursor key absent
 	let r = await exec(listTool, {});
@@ -408,6 +412,64 @@ try {
 		threw = true;
 	}
 	assert(threw, "send to unregistered target throws (error path, not empty success)");
+
+	// connect tool's structuredContent — both return paths plus the
+	// onlineClients null / inbox-throws decisions
+	const connectTool = registeredTools.get("mailbox_connect");
+	assert(connectTool.outputSchema !== undefined, "mailbox_connect declares outputSchema");
+
+	// fresh connect (already connected from the harness setup above): this
+	// call takes the already-connected short-circuit path
+	let cr = await exec(connectTool, {});
+	assert(cr.structuredContent.alreadyConnected === true, "connect short-circuit: alreadyConnected true");
+	assert(cr.structuredContent.address === sentRef.replace(/\/.*$/, ""), "connect short-circuit: full address");
+	assert(typeof cr.structuredContent.mails.total === "number" && typeof cr.structuredContent.mails.unread === "number", "connect: mail counts present");
+	assert(cr.structuredContent.onlineClients === 1, "connect: onlineClients counts self (isolated daemon)");
+	assert(/clients online/.test(cr.content[0].text), "connect text keeps the online clause");
+	validate(connectTool, cr.structuredContent);
+
+	// sessions query fails, inbox succeeds: onlineClients is PRESENT and null
+	// (never 0-on-failure), text drops the online clause (byte contract)
+	const { MailboxClient } = await import("../src/client.ts");
+	const realSessions = MailboxClient.prototype.sessions;
+	try {
+		MailboxClient.prototype.sessions = function () {
+			return Promise.reject(new Error("simulated sessions failure"));
+		};
+		cr = await exec(connectTool, {});
+	} finally {
+		MailboxClient.prototype.sessions = realSessions;
+	}
+	assert(cr.structuredContent.onlineClients === null, "connect on sessions failure: onlineClients null (not 0, not absent)");
+	assert("onlineClients" in cr.structuredContent, "connect on sessions failure: onlineClients key present");
+	assert(typeof cr.structuredContent.mails.total === "number", "connect on sessions failure: mail counts kept");
+	assert(!/clients online/.test(cr.content[0].text), "connect on sessions failure: text omits the online clause");
+	validate(connectTool, cr.structuredContent);
+
+	// sessions recovered: back to a count
+	cr = await exec(connectTool, {});
+	assert(cr.structuredContent.onlineClients === 1, "connect after recovery: onlineClients counts again");
+
+	// inbox failure: the whole call errors (deliberate — announcing
+	// "connected" without mail counts misleads), never a degraded result
+	const realInbox = MailboxClient.prototype.inbox;
+	try {
+		MailboxClient.prototype.inbox = function () {
+			return Promise.reject(new Error("simulated inbox failure"));
+		};
+		threw = false;
+		try {
+			await exec(connectTool, {});
+		} catch {
+			threw = true;
+		}
+	} finally {
+		MailboxClient.prototype.inbox = realInbox;
+	}
+	assert(threw, "connect on inbox failure throws (no degraded structuredContent)");
+	// restore sanity: the real inbox works again
+	cr = await exec(connectTool, {});
+	assert(typeof cr.structuredContent.mails.total === "number", "connect after inbox restore: counts again");
 } finally {
 	// the daemon is detached and holds the lock file in the temp home; stop
 	// it via the pid recorded in the registry so cleanup can remove the dir
@@ -431,3 +493,7 @@ try {
 	}
 }
 console.log("\nall smoke tests passed");
+// the daemon is detached and section 13 drives the real extension, so live
+// reconnect/wake timers can keep the loop alive after the last assertion:
+// the run must end here rather than waiting on an idle event loop.
+process.exit(0);

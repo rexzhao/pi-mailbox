@@ -295,6 +295,23 @@ export const MailboxSessionsOutputSchema = Type.Object({
 	sessions: Type.Array(SessionInfoSchema),
 });
 
+/** Mail counts for status summaries (connect results). */
+export const MailCountsSchema = Type.Object({
+	total: Type.Integer(),
+	unread: Type.Integer(),
+});
+
+export const MailboxConnectOutputSchema = Type.Object({
+	/** This connection's full "session@project" address. */
+	address: Type.String(),
+	alreadyConnected: Type.Boolean(),
+	mails: MailCountsSchema,
+	// null when the sessions query failed — never flattened to 0 (a script
+	// would conclude "no peers online" and take a wrong branch), never
+	// omitted. The text renders the failure as an omitted clause.
+	onlineClients: Type.Union([Type.Integer(), Type.Null()]),
+});
+
 // Compile-time drift guards (bidirectional assignability; never read at
 // runtime). Changing a wire interface without its schema — or vice versa —
 // fails `npm run check` here, because nothing validates structuredContent
