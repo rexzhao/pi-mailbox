@@ -7,26 +7,40 @@
  */
 
 /** Identity of an agent session: project id + session id (short base36 ids; see daemon.ts for the scheme). */
-export interface AgentRef {
+export type AgentRef = {
 	project: string;
 	session: string;
-}
+};
 
-/** Pointer to a mail: project + owner session + mail id. Knowing the triple is the capability to read it. */
-export interface MailRef extends AgentRef {
+/**
+ * Pointer to a mail: project + owner session + mail id. Knowing the triple is the capability to read it.
+ * Spelled out (not AgentRef & {...}) and declared as a type alias so instances
+ * satisfy pi's JsonValue (implicit index signature): these records are passed
+ * as tool `structuredContent` unchanged.
+ */
+export type MailRef = {
+	project: string;
+	session: string;
 	mail: string;
-}
+};
 
-/** Immutable mail record. The owner is implied by which session file it lives in. */
-export interface MailRecord {
+/**
+ * Immutable mail record. The owner is implied by which session file it lives in.
+ * A type alias (not an interface) so instances satisfy pi's JsonValue: they are
+ * passed as tool `structuredContent` unchanged.
+ */
+export type MailRecord = {
 	id: string;
 	from: AgentRef;
 	subject: string;
 	body: string;
-	refs: MailRef[];
+	// The daemon has no omitempty on refs and converts empty to nil, so the
+	// wire form is an array or JSON null (never a missing key).
+	refs: MailRef[] | null;
 	createdAt: string;
+	// *string daemon-side: null for unread, never missing.
 	readAt: string | null;
-}
+};
 
 // ---------------------------------------------------------------------------
 // client -> server
@@ -143,7 +157,11 @@ export interface PongMsg {
 	instanceId: string;
 }
 
-export interface SessionInfo {
+/**
+ * A session's listing entry. A type alias (not an interface) so instances
+ * satisfy pi's JsonValue: they are passed as tool `structuredContent` unchanged.
+ */
+export type SessionInfo = {
 	session: string;
 	/** Owning project id, so listings render full session@project addresses. */
 	project?: string;
@@ -156,7 +174,7 @@ export interface SessionInfo {
 	tags?: string[];
 	/** Full key/value meta map. */
 	meta?: Record<string, string>;
-}
+};
 
 export interface SessionsReply {
 	t: "sessions";
@@ -205,6 +223,98 @@ export interface NotifyMsg {
 	t: "notify";
 	unread: number;
 }
+
+// ---------------------------------------------------------------------------
+// output schemas (TypeBox)
+//
+// Declared as `outputSchema` by the mailbox tools so codemode scripts receive
+// typed `structuredContent` instead of parsing the text content. pi does not
+// validate structuredContent against the schema at runtime — the schema is a
+// declaration to programmatic callers — so the drift guards at the bottom of
+// this section bind each schema to its wire interface at compile time.
+// ---------------------------------------------------------------------------
+
+import { type Static, Type } from "typebox";
+
+export const AgentRefSchema = Type.Object({
+	project: Type.String(),
+	session: Type.String(),
+});
+
+export const MailRefSchema = Type.Object({
+	...AgentRefSchema.properties,
+	mail: Type.String(),
+});
+
+export const MailRecordSchema = Type.Object({
+	id: Type.String(),
+	from: AgentRefSchema,
+	subject: Type.String(),
+	body: Type.String(),
+	// nullable, not optional: the daemon marshals a nil slice as JSON null
+	refs: Type.Union([Type.Array(MailRefSchema), Type.Null()]),
+	createdAt: Type.String(),
+	// nullable, not optional: *string daemon-side
+	readAt: Type.Union([Type.String(), Type.Null()]),
+});
+
+// open by design: `meta` carries evolving system keys (_host, _model, _pi,
+// _platform, ...), so a closed shape would force a schema edit per key
+export const SessionInfoSchema = Type.Object({
+	session: Type.String(),
+	online: Type.Boolean(),
+	project: Type.Optional(Type.String()),
+	agent: Type.Optional(Type.String()),
+	name: Type.Optional(Type.String()),
+	tags: Type.Optional(Type.Array(Type.String())),
+	meta: Type.Optional(Type.Record(Type.String(), Type.String())),
+});
+
+// tool result shapes (the structuredContent of each mailbox tool)
+export const MailboxListOutputSchema = Type.Object({
+	mails: Type.Array(MailRecordSchema),
+	total: Type.Integer(),
+	totalUnread: Type.Integer(),
+	// absent at the end of pagination (omitempty daemon-side)
+	nextCursor: Type.Optional(Type.String()),
+});
+
+export const MailboxReadOutputSchema = Type.Object({
+	mail: MailRecordSchema,
+	// the resolved full "session@project/mail" ref (a bare id input is
+	// expanded to the caller's own mailbox; the owner cannot be inferred
+	// from `from`)
+	ref: Type.String(),
+});
+
+export const MailboxSentOutputSchema = Type.Object({
+	ref: Type.String(),
+});
+
+export const MailboxSessionsOutputSchema = Type.Object({
+	sessions: Type.Array(SessionInfoSchema),
+});
+
+// Compile-time drift guards (bidirectional assignability; never read at
+// runtime). Changing a wire interface without its schema — or vice versa —
+// fails `npm run check` here, because nothing validates structuredContent
+// against outputSchema when the tools run.
+const _agentRefGuardA: AgentRef = null as unknown as Static<typeof AgentRefSchema>;
+const _agentRefGuardB: Static<typeof AgentRefSchema> = null as unknown as AgentRef;
+const _mailRefGuardA: MailRef = null as unknown as Static<typeof MailRefSchema>;
+const _mailRefGuardB: Static<typeof MailRefSchema> = null as unknown as MailRef;
+const _mailRecordGuardA: MailRecord = null as unknown as Static<typeof MailRecordSchema>;
+const _mailRecordGuardB: Static<typeof MailRecordSchema> = null as unknown as MailRecord;
+const _sessionInfoGuardA: SessionInfo = null as unknown as Static<typeof SessionInfoSchema>;
+const _sessionInfoGuardB: Static<typeof SessionInfoSchema> = null as unknown as SessionInfo;
+void _agentRefGuardA;
+void _agentRefGuardB;
+void _mailRefGuardA;
+void _mailRefGuardB;
+void _mailRecordGuardA;
+void _mailRecordGuardB;
+void _sessionInfoGuardA;
+void _sessionInfoGuardB;
 
 export type ServerMsg =
 	| WelcomeMsg

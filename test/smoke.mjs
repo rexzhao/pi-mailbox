@@ -296,6 +296,118 @@ try {
 	assert(shortA !== deriveSessionId("agent-b", "sessA"), "different agents must derive different session ids");
 	const { readHostId } = await import("../src/daemon.ts");
 	assert(/^[0-9a-f]{16}$/.test(await readHostId()), "host id must be 16 hex chars");
+
+	// 13. extension tool harness: every mailbox tool must declare outputSchema
+	// and return structuredContent that VALIDATES against it (pi does not
+	// validate at runtime, so this is the only automated check of the declared
+	// shapes). The tools are driven for real against this daemon through a
+	// mock pi API; the extension's own mailbox_connect establishes the
+	// connection (named login required in this project).
+	const registeredTools = new Map();
+	const recordedEntries = [];
+	const piMock = {
+		registerTool: (t) => registeredTools.set(t.name, t),
+		registerCommand: () => {},
+		on: () => {},
+		appendEntry: (type, data) => recordedEntries.push({ type, data }),
+		getActiveTools: () => [],
+		setActiveTools: () => {},
+		getSessionName: () => "smoke-extension-agent",
+		sendUserMessage: () => {},
+	};
+	const extension = (await import("../src/index.ts")).default;
+	extension(piMock);
+	const toolNames = ["mailbox_list", "mailbox_read", "mailbox_send", "mailbox_reply", "mailbox_sessions"];
+	for (const name of toolNames) {
+		assert(registeredTools.has(name), `tool registered: ${name}`);
+		assert(registeredTools.get(name).outputSchema !== undefined, `${name} declares outputSchema`);
+	}
+	const fakeCtx = {
+		ui: { notify() {} },
+		sessionManager: {
+			getSessionId: () => "smoke-ext-session-id",
+			getCwd: () => projectDir,
+			getSessionDir: () => join(projectDir, ".pi", "sessions", "smoke-ext"),
+			getEntries: () => recordedEntries,
+		},
+		model: { id: "smoke-model", provider: "smoke-prov" },
+	};
+	const { Validator } = await import("typebox/compile");
+	const validate = (tool, value) => {
+		const errors = new Validator({}, tool.outputSchema).Errors(value);
+		assert(errors.length === 0, `${tool.name} structuredContent matches outputSchema${errors.length ? `: ${JSON.stringify(errors[0])}` : ""}`);
+	};
+	const exec = (tool, params) => tool.execute("smoke", params, undefined, undefined, fakeCtx);
+
+	const connect = registeredTools.get("mailbox_connect");
+	const listTool = registeredTools.get("mailbox_list");
+	const readTool = registeredTools.get("mailbox_read");
+	const sendTool = registeredTools.get("mailbox_send");
+	const replyTool = registeredTools.get("mailbox_reply");
+	const sessionsTool = registeredTools.get("mailbox_sessions");
+
+	const connected = await exec(connect, { as: "extsmoke" });
+	assert(/mailbox connected/.test(connected.content[0].text), "extension connects via mailbox_connect");
+
+	// empty mailbox: mails [] with totals, nextCursor key absent
+	let r = await exec(listTool, {});
+	assert(Array.isArray(r.structuredContent.mails) && r.structuredContent.mails.length === 0, "list empty: mails []");
+	assert(r.structuredContent.total === 0 && r.structuredContent.totalUnread === 0, "list empty: totals 0");
+	assert(!("nextCursor" in r.structuredContent), "list empty: nextCursor key absent at end of pagination");
+	validate(listTool, r.structuredContent);
+
+	// sessions: own named mailbox online, online is boolean
+	r = await exec(sessionsTool, {});
+	const own = r.structuredContent.sessions.find((s) => s.session === "extsmoke");
+	assert(own !== undefined && own.online === true, "sessions includes own named mailbox, online");
+	validate(sessionsTool, r.structuredContent);
+
+	// send to self: ref is the full session@project/mail form
+	r = await exec(sendTool, { address: "extsmoke", subject: "structured content test", body: "machine-readable" });
+	const sentRef = r.structuredContent.ref;
+	assert(/^extsmoke@[^/]+\/.+/.test(sentRef), `send structuredContent ref is full form: ${sentRef}`);
+	validate(sendTool, r.structuredContent);
+
+	// list with the mail: unread readAt null, refs null (daemon nil), totalUnread 1
+	r = await exec(listTool, {});
+	assert(r.structuredContent.mails.length === 1, "list after send: 1 mail");
+	assert(r.structuredContent.totalUnread === 1, "list after send: totalUnread 1");
+	assert(r.structuredContent.mails[0].readAt === null, "unread mail readAt is null");
+	assert(Array.isArray(r.structuredContent.mails[0].refs) && r.structuredContent.mails[0].refs.length === 0, "mail with no refs has refs [] (schema also tolerates null)");
+	validate(listTool, r.structuredContent);
+
+	// read by BARE id: ref is the resolved full ref (not the input param)
+	const mailId = r.structuredContent.mails[0].id;
+	r = await exec(readTool, { mail: mailId });
+	assert(r.structuredContent.ref === sentRef, `read ref is resolved full ref: ${r.structuredContent.ref}`);
+	assert(typeof r.structuredContent.mail.readAt === "string", "own mail marked read (readAt string)");
+	validate(readTool, r.structuredContent);
+
+	// reply: a new mail ref
+	r = await exec(replyTool, { mail: sentRef, body: "re: machine-readable" });
+	assert(r.structuredContent.ref.startsWith("extsmoke@") && r.structuredContent.ref !== sentRef, "reply ref is a new mail");
+	validate(replyTool, r.structuredContent);
+
+	// pagination branch: >limit mails yields a present nextCursor (string)
+	for (let i = 0; i < 20; i++) {
+		await exec(sendTool, { address: "extsmoke", subject: `bulk ${i}`, body: "x" });
+	}
+	r = await exec(listTool, {});
+	assert(typeof r.structuredContent.nextCursor === "string" && r.structuredContent.nextCursor.length > 0, "list with more pages: nextCursor present");
+	assert(r.structuredContent.mails.length === 20, "list default page size 20");
+	validate(listTool, r.structuredContent);
+	r = await exec(listTool, { cursor: r.structuredContent.nextCursor });
+	assert(!("nextCursor" in r.structuredContent), "list last page: nextCursor key absent");
+	validate(listTool, r.structuredContent);
+
+	// error path stays an error: unregistered target throws (no empty-success)
+	let threw = false;
+	try {
+		await exec(sendTool, { address: "never-registered-session", subject: "x" });
+	} catch {
+		threw = true;
+	}
+	assert(threw, "send to unregistered target throws (error path, not empty success)");
 } finally {
 	// the daemon is detached and holds the lock file in the temp home; stop
 	// it via the pid recorded in the registry so cleanup can remove the dir

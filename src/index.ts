@@ -25,7 +25,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { readdirSync } from "node:fs";
 import { hostname, platform } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
-import { Type } from "typebox";
+import { type Static, Type } from "typebox";
 import { isFatalLoginError, MailboxConnection, MailboxError, type RemoteTarget } from "./client.ts";
 import {
 	connectLocalDaemonIfRunning,
@@ -37,6 +37,12 @@ import {
 } from "./daemon.ts";
 import { findLiveAgentPane, wakeOfflineSession } from "./herdr.ts";
 import type { MailRecord, MailRef, SessionInfo } from "./protocol.ts";
+import {
+	MailboxListOutputSchema,
+	MailboxReadOutputSchema,
+	MailboxSentOutputSchema,
+	MailboxSessionsOutputSchema,
+} from "./protocol.ts";
 
 const TOOL_NAMES = ["mailbox_list", "mailbox_read", "mailbox_send", "mailbox_reply", "mailbox_sessions"] as const;
 
@@ -269,6 +275,20 @@ function formatSessions(sessions: SessionInfo[], self?: { project: string; sessi
 		.join("\n");
 }
 
+/** Local structural clone of pi's JsonValue (AgentToolResult.structuredContent). */
+type JsonValue = null | boolean | number | string | readonly JsonValue[] | { [key: string]: JsonValue };
+
+/**
+ * Identity cast for structuredContent: the values are runtime-parsed wire
+ * records plus strings (JSON by construction), but their static types use
+ * optional/nullable fields that an index-signature type cannot express.
+ * The shapes themselves stay compile-time bound to the output schemas by
+ * the drift guards in protocol.ts.
+ */
+function asStructured(value: unknown): JsonValue {
+	return value as JsonValue;
+}
+
 function formatMail(mail: MailRecord, ref?: MailRef): string {
 	const lines = [
 		`subject: ${mail.subject}`,
@@ -279,7 +299,7 @@ function formatMail(mail: MailRecord, ref?: MailRef): string {
 	if (ref) {
 		lines.push(`ref:     ${formatMailRef(ref)}`);
 	}
-	if ((mail.refs ?? []).length > 0) {
+	if (mail.refs !== null && mail.refs.length > 0) {
 		lines.push(`refs:    ${mail.refs.map((r) => `${r.session}@${r.project}/${r.mail}`).join(", ")}`);
 	}
 	lines.push("", mail.body);
@@ -1517,8 +1537,9 @@ ${formatMailList(mails)}${more}`,
 			cursor: Type.Optional(Type.String({ description: "Continuation token from a previous mailbox_list result" })),
 		}),
 		exposure: "deferred",
+		outputSchema: MailboxListOutputSchema,
 		async execute(_toolCallId, params) {
-			const { mails, nextCursor } = await requireConnection().mailbox.inbox(
+			const { mails, nextCursor, total, totalUnread } = await requireConnection().mailbox.inbox(
 				{ unreadOnly: params.unreadOnly, since: params.since },
 				{ limit: params.limit, cursor: params.cursor },
 			);
@@ -1526,6 +1547,15 @@ ${formatMailList(mails)}${more}`,
 			return {
 				content: [{ type: "text", text: formatMailList(mails) + more }],
 				details: { mails, nextCursor },
+				// nextCursor omitted (not undefined) at the end of pagination so the
+				// serialized form matches the schema exactly; `satisfies` binds the
+				// literal to the declared schema at compile time (a renamed key
+				// fails tsc, closing the gap the identity cast alone would leave)
+				structuredContent: asStructured(
+					(nextCursor
+						? { mails, nextCursor, total, totalUnread }
+						: { mails, total, totalUnread }) satisfies Static<typeof MailboxListOutputSchema>,
+				),
 			};
 		},
 	});
@@ -1542,6 +1572,7 @@ ${formatMailList(mails)}${more}`,
 			mail: Type.String({ description: "Mail reference 'session@project/mail'; a bare mail id means your own mailbox" }),
 		}),
 		exposure: "deferred",
+		outputSchema: MailboxReadOutputSchema,
 		async execute(_toolCallId, params) {
 			const c = requireConnection();
 			const own = { project: c.mailbox.project!, session: c.mailboxId };
@@ -1551,6 +1582,11 @@ ${formatMailList(mails)}${more}`,
 			return {
 				content: [{ type: "text", text: formatMail(mail, ref) }],
 				details: { mail, ref },
+				// the resolved full ref (a bare id input was expanded to own)
+				structuredContent: asStructured({
+					mail,
+					ref: formatMailRef(ref),
+				} satisfies Static<typeof MailboxReadOutputSchema>),
 			};
 		},
 	});
@@ -1590,6 +1626,7 @@ ${formatMailList(mails)}${more}`,
 			),
 		}),
 		exposure: "deferred",
+		outputSchema: MailboxSentOutputSchema,
 		async execute(_toolCallId, params) {
 			const c = requireConnection();
 			const own = { project: c.mailbox.project!, session: c.mailboxId };
@@ -1600,6 +1637,9 @@ ${formatMailList(mails)}${more}`,
 			return {
 				content: [{ type: "text", text: `sent: ${formatMailRef(ref)}${wakeNote}` }],
 				details: { ref },
+				structuredContent: asStructured({
+					ref: formatMailRef(ref),
+				} satisfies Static<typeof MailboxSentOutputSchema>),
 			};
 		},
 	});
@@ -1625,6 +1665,7 @@ ${formatMailList(mails)}${more}`,
 			),
 		}),
 		exposure: "deferred",
+		outputSchema: MailboxSentOutputSchema,
 		async execute(_toolCallId, params) {
 			const c = requireConnection();
 			const own = { project: c.mailbox.project!, session: c.mailboxId };
@@ -1639,6 +1680,9 @@ ${formatMailList(mails)}${more}`,
 			return {
 				content: [{ type: "text", text: `replied: ${formatMailRef(sent)}${wakeNote}` }],
 				details: { ref: sent },
+				structuredContent: asStructured({
+					ref: formatMailRef(sent),
+				} satisfies Static<typeof MailboxSentOutputSchema>),
 			};
 		},
 	});
@@ -1657,6 +1701,7 @@ ${formatMailList(mails)}${more}`,
 			includeOffline: Type.Optional(Type.Boolean({ description: "Also list offline (registered but disconnected) sessions" })),
 		}),
 		exposure: "deferred",
+		outputSchema: MailboxSessionsOutputSchema,
 		async execute(_toolCallId, params) {
 			const c = requireConnection();
 			const sessions = await c.mailbox.sessions(params.includeOffline);
@@ -1665,6 +1710,9 @@ ${formatMailList(mails)}${more}`,
 					{ type: "text", text: formatSessions(sessions, { project: c.mailbox.project!, session: c.mailboxId }) },
 				],
 				details: { sessions },
+				structuredContent: asStructured({
+					sessions,
+				} satisfies Static<typeof MailboxSessionsOutputSchema>),
 			};
 		},
 	});
