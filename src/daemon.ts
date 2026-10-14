@@ -174,7 +174,7 @@ export async function resolveLocalDaemon(): Promise<LocalEndpoint> {
 export async function fetchSessionsViaApi(
 	/** Own project id + absolute root: a freshly spawned daemon has no project in memory, so the API loads it on demand (local mode only; no mailbox is created). */
 	project?: { id: string; root: string },
-): Promise<Array<Pick<SessionInfo, "session" | "project" | "online" | "meta">>> {
+): Promise<SessionInfo[]> {
 	const endpoint = await resolveLocalDaemon();
 	// local-mode daemon: loopback only by construction
 	const query = new URLSearchParams({ includeOffline: "1" });
@@ -186,7 +186,7 @@ export async function fetchSessionsViaApi(
 		signal: AbortSignal.timeout(5_000),
 	});
 	if (!resp.ok) throw new Error(`daemon HTTP ${resp.status}`);
-	const body = (await resp.json()) as { sessions?: Array<Pick<SessionInfo, "session" | "project" | "online" | "meta">> };
+	const body = (await resp.json()) as { sessions?: SessionInfo[] };
 	return body.sessions ?? [];
 }
 

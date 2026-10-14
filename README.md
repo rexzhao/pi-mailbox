@@ -147,7 +147,10 @@ below.
 - `/mailbox list [client [all]|mail]` — list online sessions, all
   mailboxes (with `all`, including offline ones marked `-`; the own
   session is marked `(you)`), or this session's mail (default: mail,
-  same as `/mailbox`)
+  same as `/mailbox`). The client listing also works while NOT logged
+  in (read-only view through the daemon's HTTP API, no mailbox created;
+  like resume, it may start the daemon to do so; `(you)` is omitted
+  then)
 - `/mailbox name <name>` — set this session's display name (persists across
   reconnects; a name set once is not overwritten by later registration
   defaults)

@@ -725,6 +725,34 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
+			if (arg === "list client" || arg === "list client all") {
+				try {
+					const includeOffline = arg === "list client all";
+					let sessions: SessionInfo[];
+					let self: { project: string; session: string } | undefined;
+					if (conn?.connected) {
+						sessions = await conn.mailbox.sessions(includeOffline);
+						self = { project: conn.mailbox.project!, session: conn.mailboxId };
+					} else {
+						// read-only HTTP API: the listing works without a
+						// mailbox of one's own — a fresh, not-yet-logged-in
+						// session can still browse names
+						const projectRoot = ctx.sessionManager.getCwd();
+						const projectId = await deriveProjectId(projectRoot);
+						sessions = (await fetchSessionsViaApi({ id: projectId, root: projectRoot })).filter(
+							(s) => s.project === projectId && (includeOffline || s.online),
+						);
+					}
+					const online = sessions.filter((s) => s.online).length;
+					const scope = includeOffline ? `${online} online / ${sessions.length} total` : `${online} online`;
+					const note = conn?.connected ? "" : " (not connected — read-only view; /mailbox to connect)";
+					ctx.ui.notify(`mailbox: ${scope}${note}\n${formatSessions(sessions, self)}`, "info");
+				} catch (err) {
+					ctx.ui.notify(`mailbox: ${err instanceof Error ? err.message : String(err)}`, "error");
+				}
+				return;
+			}
+
 			if (arg === "login" || arg.startsWith("login ")) {
 				const rest = arg.slice(5).trim();
 				if (!rest) {
@@ -895,9 +923,7 @@ export default function (pi: ExtensionAPI) {
 				arg === "tag" ||
 				arg === "meta" ||
 				arg === "list" ||
-				arg === "list mail" ||
-				arg === "list client" ||
-				arg === "list client all"
+				arg === "list mail"
 			) {
 				// show metadata / sessions / inbox below; `list` defaults to mail
 			} else if (arg !== "") {
@@ -935,17 +961,6 @@ export default function (pi: ExtensionAPI) {
 								.join(", ")
 						: `unset ${metaUpdate.unset!.join(", ")}`;
 					ctx.ui.notify(`mailbox: ${desc}`, "info");
-					return;
-				}
-				if (arg === "list client" || arg === "list client all") {
-					const sessions = await c.mailbox.sessions(arg === "list client all");
-					const online = sessions.filter((s) => s.online).length;
-					const scope =
-						arg === "list client all" ? `${online} online / ${sessions.length} total` : `${online} online`;
-					ctx.ui.notify(
-						`mailbox: ${scope}\n${formatSessions(sessions, { project: c.mailbox.project!, session: c.mailboxId })}`,
-						"info",
-					);
 					return;
 				}
 				if (arg === "name" || arg === "tag" || arg === "meta") {
