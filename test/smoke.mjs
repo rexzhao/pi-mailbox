@@ -304,10 +304,11 @@ try {
 	// mock pi API; the extension's own mailbox_connect establishes the
 	// connection (named login required in this project).
 	const registeredTools = new Map();
+	const registeredCommands = new Map();
 	const recordedEntries = [];
 	const piMock = {
 		registerTool: (t) => registeredTools.set(t.name, t),
-		registerCommand: () => {},
+		registerCommand: (name, def) => registeredCommands.set(name, def),
 		on: () => {},
 		appendEntry: (type, data) => recordedEntries.push({ type, data }),
 		getActiveTools: () => [],
@@ -317,6 +318,17 @@ try {
 	};
 	const extension = (await import("../src/index.ts")).default;
 	extension(piMock);
+	const cmdNotifies = [];
+	const cmdCtx = (entries = []) => ({
+		ui: { notify: (msg, kind) => cmdNotifies.push({ msg, kind }) },
+		sessionManager: {
+			getSessionId: () => "smoke-cmd-session",
+			getCwd: () => projectDir,
+			getSessionDir: () => join(projectDir, ".pi", "sessions", "smoke-cmd"),
+			getEntries: () => entries,
+		},
+	});
+	const runCommand = (args, ctx) => registeredCommands.get("mailbox").handler(args, ctx);
 	const toolNames = ["mailbox_list", "mailbox_read", "mailbox_send", "mailbox_reply", "mailbox_sessions"];
 	for (const name of toolNames) {
 		assert(registeredTools.has(name), `tool registered: ${name}`);
@@ -338,6 +350,16 @@ try {
 		assert(errors.length === 0, `${tool.name} structuredContent matches outputSchema${errors.length ? `: ${JSON.stringify(errors[0])}` : ""}`);
 	};
 	const exec = (tool, params) => tool.execute("smoke", params, undefined, undefined, fakeCtx);
+
+	// start service with NO stored login: starts the service without
+	// demanding a login (the named-account policy applies to CONNECTING,
+	// not to bringing the daemon up)
+	await runCommand("start service", cmdCtx());
+	const startNoLogin = cmdNotifies[cmdNotifies.length - 1];
+	assert(
+		startNoLogin && /service (started|already running)/.test(startNoLogin.msg) && /login <name>/.test(startNoLogin.msg),
+		`start service without login manages the service: ${startNoLogin?.msg}`,
+	);
 
 	const connect = registeredTools.get("mailbox_connect");
 	const listTool = registeredTools.get("mailbox_list");
@@ -470,6 +492,19 @@ try {
 	// restore sanity: the real inbox works again
 	cr = await exec(connectTool, {});
 	assert(typeof cr.structuredContent.mails.total === "number", "connect after inbox restore: counts again");
+
+	// restart service with NO stored login (fresh ctx): restarts the daemon
+	// without demanding a login, leaves the session disconnected
+	cmdNotifies.length = 0;
+	await runCommand("restart service", cmdCtx());
+	const restartNoLogin = cmdNotifies[cmdNotifies.length - 1];
+	assert(
+		restartNoLogin && /service restarted/.test(restartNoLogin.msg) && /login <name>/.test(restartNoLogin.msg),
+		`restart service without login restarts the service: ${restartNoLogin?.msg}`,
+	);
+	// liveness: the daemon must actually be back up after the restart
+	const { connectLocalDaemonIfRunning } = await import("../src/daemon.ts");
+	assert((await connectLocalDaemonIfRunning()) !== null, "daemon is live after restart service");
 } finally {
 	// the daemon is detached and holds the lock file in the temp home; stop
 	// it via the pid recorded in the registry so cleanup can remove the dir

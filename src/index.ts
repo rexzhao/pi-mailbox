@@ -34,6 +34,7 @@ import {
 	fetchSessionsViaApi,
 	findMailboxdBinary,
 	mailboxTotalsViaApi,
+	resolveLocalDaemon,
 } from "./daemon.ts";
 import { findLiveAgentPane, wakeOfflineSession } from "./herdr.ts";
 import type { MailRecord, MailRef, SessionInfo } from "./protocol.ts";
@@ -930,8 +931,20 @@ export default function (pi: ExtensionAPI) {
 						ctx.ui.notify("mailbox: already connected", "info");
 						return;
 					}
-					const connection = await startConnection(ctx, null, true);
-					ctx.ui.notify(`mailbox: connected as ${connection.address}`, "info");
+					// starting the SERVICE is decoupled from the named-account
+					// connect policy: a session that never logged in can still
+					// bring the daemon up. Connect (and spawn) only when a
+					// stored binding exists; otherwise just ensure the daemon
+					// runs and say how to connect.
+					if (readStoredLogin(ctx)) {
+						const connection = await startConnection(ctx, null, true);
+						ctx.ui.notify(`mailbox: connected as ${connection.address}`, "info");
+					} else if (await connectLocalDaemonIfRunning()) {
+						ctx.ui.notify("mailbox: service already running — run /mailbox login <name> to connect", "info");
+					} else {
+						await resolveLocalDaemon(); // spawn; login-free
+						ctx.ui.notify("mailbox: service started — run /mailbox login <name> to connect", "info");
+					}
 				} catch (err) {
 					ctx.ui.notify(`mailbox: ${err instanceof Error ? err.message : String(err)}`, "error");
 				}
@@ -1303,8 +1316,15 @@ export default function (pi: ExtensionAPI) {
 					}
 					// wait briefly for the daemon to release the lock
 					await new Promise((resolve) => setTimeout(resolve, 500));
-					const connection = await startConnection(ctx, null, true);
-					ctx.ui.notify(`mailbox: restarted as ${connection.address}`, "info");
+					// same decoupling as start service: restart the daemon
+					// regardless of login; reconnect only with a stored binding
+					if (readStoredLogin(ctx)) {
+						const connection = await startConnection(ctx, null, true);
+						ctx.ui.notify(`mailbox: restarted as ${connection.address}`, "info");
+					} else {
+						await resolveLocalDaemon();
+						ctx.ui.notify("mailbox: service restarted — run /mailbox login <name> to connect", "info");
+					}
 				} catch (err) {
 					ctx.ui.notify(`mailbox: ${err instanceof Error ? err.message : String(err)}`, "error");
 				}
