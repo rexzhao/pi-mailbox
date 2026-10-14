@@ -52,6 +52,8 @@ export interface HelloMsg {
 	tags?: string;
 	/** Take over a name whose holder is OFFLINE and foreign. Online holders are never displaced; free names and same-origin reconnects never need it. */
 	force?: boolean;
+	/** Deferred release (model E): the name whose _holds binding to clear on this hello. Independent of `as`. */
+	release?: string;
 	/** Full pi session id; persisted as the `_origin` system meta for the lifecycle GC. */
 	origin?: string;
 	agent: string;
@@ -126,6 +128,8 @@ export interface WelcomeMsg {
 	project: string;
 	/** Effective mailbox id (the login name when hello carried `as`, else the session id); clients verify their login was applied. */
 	mailbox?: string;
+	/** True when the hello carried a release field and the daemon processed it. Any welcome = delivered (applied or no-op). */
+	released?: boolean;
 	instanceId: string;
 	protocolVersion?: number;
 	/** This session's full meta after the registration merge. */

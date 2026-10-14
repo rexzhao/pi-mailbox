@@ -41,7 +41,7 @@ type conn struct {
 	closed  bool
 
 	project *Project
-	session string
+	session string // mailbox id: the login name, or the derived session id
 	agent   string
 }
 
@@ -96,6 +96,8 @@ func (d *Daemon) httpHandler() http.Handler {
 		defer func() {
 			d.removeConn(c)
 			if c.project != nil {
+				// Only unregister if THIS connection is still the registered
+				// one (a replacement re-hello may have taken over).
 				c.project.Unregister(c.session, c)
 			}
 			c.close()
@@ -194,18 +196,47 @@ func (c *conn) handleHello(rid int, data []byte) error {
 	var claim *Claim
 	mailboxID := msg.Session
 	var proj *Project
-	if msg.As != "" {
-		if err := ValidateMailboxName(msg.As); err != nil {
-			ridCopy := rid
-			c.send(ErrorReply{T: "error", Rid: &ridCopy, Code: "bad_name", Message: err.Error()})
-			return nil
-		}
+
+	// deferred release (model E): a logout that could not reach the daemon
+	// rides this hello. MUST run before the session_bound check below —
+	// otherwise {as: Y, release: X} is rejected for holding X before the
+	// release can clear it. Independent of `as`: rides nameless hellos,
+	// re-claims, and different-name claims alike. Only the caller's own
+	// derived record is touched, only _holds (never _origin, never the
+	// named record), and only if _holds still matches the exact name.
+	// "Nothing to release" is still a DELIVERED answer (the client clears
+	// its pending flag on any welcome, not just on "applied").
+	if msg.Release != "" {
 		var err error
 		proj, err = c.daemon.project(msg)
 		if err != nil {
 			ridCopy := rid
 			c.send(ErrorReply{T: "error", Rid: &ridCopy, Code: "bad_project", Message: err.Error()})
 			return nil
+		}
+		if holds := proj.Store.HoldsOf(msg.Session); holds == msg.Release {
+			if err := proj.Store.BindName(msg.Session, msg.Origin, ""); err != nil {
+				log.Printf("deferred release of %s from %s: %v", msg.Release, msg.Session, err)
+			} else {
+				log.Printf("deferred release: %s released %s", msg.Session, msg.Release)
+			}
+		}
+	}
+
+	if msg.As != "" {
+		if err := ValidateMailboxName(msg.As); err != nil {
+			ridCopy := rid
+			c.send(ErrorReply{T: "error", Rid: &ridCopy, Code: "bad_name", Message: err.Error()})
+			return nil
+		}
+		if proj == nil {
+			var err error
+			proj, err = c.daemon.project(msg)
+			if err != nil {
+				ridCopy := rid
+				c.send(ErrorReply{T: "error", Rid: &ridCopy, Code: "bad_project", Message: err.Error()})
+				return nil
+			}
 		}
 		// one name per session: the reverse marker (_holds on the
 		// session's own derived record) makes this O(1). A stale marker
@@ -222,6 +253,7 @@ func (c *conn) handleHello(rid int, data []byte) error {
 				log.Printf("heal _holds for %s: %v", msg.Session, err)
 			}
 		}
+		// online holder of the name that is not ours: needs a confirmed force
 		if online := proj.LookupOnline(msg.As); online != nil && online != c {
 			storedOrigin := proj.Store.OriginOf(msg.As)
 			if msg.Origin == "" || storedOrigin == "" || msg.Origin != storedOrigin {
@@ -249,7 +281,7 @@ func (c *conn) handleHello(rid int, data []byte) error {
 			}
 		}
 	}
-	if mailboxID == webUserSession {
+	if msg.Session == webUserSession {
 		ridCopy := rid
 		c.send(ErrorReply{T: "error", Rid: &ridCopy, Code: "bad_hello", Message: "session id 'user' is reserved for the web UI"})
 		return nil
@@ -303,6 +335,7 @@ func (c *conn) handleHello(rid int, data []byte) error {
 		Rid:             rid,
 		Project:         msg.Project,
 		Mailbox:         mailboxID,
+		Released:        msg.Release != "",
 		InstanceID:      c.daemon.instanceID,
 		ProtocolVersion: ProtocolVersion,
 		Meta:            welcomeMeta,

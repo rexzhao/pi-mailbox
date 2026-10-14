@@ -546,6 +546,37 @@ export default function (pi: ExtensionAPI) {
 		return null;
 	}
 
+	const RELEASE_ENTRY = "pi-mailbox-release";
+
+	/** Read the pending release name (the last pi-mailbox-release entry wins). */
+	function readPendingRelease(ctx: {
+		sessionManager: { getEntries?(): Array<{ type: string; customType?: string; data?: unknown }> };
+	}): string | null {
+		try {
+			const entries = ctx.sessionManager.getEntries?.() ?? [];
+			for (let i = entries.length - 1; i >= 0; i--) {
+				const e = entries[i];
+				if (e.type === "custom" && e.customType === RELEASE_ENTRY) {
+					const data = e.data as { name?: string | null } | undefined | null;
+					return data?.name ?? null;
+				}
+			}
+		} catch {
+			// entries unavailable: the release rides the next hello that can read them
+		}
+		return null;
+	}
+
+	/** Record (or clear, name=null) a pending release in the session file. */
+	function storePendingRelease(name: string | null): void {
+		try {
+			const api = pi as { appendEntry?: (t: string, data?: unknown) => void };
+			api.appendEntry?.(RELEASE_ENTRY, { name });
+		} catch {
+			// best-effort: without the entry, the release only works while connected
+		}
+	}
+
 	/** Persist (or clear, name=null) the login binding in the session file. */
 	function storeLogin(name: string | null): void {
 		try {
@@ -679,6 +710,7 @@ export default function (pi: ExtensionAPI) {
 		const fromBinding = login === undefined;
 		const effectiveLogin: { as: string; tags?: string; force?: boolean } | null =
 			login != null ? { ...login } : readStoredLogin(ctx);
+		const pendingRelease = readPendingRelease(ctx);
 		if (!effectiveLogin) {
 			throw new Error("mailbox: no login for this session — use /mailbox login <name> first (or mailbox_connect with as='<name>')");
 		}
@@ -697,6 +729,14 @@ export default function (pi: ExtensionAPI) {
 				onConnected: () => {
 					activateTools(true);
 					refreshFooter();
+					// clear the pending release ONLY when the daemon acked it
+					// (welcome.released === true). An old daemon that ignores
+					// the release field must leave it pending so the next
+					// hello retries — clearing on any welcome re-enters the
+					// original bug through the ack path.
+					if (conn?.releaseAcked === true) {
+						if (readPendingRelease(ctx) !== null) storePendingRelease(null);
+					}
 				},
 				onDisconnected: () => {
 					activateTools(false);
@@ -705,6 +745,7 @@ export default function (pi: ExtensionAPI) {
 			},
 			{
 				login: effectiveLogin ?? undefined,
+				release: pendingRelease ?? undefined,
 				helloMeta,
 				canSpawn,
 			},
@@ -1141,12 +1182,20 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (arg === "logout" || arg === "off") {
+				// model E: record the pending release so it rides the next
+				// hello (survives daemon downtime and pi restarts); the
+				// daemon clears _holds when it processes the hello
+				const releasedName = conn?.connected ? conn.mailboxId : readStoredLogin(ctx)?.as;
+				if (releasedName) storePendingRelease(releasedName);
 				await conn?.stop();
 				conn = null;
 				activateTools(false);
 				refreshFooter(); // stop() suppresses onDisconnected: refresh manually
 				storeLogin(null); // release the binding: resumes no longer auto-login
-				ctx.ui.notify("mailbox: logged out (daemon keeps running)", "info");
+				ctx.ui.notify(
+					`mailbox: logged out (daemon keeps running)${releasedName ? ` — '${releasedName}' will be released on next connect` : ""}`,
+					"info",
+				);
 				return;
 			}
 

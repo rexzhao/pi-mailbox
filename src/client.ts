@@ -53,6 +53,8 @@ export class MailboxClient {
 	project: string | null = null;
 	/** This session's full meta as of the last successful registration (from the welcome reply). */
 	sessionMeta: Record<string, string> | null = null;
+	/** True when the welcome acked a hello-carried release (released === true). */
+	releaseAcked = false;
 	/** Set when closed on purpose; suppresses reconnect handling in the caller. */
 	closed = false;
 
@@ -65,6 +67,7 @@ export class MailboxClient {
 		as?: string;
 		tags?: string;
 		force?: boolean;
+		release?: string;
 		origin?: string;
 		agent: string;
 		token?: string;
@@ -83,6 +86,7 @@ export class MailboxClient {
 			as?: string;
 			tags?: string;
 			force?: boolean;
+			release?: string;
 			origin?: string;
 			agent: string;
 			token?: string;
@@ -172,7 +176,7 @@ export class MailboxClient {
 	}
 
 	private handshake(): Promise<void> {
-		return this.request<{ project: string; mailbox?: string; meta?: Record<string, string>; protocolVersion?: number }>({
+		return this.request<{ project: string; mailbox?: string; released?: boolean; meta?: Record<string, string>; protocolVersion?: number }>({
 			t: "hello",
 			rid: this.nextRid++,
 			...this.hello,
@@ -203,6 +207,7 @@ export class MailboxClient {
 				}
 				this.project = reply.project;
 				this.sessionMeta = reply.meta ?? null;
+				this.releaseAcked = reply.released === true;
 			},
 			(err) => {
 				// close the socket on handshake failure so it is not leaked
@@ -308,6 +313,8 @@ export type ConnectionMode = "local" | "remote";
 export interface ConnectionOptions {
 	/** Named-mailbox login: claim this name instead of the derived session id. */
 	login?: { as: string; tags?: string; force?: boolean };
+	/** Deferred release (model E): the name whose _holds to clear on this hello. */
+	release?: string;
 	/** Registration-time meta defaults: system keys (`_`-prefixed) refresh on every connect; user keys apply only when absent. */
 	helloMeta?: Record<string, string>;
 	/** When true, the connection may spawn a new daemon when none is running. Only /mailbox start service sets this. */
@@ -454,6 +461,7 @@ export class MailboxConnection {
 			as?: string;
 			tags?: string;
 			force?: boolean;
+			release?: string;
 			origin: string;
 			agent: string;
 			token?: string;
@@ -464,6 +472,7 @@ export class MailboxConnection {
 			as: this.options.login?.as,
 			tags: this.options.login?.tags,
 			force: this.options.login?.force,
+			release: this.options.release,
 			origin: this.session,
 			agent: this.agent,
 			meta: this.options.helloMeta,
@@ -527,6 +536,11 @@ export class MailboxConnection {
 		);
 		await client.connect();
 		this.client = client;
+	}
+
+	/** True when the current client's welcome acked a release. */
+	get releaseAcked(): boolean {
+		return this.client?.releaseAcked ?? false;
 	}
 
 	/** Connected client; throws when disconnected. */

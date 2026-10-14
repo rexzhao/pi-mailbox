@@ -41,8 +41,14 @@ below.
   3-32 chars `[a-z][a-z0-9_-]` (never a derived-id shape, `user` reserved).
   A session may hold at most one name: the daemon tracks the reverse
   binding (`_holds` on the session's own record, O(1) at login) and rejects
-  a second name with `session_bound`; a stale reverse binding (the name was
-  taken over or deleted) self-heals against the authoritative `_origin`.
+  a second name with `session_bound`. The binding is released by
+  `/mailbox logout` (model E): the client records a pending release that
+  rides the NEXT hello, surviving daemon downtime and pi restarts. The
+  daemon clears `_holds` on the caller's derived record only if it still
+  matches the released name — never `_origin` (the GC needs it), never the
+  named record. A stale reverse binding (the name was taken over or
+  deleted) self-heals against the authoritative `_origin`. The release is
+  client-asserted, same trust class as `force` within a project.
   The extension refuses nameless connections entirely: a session with no
   login gets "no login for this session" from every connect path — named
   accounts are the only identity.
@@ -169,7 +175,8 @@ below.
 - `/mailbox read <mailId>` — view one mail
 - `/mailbox login <name> [tags=a,b]` — log in to a named mailbox (persistent
   identity; tags overwrite when given, inherited when omitted)
-- `/mailbox logout` — log out: disconnect and clear the login binding
+- `/mailbox logout` — log out: disconnect, clear the login binding, and
+  record a pending daemon-side release that rides the next hello
   (`off` is an alias)
 - `/mailbox delete <name> [<name> ...]` — hard-delete mailboxes in this
   project (mails, meta, registration — irreversibly; local mode only, no

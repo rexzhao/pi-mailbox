@@ -179,9 +179,10 @@ func TestNamedMailboxLogin(t *testing.T) {
 		}
 	}
 
-	// 7. an offline foreign holder now requires a confirmed force: the
-	//    normal attempt is rejected, the forced retry takes over and
-	//    inherits mails and tags wholesale
+	// 7. an offline foreign holder requires a confirmed force: the normal
+	//    attempt is rejected, the forced retry takes over and inherits
+	//    mails and tags wholesale (the "forced B login after logout" is
+	//    actually a socket drop — the release path is 7b-release above)
 	a2.ws.Close(websocket.StatusNormalClosure, "")
 	time.Sleep(100 * time.Millisecond)
 	b2 := dialTest(t, port) // b's socket was closed by the step-3 rejection
@@ -242,6 +243,46 @@ func TestNamedMailboxLogin(t *testing.T) {
 		"agent": "agent-c", "as": "someother",
 	}); e["t"] != "welcome" {
 		t.Fatalf("forged _holds must be ignored (claim should succeed), got %v", e)
+	}
+
+	// 7b-release (model E): login A -> hello with release=A, as=B in ONE
+	// hello -> the release must clear _holds BEFORE session_bound runs,
+	// so the switch to B succeeds in a single round trip. The welcome
+	// must carry released=true.
+	if w := b2.request(map[string]interface{}{
+		"t": "hello", "rid": 20, "project": project, "projectRoot": projectRoot,
+		"sessionDir": sessionDir, "session": "shortbbbb", "origin": "originB",
+		"agent": "agent-b", "as": "post-release-name", "release": "reviewer",
+	}); w["t"] != "welcome" || w["mailbox"] != "post-release-name" {
+		t.Fatalf("release+switch in one hello should succeed, got %v", w)
+	} else if w["released"] != true {
+		t.Fatalf("welcome must carry released=true, got %v", w)
+	}
+	// switching to yet another name requires releasing the current one
+	// (model E: one name at a time, release-then-switch in ONE hello)
+	if w := b2.request(map[string]interface{}{
+		"t": "hello", "rid": 21, "project": project, "projectRoot": projectRoot,
+		"sessionDir": sessionDir, "session": "shortbbbb", "origin": "originB",
+		"agent": "agent-b", "as": "another-name", "release": "post-release-name",
+	}); w["t"] != "welcome" || w["mailbox"] != "another-name" {
+		t.Fatalf("release+switch again should succeed, got %v", w)
+	}
+	// release of a name we don't hold: delivered (welcome.released=true)
+	// but a no-op (no error, binding unchanged)
+	if w := b2.request(map[string]interface{}{
+		"t": "hello", "rid": 22, "project": project, "projectRoot": projectRoot,
+		"sessionDir": sessionDir, "session": "shortbbbb", "origin": "originB",
+		"agent": "agent-b", "as": "another-name", "release": "not-ours",
+	}); w["t"] != "welcome" || w["released"] != true {
+		t.Fatalf("no-op release should still welcome with released=true, got %v", w)
+	}
+	// release riding a nameless hello (no `as`): still processes
+	if w := b2.request(map[string]interface{}{
+		"t": "hello", "rid": 23, "project": project, "projectRoot": projectRoot,
+		"sessionDir": sessionDir, "session": "shortbbbb", "origin": "originB",
+		"agent": "agent-b", "release": "another-name",
+	}); w["t"] != "welcome" || w["released"] != true {
+		t.Fatalf("nameless hello with release should succeed, got %v", w)
 	}
 
 	// 7c. self-heal: the ORIGINAL holder (originA) lost "reviewer" to B

@@ -234,6 +234,18 @@ try {
 	});
 	await d1b.start();
 	assert((d1b.mailbox.sessionMeta ?? {}).tags === "review,urgent", "relogin inherits tags when none given");
+	// ack-based clearing: a welcome WITHOUT `released` (legacy daemon)
+	// must NOT clear the pending release — the client keeps it so the
+	// next hello retries against an updated daemon
+	const logD5 = { notify: [], connected: 0, disconnected: 0 };
+	const d5 = new MailboxConnection("local", projectDir, null, "sessD5", "agent-d", events(logD5), {
+		login: { as: "smoke-release-test" },
+		canSpawn: true,
+	});
+	await d5.start();
+	assert(d5.releaseAcked === false, "a hello without release must not set releaseAcked");
+	await d5.stop();
+
 	// (a held stored binding falling back to the derived identity is
 	// extension-level policy — covered by test/login-live-test.mjs)
 

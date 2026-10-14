@@ -45,6 +45,11 @@ type HelloMsg struct {
 	// Online holders are never displaced; same-origin reconnects and free
 	// names never need it. Strictly per-hello, never persisted.
 	Force bool `json:"force,omitempty"`
+	// Release carries the name whose _holds binding the caller is owed a
+	// release for (the daemon-side half of /mailbox logout, deferred to
+	// the next hello so it survives daemon downtime). Only the caller's
+	// own derived record is touched, and only if _holds still matches.
+	Release string `json:"release,omitempty"`
 	// Origin is the client's full session id (e.g. the pi session UUID);
 	// persisted as the _origin system meta, used by the lifecycle GC to
 	// match the client's session file. May be empty for non-pi agents.
@@ -142,7 +147,11 @@ type WelcomeMsg struct {
 	// Mailbox is the effective mailbox id the connection is keyed by
 	// (the login name when hello carried "as", else Session). Clients
 	// verify their login was applied by comparing against the expectation.
-	Mailbox         string            `json:"mailbox,omitempty"`
+	Mailbox string `json:"mailbox,omitempty"`
+	// Released is true when the hello carried a release field and the
+	// daemon processed it (applied or no-op). Any welcome means the
+	// release was delivered; the client clears its pending flag.
+	Released        bool              `json:"released,omitempty"`
 	InstanceID      string            `json:"instanceId"`
 	ProtocolVersion int               `json:"protocolVersion"`
 	Meta            map[string]string `json:"meta,omitempty"`
