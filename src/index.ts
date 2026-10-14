@@ -23,7 +23,7 @@ import { hostname, platform } from "node:os";
 import { join } from "node:path";
 import { Type } from "typebox";
 import { isFatalLoginError, MailboxConnection, MailboxError, type RemoteTarget } from "./client.ts";
-import { connectLocalDaemonIfRunning, findMailboxdBinary } from "./daemon.ts";
+import { connectLocalDaemonIfRunning, deriveProjectId, fetchSessionsViaApi, findMailboxdBinary } from "./daemon.ts";
 import { findLiveAgentPane, wakeOfflineSession } from "./herdr.ts";
 import type { MailRecord, MailRef, SessionInfo } from "./protocol.ts";
 
@@ -653,9 +653,12 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				try {
-					const c = requireConnection();
-					const sessions = await c.mailbox.sessions(true);
-					const info = sessions.find((s) => s.session === name);
+					// resolve via the daemon's read-only HTTP API: resume must
+					// not require this session to have a mailbox of its own
+					const projectRoot = ctx.sessionManager.getCwd();
+					const projectId = await deriveProjectId(projectRoot);
+					const sessions = await fetchSessionsViaApi({ id: projectId, root: projectRoot });
+					const info = sessions.find((s) => s.session === name && s.project === projectId);
 					if (!info) {
 						ctx.ui.notify(`mailbox: no such named mailbox '${name}' in this project`, "error");
 						return;

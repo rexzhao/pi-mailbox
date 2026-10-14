@@ -21,7 +21,7 @@ import { join, resolve } from "node:path";
 import { createHash, randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
-import { PROTOCOL_VERSION } from "./protocol.ts";
+import { PROTOCOL_VERSION, type SessionInfo } from "./protocol.ts";
 
 const PROBE_TIMEOUT_MS = 1_500;
 const SPAWN_WAIT_MS = 10_000;
@@ -162,6 +162,32 @@ export async function resolveLocalDaemon(): Promise<LocalEndpoint> {
 		}
 	}
 	throw new Error("mailboxd did not come up after spawning (see the daemon log)");
+}
+
+/**
+ * Fetch every session (incl. offline mailboxes) through the daemon's
+ * read-only HTTP API — the web UI's endpoint. Unlike a websocket hello,
+ * this creates NO mailbox for the caller, so identity-less flows (e.g.
+ * /mailbox resume resolving a name) can look names up without registering.
+ * Spawns the daemon when none is running (like /mailbox login).
+ */
+export async function fetchSessionsViaApi(
+	/** Own project id + absolute root: a freshly spawned daemon has no project in memory, so the API loads it on demand (local mode only; no mailbox is created). */
+	project?: { id: string; root: string },
+): Promise<Array<Pick<SessionInfo, "session" | "project" | "online" | "meta">>> {
+	const endpoint = await resolveLocalDaemon();
+	// local-mode daemon: loopback only by construction
+	const query = new URLSearchParams({ includeOffline: "1" });
+	if (project) {
+		query.set("project", project.id);
+		query.set("projectRoot", project.root);
+	}
+	const resp = await fetch(`http://127.0.0.1:${endpoint.port}/api/sessions?${query}`, {
+		signal: AbortSignal.timeout(5_000),
+	});
+	if (!resp.ok) throw new Error(`daemon HTTP ${resp.status}`);
+	const body = (await resp.json()) as { sessions?: Array<Pick<SessionInfo, "session" | "project" | "online" | "meta">> };
+	return body.sessions ?? [];
 }
 
 // ---------------------------------------------------------------------------

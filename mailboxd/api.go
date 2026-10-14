@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io/fs"
+	"log"
 	"net"
 	"net/http"
 	"sort"
@@ -154,6 +155,21 @@ func (d *Daemon) apiInfo(w http.ResponseWriter, _ *http.Request) {
 
 func (d *Daemon) apiSessions(w http.ResponseWriter, r *http.Request) {
 	includeOffline := r.URL.Query().Get("includeOffline") == "1"
+	// local mode: allow on-demand project loading, so identity-less
+	// lookups (e.g. pi's /mailbox resume) work against a freshly spawned
+	// daemon that no client has hello'd yet — the project's mailbox files
+	// exist on disk but are not registered in memory. Loading only builds
+	// the in-memory store from disk: no mailbox is created, nothing is
+	// registered. Remote mode never trusts client paths.
+	if !d.Remote {
+		if pid := r.URL.Query().Get("project"); pid != "" {
+			if root := r.URL.Query().Get("projectRoot"); root != "" && projectIDRe.MatchString(pid) {
+				if _, err := d.project(HelloMsg{Project: pid, ProjectRoot: root}); err != nil {
+					log.Printf("on-demand load of project %s: %v", pid, err)
+				}
+			}
+		}
+	}
 	d.mu.Lock()
 	projects := make([]*Project, 0, len(d.projects))
 	for _, p := range d.projects {

@@ -321,6 +321,18 @@ func (d *Daemon) project(msg HelloMsg) (*Project, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if p, ok := d.projects[msg.Project]; ok {
+		// fill in fields an earlier load may not have had: the read-only
+		// API can load a project on demand without a sessionDir, and the
+		// first real hello must still arm the lifecycle GC (and give the
+		// web UI its path) rather than hitting this early return forever
+		if !d.Remote {
+			if p.RootPath == "" && msg.ProjectRoot != "" {
+				p.RootPath = msg.ProjectRoot
+			}
+			if p.SessionDir == "" && msg.SessionDir != "" {
+				p.SessionDir = msg.SessionDir
+			}
+		}
 		return p, nil
 	}
 	var dir string

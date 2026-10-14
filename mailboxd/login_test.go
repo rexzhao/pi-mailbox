@@ -3,6 +3,10 @@ package main
 // Named-mailbox login tests: claim, exclusivity, inheritance, GC exemption.
 
 import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"testing"
@@ -38,6 +42,56 @@ func (c *testClient) helloLoginForce(rid int, project, root, sessionDir, short, 
 		msg["tags"] = tags
 	}
 	return c.request(msg)
+}
+
+// A freshly spawned daemon has no project in memory (projects register on
+// hello); /api/sessions must load one on demand in local mode so that
+// identity-less lookups (resume) see the on-disk mailboxes.
+func TestAPISessionsOnDemandProject(t *testing.T) {
+	tmp := t.TempDir()
+	projectRoot := filepath.Join(tmp, "proj")
+	mailDir := filepath.Join(projectRoot, ".pi", "mailbox")
+	os.MkdirAll(mailDir, 0o755)
+	// a pre-existing named mailbox on disk
+	st, err := NewStore(mailDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.HelloMerge("on-demand-name", "pi", "some-origin", map[string]string{}, &Claim{Name: "on-demand-name"}); err != nil {
+		t.Fatal(err)
+	}
+
+	port, stop := bootDaemon(t, tmp, "", false) // fresh daemon, no hello yet
+	defer stop()
+
+	httpGet := func(path string) map[string]interface{} {
+		resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d%s", port, path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var m map[string]interface{}
+		if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+
+	// without the params: the project is unknown, no sessions
+	if m := httpGet("/api/sessions?includeOffline=1"); len(m["sessions"].([]interface{})) != 0 {
+		t.Fatalf("fresh daemon should list no sessions, got %v", m)
+	}
+	// with project+projectRoot: loaded on demand, the mailbox is visible
+	q := "/api/sessions?includeOffline=1&project=ondemand-proj&projectRoot=" + url.QueryEscape(projectRoot)
+	m := httpGet(q)
+	sessions := m["sessions"].([]interface{})
+	if len(sessions) != 1 {
+		t.Fatalf("on-demand load should list the disk mailbox, got %v", m)
+	}
+	s := sessions[0].(map[string]interface{})
+	if s["session"] != "on-demand-name" || s["online"] != false {
+		t.Fatalf("unexpected session info: %v", s)
+	}
 }
 
 func TestNamedMailboxLogin(t *testing.T) {

@@ -161,9 +161,14 @@ below.
 - `/mailbox logout` — log out: disconnect and clear the login binding
   (`off` is an alias)
 - `/mailbox resume <name>` — switch THIS terminal to the named mailbox's
-  session in place (pi's switchSession). Fails when the name is unknown,
-  online (its holder runs elsewhere), or the session file is gone (claim it
-  with `/mailbox login <name> [--force]` instead); a live-but-disconnected
+  session in place (pi's switchSession). The name is resolved through the
+  daemon's read-only HTTP API, so the current session needs NO mailbox of
+  its own — a fresh session can resume directly without creating an
+  address. The lookup starts the daemon if none is running (like
+  /mailbox login) and asks it to load the project on demand, so it works
+  even against a freshly spawned daemon. Fails when the name is unknown,
+  online (its holder runs elsewhere), or the session file is gone (claim it with
+  `/mailbox login <name> [--force]` instead); a live-but-disconnected
   holder is detected through herdr when available. The switched-to session
   auto-logins through its stored binding.
 - `/mailbox start service` — connect (spawns the daemon if needed)
