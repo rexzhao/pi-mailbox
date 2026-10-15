@@ -509,6 +509,24 @@ try {
 	const { connectLocalDaemonIfRunning } = await import("../src/daemon.ts");
 	assert((await connectLocalDaemonIfRunning()) !== null, "daemon is live after restart service");
 
+	// identity rule is shipped with the mailbox: present in the namespace
+	// instructions (every tool registration), the mailbox_connect
+	// description, and the connect result text — a refactor cannot silently
+	// drop it without failing here
+	const IDENTITY_RULE = /mail from 'user' is your human operator/i;
+	assert(
+		IDENTITY_RULE.test(registeredTools.get("mailbox_list").namespace.instructions),
+		"identity rule present in the namespace instructions",
+	);
+	assert(
+		IDENTITY_RULE.test(registeredTools.get("mailbox_connect").description),
+		"identity rule present in the mailbox_connect description",
+	);
+	assert(
+		IDENTITY_RULE.test(connected.content[0].text),
+		"identity rule present in the connect result text",
+	);
+
 	// footer unread badge: fire the captured session_start (installs the
 	// footer), reconnect (binding auto-applies), render the component
 	const sessionStart = registeredEvents.get("session_start");
