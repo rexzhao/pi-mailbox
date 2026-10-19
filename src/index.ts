@@ -420,7 +420,16 @@ export default function (pi: ExtensionAPI) {
 	let shuttingDown = false;
 
 	pi.on("session_start", (event, ctx) => {
-		interactive = ctx.mode === "tui" || ctx.mode === "rpc";
+		// json is a pure event stream (stdout carries only JSON records consumed
+		// by a client), so injecting user messages is meaningless there; every
+		// other mode can receive sendUserMessage injections. Notably print
+		// (SDK hosts, bindExtensions({ mode: "print" })) DOES receive them:
+		// AgentSession.sendUserMessage -> prompt() starts a normal run when
+		// idle — headless services must still get new-mail notifications.
+		// Side effect: print hosts also silently auto-connect on resume now
+		// (autoConnect gates on interactive); a one-shot "pi -p" run connects,
+		// announces nothing unless mail arrives, and exits — harmless.
+		interactive = ctx.mode !== "json";
 		sessCtx = ctx;
 		installFooter(ctx.ui); // replaces the default footer with the address-aware one
 		refreshFooter();

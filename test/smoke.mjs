@@ -305,6 +305,7 @@ try {
 	// connection (named login required in this project).
 	const registeredTools = new Map();
 	const registeredCommands = new Map();
+	const sentUserMessages = [];
 	const recordedEntries = [];
 	const registeredEvents = new Map();
 	const piMock = {
@@ -317,7 +318,7 @@ try {
 		getActiveTools: () => [],
 		setActiveTools: () => {},
 		getSessionName: () => "smoke-extension-agent",
-		sendUserMessage: () => {},
+		sendUserMessage: (msg, opts) => sentUserMessages.push({ msg, opts }),
 	};
 	const extension = (await import("../src/index.ts")).default;
 	extension(piMock);
@@ -638,6 +639,56 @@ try {
 		RaceConn.prototype.start = realStart;
 	}
 	await holder.stop();
+
+	// interactive mode gate: print-mode SDK hosts MUST receive new-mail
+	// injections (sendUserMessage -> prompt()); json (pure event stream)
+	// MUST NOT. A peer named mailbox sends one mail per mode; polling
+	// covers the 300ms coalescing debounce.
+	const modeCtx = (mode) => ({
+		mode,
+		ui: { setFooter: () => {}, notify: () => {} },
+		sessionManager: {
+			getSessionId: () => "smoke-ext-session-id",
+			getCwd: () => projectDir,
+			getSessionDir: () => join(projectDir, ".pi", "sessions", "smoke-ext"),
+			getSessionName: () => "smoke-mode-agent",
+			getEntries: () => recordedEntries,
+		},
+	});
+	const extProject = connected.structuredContent.address.split("@")[1];
+	const peerLog = { notify: [], connected: 0, disconnected: 0 };
+	const peer = new RaceConn("local", projectDir, null, "mode-peer-sess", "mode-peer-agent", events(peerLog), {
+		login: { as: "mode-peer" },
+	});
+	await peer.start();
+	const peerSends = (subject) =>
+		peer.mailbox.sendMail({ project: extProject, session: "extsmoke" }, subject, "x");
+
+	// print: the injection MUST fire
+	await sessionStart({}, modeCtx("print"));
+	sentUserMessages.length = 0;
+	await peerSends("print-mode notify test");
+	let printInjected = false;
+	for (let i = 0; i < 40 && !printInjected; i++) {
+		await new Promise((r) => setTimeout(r, 100));
+		printInjected = sentUserMessages.some((s) => String(s.msg).includes("print-mode notify test"));
+	}
+	assert(printInjected, "print mode: new-mail injection reaches the host");
+	assert(
+		sentUserMessages.every((s) => s.opts?.deliverAs === "steer"),
+		"print mode: injections are steered",
+	);
+
+	// json: no injection (stdout stays a pure event stream)
+	await sessionStart({}, modeCtx("json"));
+	sentUserMessages.length = 0;
+	await peerSends("json-mode notify test");
+	await new Promise((r) => setTimeout(r, 1000));
+	assert(
+		sentUserMessages.length === 0,
+		"json mode: no injection (pure event stream)",
+	);
+	await peer.stop();
 } finally {
 	// the daemon is detached and holds the lock file in the temp home; stop
 	// it via the pid recorded in the registry so cleanup can remove the dir
