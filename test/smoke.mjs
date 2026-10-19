@@ -118,43 +118,63 @@ try {
 	assert(cInfo?.name === undefined && cInfo?.tags?.length === 2, "name unset, tags kept");
 	assert(c.mailbox.sessionMeta?.name === undefined, "sessionMeta kept in sync after unset");
 
-	// 6. offline delivery + offline listing + reconnect backfill
+	// 6. unnamed mailboxes are ephemeral: they die with the connection —
+	// no offline delivery, no offline listing. Named accounts keep both.
 	await c.stop();
+	let deadErr = null;
+	try {
+		await b.mailbox.sendMail({ project: a.mailbox.project, session: shortC }, "offline mail", "while away", []);
+	} catch (e) {
+		deadErr = e;
+	}
+	assert(deadErr && String(deadErr).includes("no_mailbox"), "send to a disconnected unnamed mailbox: no_mailbox");
+	const withOffline = await a.mailbox.sessions(true);
+	assert(!withOffline.some((s) => s.session === shortC), "disconnected unnamed mailbox not listed");
+
+	// named offline delivery + listing + reconnect backfill
+	const logD4 = { notify: [], connected: 0, disconnected: 0 };
+	const d4 = new MailboxConnection("local", projectDir, null, "sessD4", "agent-d4", events(logD4), {
+		login: { as: "smoke-offline" },
+	});
+	await d4.start();
+	await d4.stop();
 	const offlineRef = await b.mailbox.sendMail(
-		{ project: a.mailbox.project, session: shortC },
+		{ project: a.mailbox.project, session: "smoke-offline" },
 		"offline mail",
 		"while away",
 		[],
 	);
-	assert(offlineRef.session === shortC, "send to offline registered session accepted");
-	const withOffline = await a.mailbox.sessions(true);
-	const cOffline = withOffline.find((s) => s.session === shortC);
-	assert(cOffline && cOffline.online === false, "offline session listed with online=false");
-	assert(cOffline?.agent === "agent-c", "offline agent from _agent");
+	assert(offlineRef.session === "smoke-offline", "send to offline named mailbox accepted");
+	const withOffline2 = await a.mailbox.sessions(true);
+	const cOffline = withOffline2.find((s) => s.session === "smoke-offline");
+	assert(cOffline && cOffline.online === false, "offline named mailbox listed with online=false");
+	assert(cOffline?.agent === "agent-d4", "offline agent from _agent");
 	const onlineOnly = await a.mailbox.sessions();
-	assert(!onlineOnly.some((s) => s.session === shortC), "default listing omits offline");
+	assert(!onlineOnly.some((s) => s.session === "smoke-offline"), "default listing omits offline");
 
 	const logC2 = { notify: [], connected: 0, disconnected: 0 };
-	const c2 = new MailboxConnection("local", projectDir, null, "sessC", "agent-c", events(logC2));
+	const c2 = new MailboxConnection("local", projectDir, null, "sessD4", "agent-d4", events(logC2), {
+		login: { as: "smoke-offline" },
+	});
 	await c2.start();
 	const after = await c2.mailbox.inbox(undefined, { limit: 100 });
 	assert(after.mails.some((m) => m.subject === "offline mail"), "offline mail delivered on reconnect");
 	assert(logC2.notify.some((n) => n >= 1), "unread backfill on reconnect");
 
 	// 7. pagination + cursor semantics
-	for (let i = 0; i < 3; i++) {
-		await b.mailbox.sendMail({ project: a.mailbox.project, session: shortC }, `mail-${i}`, "x", []);
+	for (let i = 0; i < 4; i++) {
+		await b.mailbox.sendMail({ project: a.mailbox.project, session: "smoke-offline" }, `mail-${i}`, "x", []);
 	}
 	const page1 = await c2.mailbox.inbox(undefined, { limit: 2 });
 	assert(page1.mails.length === 2 && page1.nextCursor, "page 1 limited with cursor");
-	assert(page1.total === 5 && page1.totalUnread === 4, "mailbox-wide totals under pagination");
+	assert(page1.total === 5 && page1.totalUnread === 5, "mailbox-wide totals under pagination");
 	const page2 = await c2.mailbox.inbox(undefined, { limit: 2, cursor: page1.nextCursor });
 	assert(page2.mails.length === 2 && page2.nextCursor, "page 2 with cursor");
 	const page3 = await c2.mailbox.inbox(undefined, { limit: 2, cursor: page2.nextCursor });
 	assert(page3.mails.length === 1 && !page3.nextCursor, "page 3 is last");
 	const subjects = [...page1.mails, ...page2.mails, ...page3.mails].map((m) => m.subject);
 	assert(
-		JSON.stringify(subjects) === JSON.stringify(["mail-2", "mail-1", "mail-0", "offline mail", "hello"]),
+		JSON.stringify(subjects) === JSON.stringify(["mail-3", "mail-2", "mail-1", "mail-0", "offline mail"]),
 		"pagination: newest first, all mails exactly once",
 	);
 	let badCursorErr = null;
@@ -169,7 +189,7 @@ try {
 		"base64url",
 	);
 	const beyond = await c2.mailbox.inbox(undefined, { cursor: future });
-	assert(beyond.mails[0]?.subject === "mail-2", "future cursor returns strictly-older mails");
+	assert(beyond.mails[0]?.subject === "mail-3", "future cursor returns strictly-older mails");
 
 	// 8. send to never-registered session
 	let noMailboxErr = null;
@@ -181,15 +201,17 @@ try {
 	assert(noMailboxErr && String(noMailboxErr).includes("no_mailbox"), "never-registered target: no_mailbox");
 
 	// 9. user-set meta survives reconnect; hello defaults do not clobber
-	await c2.mailbox.setMeta({ set: { name: "manual-c", role: "worker" } });
+	// (on a NAMED mailbox — the persistent kind; name is claim-owned)
+	await c2.mailbox.setMeta({ set: { role: "worker" } });
 	await c2.stop();
 	const logC3 = { notify: [], connected: 0, disconnected: 0 };
-	const c3 = new MailboxConnection("local", projectDir, null, "sessC", "agent-c", events(logC3), {
-		helloMeta: { name: "auto-c", _model: "prov/m2", role: "boss" },
+	const c3 = new MailboxConnection("local", projectDir, null, "sessD4", "agent-d4", events(logC3), {
+		login: { as: "smoke-offline" },
+		helloMeta: { _model: "prov/m2", role: "boss" },
 	});
 	await c3.start();
 	const meta3 = c3.mailbox.sessionMeta ?? {};
-	assert(meta3.name === "manual-c", "user-set name survives reconnect");
+	assert(meta3.name === "smoke-offline", "claim name applies at login");
 	assert(meta3._model === "prov/m2", "system key refreshed on reconnect");
 	assert(meta3.role === "worker", "existing user key not clobbered by hello default");
 	await c3.stop();

@@ -263,50 +263,72 @@ func TestDaemonLocalFlow(t *testing.T) {
 		t.Fatalf("expected no_mailbox, got %v", m)
 	}
 
-	// offline delivery: B disconnects, A sends, B reconnects with backfill
+	// unnamed mailboxes are ephemeral: B disconnects and its mailbox DIES —
+	// sends to it now fail and it vanishes from offline listings
 	b.ws.Close(websocket.StatusNormalClosure, "")
 	time.Sleep(100 * time.Millisecond)
-	a.send(map[string]interface{}{
+	if m := a.request(map[string]interface{}{
 		"t": "send", "rid": 5,
 		"target":  map[string]string{"project": project, "session": "sessB"},
 		"subject": "offline mail", "body": "while away",
-	})
-	a.request(map[string]interface{}{"t": "ping", "rid": 98})
-
-	// offline listing: B is disconnected but registered
+	}); m["code"] != "no_mailbox" {
+		t.Fatalf("send to a disconnected unnamed mailbox should be no_mailbox, got %v", m)
+	}
 	sess2 := a.request(map[string]interface{}{"t": "sessions", "rid": 6, "includeOffline": true})
-	var bOffline map[string]interface{}
 	for _, s := range sess2["sessions"].([]interface{}) {
-		sm := s.(map[string]interface{})
-		if sm["session"] == "sessB" && !sm["online"].(bool) {
-			bOffline = sm
+		if s.(map[string]interface{})["session"] == "sessB" {
+			t.Fatalf("disconnected unnamed mailbox must not be listed: %v", sess2)
 		}
 	}
-	if bOffline == nil {
-		t.Fatalf("sessB not listed offline: %v", sess2)
+
+	// offline delivery still works for NAMED accounts: C claims a name,
+	// receives mail, disconnects; A sends; C reconnects with backfill
+	c1 := dialTest(t, port)
+	if w := c1.helloLogin(1, project, projectRoot, "", "sessC", "sessC-origin", "agent-c", "offlinetest", ""); w["t"] != "welcome" {
+		t.Fatalf("C welcome: %v", w)
 	}
-	if bOffline["agent"] != "agent-b" {
-		t.Fatalf("offline agent should come from _agent: %v", bOffline)
+	c1.ws.Close(websocket.StatusNormalClosure, "")
+	time.Sleep(100 * time.Millisecond)
+	if m := a.request(map[string]interface{}{
+		"t": "send", "rid": 7,
+		"target":  map[string]string{"project": project, "session": "offlinetest"},
+		"subject": "offline mail", "body": "while away",
+	}); m["t"] != "sent" {
+		t.Fatalf("offline send to a named mailbox failed: %v", m)
+	}
+	sess3 := a.request(map[string]interface{}{"t": "sessions", "rid": 8, "includeOffline": true})
+	var cOffline map[string]interface{}
+	for _, s := range sess3["sessions"].([]interface{}) {
+		sm := s.(map[string]interface{})
+		if sm["session"] == "offlinetest" && !sm["online"].(bool) {
+			cOffline = sm
+		}
+	}
+	if cOffline == nil {
+		t.Fatalf("named mailbox should be listed offline: %v", sess3)
+	}
+	if cOffline["agent"] != "agent-c" {
+		t.Fatalf("offline agent should come from _agent: %v", cOffline)
 	}
 
-	b2 := dialTest(t, port)
-	wb2 := b2.hello(1, project, projectRoot, "sessB", "agent-b", nil)
-	if wb2["t"] != "welcome" {
-		t.Fatalf("B reconnect welcome: %v", wb2)
+	c2 := dialTest(t, port)
+	if w := c2.helloLogin(1, project, projectRoot, "", "sessC", "sessC-origin", "agent-c", "offlinetest", ""); w["t"] != "welcome" {
+		t.Fatalf("C reconnect welcome: %v", w)
 	}
-	if n := b2.expectNotify(); n < 1 {
+	if n := c2.expectNotify(); n < 1 {
 		t.Fatalf("expected unread backfill, got %d", n)
 	}
-	inb3 := b2.request(map[string]interface{}{"t": "inbox", "rid": 2, "limit": 100})
+	inc3 := c2.request(map[string]interface{}{"t": "inbox", "rid": 2, "limit": 100})
 	found := false
-	for _, m := range inb3["mails"].([]interface{}) {
+	for _, m := range inc3["mails"].([]interface{}) {
 		if m.(map[string]interface{})["subject"] == "offline mail" {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatalf("offline mail missing: %v", inb3)
+		t.Fatalf("offline mail missing: %v", inc3)
 	}
+	c2.ws.Close(websocket.StatusNormalClosure, "")
 
 }
 
@@ -327,8 +349,11 @@ func TestDaemonRemoteTokenAndCentralStorage(t *testing.T) {
 	// hello with token and no projectRoot (remote semantics): project state
 	// uses the central data dir
 	c2 := dialTest(t, port)
+	// named login: unnamed mailboxes are ephemeral (no file), so the
+	// central-storage placement is asserted on the named mailbox's file
 	msg := map[string]interface{}{
-		"t": "hello", "rid": 1, "project": "proj-x", "session": "s1", "agent": "a", "token": "sekrit",
+		"t": "hello", "rid": 1, "project": "proj-x", "session": "s1", "origin": "sess-s1",
+		"agent": "a", "token": "sekrit", "as": "storetest",
 	}
 	w := c2.request(msg)
 	if w["t"] != "welcome" {
@@ -336,8 +361,12 @@ func TestDaemonRemoteTokenAndCentralStorage(t *testing.T) {
 	}
 	// the store directory must be under the data dir, not a client path
 	dataDir := filepath.Join(tmp, "data")
-	if _, err := os.Stat(filepath.Join(dataDir, "proj-x", "s1.jsonl")); err != nil {
+	if _, err := os.Stat(filepath.Join(dataDir, "proj-x", "storetest.jsonl")); err != nil {
 		t.Fatalf("central storage file missing: %v", err)
+	}
+	// and the unnamed record must NOT have landed anywhere
+	if _, err := os.Stat(filepath.Join(dataDir, "proj-x", "s1.jsonl")); !os.IsNotExist(err) {
+		t.Fatalf("unnamed record must not be persisted: %v", err)
 	}
 }
 
@@ -546,34 +575,33 @@ func TestCleanupOriginGC(t *testing.T) {
 	defer stop()
 	const project = "proj-gc"
 
-	// register with short ids + origins
+	// unnamed mailboxes are ephemeral now, so the lifecycle GC only ever
+	// sees LEGACY derived files: hand-craft two (mail + _origin meta), the
+	// way the pre-ephemeral daemon wrote them
+	legacy := func(short, origin string) {
+		t.Helper()
+		mailDir := filepath.Join(projectRoot, ".pi", "mailbox")
+		line1 := fmt.Sprintf(`{"t":"send","mail":{"id":"m-%s","from":{"project":"%s","session":"sender"},"subject":"x","body":"y","refs":null,"createdAt":"2026-01-01T00:00:00.000000000Z"}}`, short, project)
+		line2 := fmt.Sprintf(`{"t":"meta","set":{"_origin":"%s","_agent":"agent-%s"}}`, origin, short)
+		if err := os.WriteFile(filepath.Join(mailDir, short+".jsonl"), []byte(line1+"\n"+line2+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	legacy("shortaaaa", "sessA")
+	legacy("shortbbbb", "sessB")
+	// B's pi session file is gone: B's mailbox is an orphan
+	os.Remove(filepath.Join(sessionDir, "2026-01-01_sessB.jsonl"))
+
+	// A connects (its legacy file survives: A is online)
 	a := dialTest(t, port)
 	if w := a.helloShort(1, project, projectRoot, sessionDir, "shortaaaa", "sessA", "agent-a", nil); w["t"] != "welcome" {
 		t.Fatalf("A welcome: %v", w)
 	}
-	b := dialTest(t, port)
-	if w := b.helloShort(1, project, projectRoot, sessionDir, "shortbbbb", "sessB", "agent-b", nil); w["t"] != "welcome" {
-		t.Fatalf("B welcome: %v", w)
-	}
+	// B never connects, and its pi session file is gone: an orphan
 
-	// a mail into B's mailbox so the file exists with content
-	if m := a.request(map[string]interface{}{
-		"t": "send", "rid": 2,
-		"target":  map[string]string{"project": project, "session": "shortbbbb"},
-		"subject": "x", "body": "y",
-	}); m["t"] != "sent" {
-		t.Fatalf("send failed: %v", m)
-	}
-
-	// (origin visibility is exercised functionally by the cleanup below)
-
-	// delete sessB's pi session file and disconnect B: B's mailbox becomes
-	// an orphan (online sessions are never collected)
-	os.Remove(filepath.Join(sessionDir, "2026-01-01_sessB.jsonl"))
-	b.ws.Close(websocket.StatusNormalClosure, "")
-	time.Sleep(100 * time.Millisecond)
-
-	// on-demand cleanup: B's mailbox must move to .trash, A's must stay
+	// delete sessB's pi session file (already absent in this fixture — the
+	// orphan condition) and run the on-demand cleanup: B's mailbox must
+	// move to .trash, A's must stay
 	cm := a.request(map[string]interface{}{"t": "cleanup", "rid": 4})
 	if cm["t"] != "cleanup" {
 		t.Fatalf("cleanup failed: %v", cm)
@@ -1252,12 +1280,16 @@ func TestHTTPDelete(t *testing.T) {
 
 	a := dialTest(t, port)
 	a.hello(1, "p", root, "s1", "a", nil)
+	// named login: unnamed mailboxes are ephemeral (no file, die with the
+	// connection), so deletion targets a named account
 	b := dialTest(t, port)
-	b.hello(1, "p", root, "s2", "b", map[string]string{"name": "bee"})
+	if w := b.helloLogin(1, "p", root, sessionDir, "s2", "sess-s2-origin", "b", "bee", ""); w["t"] != "welcome" {
+		t.Fatalf("B welcome: %v", w)
+	}
 	// mail into b's mailbox
 	if m := a.request(map[string]interface{}{
 		"t": "send", "rid": 2,
-		"target":  map[string]string{"project": "p", "session": "s2"},
+		"target":  map[string]string{"project": "p", "session": "bee"},
 		"subject": "to be deleted", "body": "x",
 	}); m["t"] != "sent" {
 		t.Fatalf("send failed: %v", m)
@@ -1276,18 +1308,19 @@ func TestHTTPDelete(t *testing.T) {
 	}
 
 	// online session: refused
-	if resp, body := post("/api/delete", map[string]any{"address": "s2@p"}); resp.StatusCode != 409 {
+	if resp, body := post("/api/delete", map[string]any{"address": "bee@p"}); resp.StatusCode != 409 {
 		t.Fatalf("online session should be 409: %v %v", resp.StatusCode, body)
 	}
 
 	// disconnect b, then delete
 	b.ws.Close(websocket.StatusNormalClosure, "")
 	time.Sleep(100 * time.Millisecond)
-	if resp, body := post("/api/delete", map[string]any{"address": "s2@p"}); resp.StatusCode != 200 {
+	if resp, body := post("/api/delete", map[string]any{"address": "bee@p"}); resp.StatusCode != 200 {
 		t.Fatalf("delete: %v %v", resp.StatusCode, body)
 	}
 
-	// the session is gone from listings and the API
+	// the session is gone from listings and the API (the disconnected
+	// derived record s2 is gone too: unnamed mailboxes die with the conn)
 	resp, err := http.Get(base + "/api/sessions?includeOffline=1")
 	if err != nil {
 		t.Fatal(err)
@@ -1296,27 +1329,27 @@ func TestHTTPDelete(t *testing.T) {
 	json.NewDecoder(resp.Body).Decode(&sb)
 	resp.Body.Close()
 	for _, s := range sb["sessions"].([]interface{}) {
-		if s.(map[string]interface{})["session"] == "s2" {
-			t.Fatalf("s2 should be gone from listings: %v", sb)
+		id := s.(map[string]interface{})["session"]
+		if id == "bee" || id == "s2" {
+			t.Fatalf("%v should be gone from listings: %v", id, sb)
 		}
 	}
-	if resp, _ := post("/api/delete", map[string]any{"address": "s2@p"}); resp.StatusCode != 404 {
+	if resp, _ := post("/api/delete", map[string]any{"address": "bee@p"}); resp.StatusCode != 404 {
 		t.Fatalf("second delete should 404: %v", resp.StatusCode)
 	}
 
 	// the mailbox file is gone; the pi session file is untouched
-	if _, err := os.Stat(filepath.Join(root, ".pi", "mailbox", "s2.jsonl")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(root, ".pi", "mailbox", "bee.jsonl")); !os.IsNotExist(err) {
 		t.Fatalf("mailbox file should be gone: %v", err)
 	}
 	if _, err := os.Stat(piSession); err != nil {
 		t.Fatalf("pi session file must not be touched: %v", err)
 	}
 
-	// s1 is untouched and a ref to the deleted mail no longer resolves
-	// (the referencing mail becomes an orphan root in thread listings)
+	// a send to the deleted name no longer resolves
 	if m := a.request(map[string]interface{}{
 		"t": "send", "rid": 3,
-		"target":  map[string]string{"project": "p", "session": "s2"},
+		"target":  map[string]string{"project": "p", "session": "bee"},
 		"subject": "after delete", "body": "x",
 	}); m["code"] != "no_mailbox" {
 		t.Fatalf("send to deleted mailbox should fail: %v", m)

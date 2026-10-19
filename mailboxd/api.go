@@ -403,7 +403,7 @@ func (d *Daemon) buildMailGraph() *mailGraph {
 		children: map[string][]*threadEntry{},
 	}
 	for _, p := range projects {
-		for _, sid := range p.Store.ListSessionIDs() {
+		for _, sid := range p.Store.AllSessionIDs() {
 			mails, err := p.Store.Inbox(sid)
 			if err != nil {
 				continue

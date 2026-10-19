@@ -43,6 +43,9 @@ type conn struct {
 	project *Project
 	session string // mailbox id: the login name, or the derived session id
 	agent   string
+	// nameless: this connection registered without a name claim — its
+	// (derived) mailbox is ephemeral and dies with the connection
+	nameless bool
 }
 
 func (c *conn) isOpen() bool {
@@ -97,8 +100,11 @@ func (d *Daemon) httpHandler() http.Handler {
 			d.removeConn(c)
 			if c.project != nil {
 				// Only unregister if THIS connection is still the registered
-				// one (a replacement re-hello may have taken over).
-				c.project.Unregister(c.session, c)
+				// one (a replacement re-hello may have taken over). An unnamed
+				// (derived) mailbox dies with its connection: drop the state.
+				if c.project.Unregister(c.session, c) && c.nameless {
+					c.project.Store.DropState(c.session)
+				}
 			}
 			c.close()
 		}()
@@ -298,20 +304,31 @@ func (c *conn) handleHello(rid int, data []byte) error {
 	}
 
 	// same ws re-helloing as a different session: drop the old registration
+	// (an unnamed mailbox being switched away from dies here too)
 	if c.project != nil && c.session != "" && c.session != mailboxID {
-		c.project.Unregister(c.session, c)
+		if c.project.Unregister(c.session, c) && c.nameless {
+			c.project.Store.DropState(c.session)
+		}
 	}
 	c.project = proj
 	c.session = mailboxID
 	c.agent = msg.Agent
+	c.nameless = claim == nil
 	if old := proj.Register(mailboxID, c); old != nil && old != c {
 		// same session reconnected elsewhere: replace the old connection
 		old.close()
 	}
 
-	// create the session file so offline delivery works from now on
-	if err := proj.Store.EnsureSession(mailboxID); err != nil {
-		log.Printf("ensure session %s: %v", mailboxID, err)
+	// unnamed (derived) mailboxes are ephemeral: in-memory only, never
+	// written to disk, dropped when the connection ends. The derived
+	// record of a NAMED login (the _holds marker below) is ephemeral too:
+	// the binding lives in memory for this daemon's lifetime.
+	proj.Store.MarkEphemeral(msg.Session)
+	if claim != nil {
+		// named mailbox: the file is what makes offline delivery work
+		if err := proj.Store.EnsureSession(mailboxID); err != nil {
+			log.Printf("ensure session %s: %v", mailboxID, err)
+		}
 	}
 
 	// registration-time meta merge happens atomically inside the store
@@ -322,9 +339,6 @@ func (c *conn) handleHello(rid int, data []byte) error {
 	// named login: maintain the reverse marker on the session's own
 	// derived record (session -> name), the counterpart of _origin
 	if claim != nil {
-		if err := proj.Store.EnsureSession(msg.Session); err != nil {
-			log.Printf("ensure derived session %s: %v", msg.Session, err)
-		}
 		if err := proj.Store.BindName(msg.Session, msg.Origin, claim.Name); err != nil {
 			return err
 		}

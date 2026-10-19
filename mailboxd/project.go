@@ -66,13 +66,18 @@ func (p *Project) Register(sessionID string, c *conn) *conn {
 	return old
 }
 
-// Unregister removes a session binding if it still points at c.
-func (p *Project) Unregister(sessionID string, c *conn) {
+// Unregister removes a session binding if it still points at c. It
+// reports whether THIS connection was the registered one (a replacement
+// re-hello or a reconnect elsewhere may have taken over) — the caller
+// uses that to decide whether the mailbox dies with the connection.
+func (p *Project) Unregister(sessionID string, c *conn) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.online[sessionID] == c {
 		delete(p.online, sessionID)
+		return true
 	}
+	return false
 }
 
 func (p *Project) OnlineCount() int {

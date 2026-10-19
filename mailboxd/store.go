@@ -148,15 +148,20 @@ type SessionState struct {
 type Store struct {
 	Dir string
 
-	mu     sync.Mutex
-	states map[string]*SessionState
+	mu sync.Mutex
+	// states is the in-memory mailbox state; ephemeral marks mailboxes that
+	// never touch disk (unnamed/derived ones): their events apply to the
+	// in-memory state only, the map entry survives DropState so a racing
+	// writer cannot resurrect a file, and a daemon restart clears both.
+	states    map[string]*SessionState
+	ephemeral map[string]bool
 }
 
 func NewStore(dir string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	return &Store{Dir: dir, states: map[string]*SessionState{}}, nil
+	return &Store{Dir: dir, states: map[string]*SessionState{}, ephemeral: map[string]bool{}}, nil
 }
 
 func (s *Store) sessionFile(sessionID string) (string, error) {
@@ -208,6 +213,33 @@ func (s *Store) state(sessionID string) (*SessionState, error) {
 		return nil, err
 	}
 	return s.states[sessionID], nil
+}
+
+// MarkEphemeral flags a mailbox as never-persisted: every event for it
+// applies to the in-memory state only (no JSONL, no file creation). Used
+// for unnamed (derived) mailboxes — they die with the connection.
+func (s *Store) MarkEphemeral(sessionID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ephemeral[sessionID] = true
+}
+
+// DropState forgets a mailbox's in-memory state (the unnamed-mailbox
+// cleanup on disconnect). The ephemeral marker stays so a writer racing
+// the drop cannot resurrect a file on disk.
+func (s *Store) DropState(sessionID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.states, sessionID)
+}
+
+// persistLine appends an event line unless the mailbox is ephemeral.
+// Callers must hold s.mu (same contract as the state accessors).
+func (s *Store) persistLine(sessionID, path, line string) error {
+	if s.ephemeral[sessionID] {
+		return nil
+	}
+	return appendLine(path, line)
 }
 
 func applyMeta(st *SessionState, set map[string]string, unset []string) {
@@ -269,7 +301,7 @@ func (s *Store) AppendSend(sessionID string, mail *MailRecord) error {
 	}
 	st.Mails[mail.ID] = mail
 	data, _ := json.Marshal(map[string]interface{}{"t": "send", "mail": mail})
-	return appendLine(path, string(data))
+	return s.persistLine(sessionID, path, string(data))
 }
 
 // AppendRead marks a mail read.
@@ -281,7 +313,7 @@ func (s *Store) AppendRead(sessionID, mailID, at string) error {
 	data, _ := json.Marshal(map[string]interface{}{"t": "read", "mail": mailID, "at": at})
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := appendLine(path, string(data)); err != nil {
+	if err := s.persistLine(sessionID, path, string(data)); err != nil {
 		return err
 	}
 	st, err := s.state(sessionID)
@@ -343,7 +375,7 @@ func (s *Store) UpdateMeta(sessionID string, set map[string]string, unset []stri
 		ev["unset"] = unset
 	}
 	data, _ := json.Marshal(ev)
-	if err := appendLine(path, string(data)); err != nil {
+	if err := s.persistLine(sessionID, path, string(data)); err != nil {
 		return err
 	}
 	applyMeta(st, set, unset)
@@ -464,7 +496,7 @@ func (s *Store) HelloMerge(sessionID, agent, origin string, meta map[string]stri
 			ev["unset"] = unset
 		}
 		data, _ := json.Marshal(ev)
-		if err := appendLine(path, string(data)); err != nil {
+		if err := s.persistLine(sessionID, path, string(data)); err != nil {
 			return nil, err
 		}
 		applyMeta(st, set, unset)
@@ -488,12 +520,24 @@ func (s *Store) HasMailbox(sessionID string) bool {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// in-memory states count (ephemeral mailboxes have no file but exist
+	// while their session is connected)
+	if _, ok := s.states[sessionID]; ok {
+		return true
+	}
 	_, err = os.Stat(path)
 	return err == nil
 }
 
-// EnsureSession creates the session file on first registration.
+// EnsureSession creates the session file on first registration. Ephemeral
+// mailboxes never get a file.
 func (s *Store) EnsureSession(sessionID string) error {
+	s.mu.Lock()
+	eph := s.ephemeral[sessionID]
+	s.mu.Unlock()
+	if eph {
+		return nil
+	}
 	path, err := s.sessionFile(sessionID)
 	if err != nil {
 		return err
@@ -503,6 +547,26 @@ func (s *Store) EnsureSession(sessionID string) error {
 		return err
 	}
 	return f.Close()
+}
+
+// AllSessionIDs returns every mailbox id the store knows: file-backed
+// (persisted, named accounts) plus in-memory-only ones (ephemeral unnamed
+// mailboxes of connected sessions). Iteration order is unspecified.
+func (s *Store) AllSessionIDs() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	seen := map[string]bool{}
+	ids := make([]string, 0, len(s.states))
+	for id := range s.states {
+		seen[id] = true
+		ids = append(ids, id)
+	}
+	for _, id := range s.ListSessionIDs() {
+		if !seen[id] {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
 
 // ListSessionIDs returns every session id with a mailbox file.
@@ -623,7 +687,7 @@ func (s *Store) BindName(sessionID, origin, name string) error {
 		ev["unset"] = unset
 	}
 	data, _ := json.Marshal(ev)
-	if err := appendLine(path, string(data)); err != nil {
+	if err := s.persistLine(sessionID, path, string(data)); err != nil {
 		return err
 	}
 	applyMeta(st, set, unset)
