@@ -21,7 +21,7 @@ import { join, resolve } from "node:path";
 import { createHash, randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
-import { PROTOCOL_VERSION, type SessionInfo } from "./protocol.ts";
+import { PROTOCOL_VERSION, type ProjectInfo, type SessionInfo } from "./protocol.ts";
 
 const PROBE_TIMEOUT_MS = 1_500;
 const SPAWN_WAIT_MS = 10_000;
@@ -188,6 +188,22 @@ export async function fetchSessionsViaApi(
 	if (!resp.ok) throw new Error(`daemon HTTP ${resp.status}`);
 	const body = (await resp.json()) as { sessions?: SessionInfo[] };
 	return body.sessions ?? [];
+}
+
+/** List every project served by the local daemon via /api/info (no
+ * identity required — the same listing the web UI shows). Local mode
+ * only: remote daemons do not expose the loopback HTTP API. */
+export async function fetchProjectsViaApi(): Promise<ProjectInfo[]> {
+	// non-spawning: a listing must never bring a daemon up (a fresh daemon
+	// knows no projects, so a spawn would silently return an empty list)
+	const endpoint = await connectLocalDaemonIfRunning();
+	if (!endpoint) throw new Error("no running mailboxd daemon found");
+	const resp = await fetch(`http://127.0.0.1:${endpoint.port}/api/info`, {
+		signal: AbortSignal.timeout(5_000),
+	});
+	if (!resp.ok) throw new Error(`daemon HTTP ${resp.status}`);
+	const body = (await resp.json()) as { projects?: Array<{ id: string; host?: string; path?: string }> };
+	return (body.projects ?? []).map((p) => ({ project: p.id, host: p.host, path: p.path }));
 }
 
 /** Hard-delete a mailbox through the daemon's HTTP API (the web UI's

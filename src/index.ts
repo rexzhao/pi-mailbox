@@ -31,6 +31,7 @@ import {
 	connectLocalDaemonIfRunning,
 	deleteMailboxViaApi,
 	deriveProjectId,
+	fetchProjectsViaApi,
 	fetchSessionsViaApi,
 	findMailboxdBinary,
 	mailboxTotalsViaApi,
@@ -41,13 +42,22 @@ import type { MailRecord, MailRef, SessionInfo } from "./protocol.ts";
 import {
 	MailboxConnectOutputSchema,
 	MailboxListOutputSchema,
+	MailboxProjectsOutputSchema,
 	MailboxReadOutputSchema,
 	MailboxSentOutputSchema,
 	MailboxSessionsOutputSchema,
 	MailCountsSchema,
+	type ProjectInfo,
 } from "./protocol.ts";
 
-const TOOL_NAMES = ["mailbox_list", "mailbox_read", "mailbox_send", "mailbox_reply", "mailbox_sessions"] as const;
+const TOOL_NAMES = [
+	"mailbox_list",
+	"mailbox_read",
+	"mailbox_send",
+	"mailbox_reply",
+	"mailbox_sessions",
+	"mailbox_projects",
+] as const;
 
 /** Shared explanation of the external addressing format, embedded in tool output. */
 const ADDRESS_FORMAT_DOC =
@@ -1811,6 +1821,76 @@ ${formatMailList(mails)}${more}`,
 				structuredContent: asStructured({
 					ref: formatMailRef(sent),
 				} satisfies Static<typeof MailboxSentOutputSchema>),
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "mailbox_projects",
+		label: "Mailbox projects",
+		namespace: MAILBOX_NAMESPACE,
+		annotations: READ_ONLY,
+		description:
+			"List the projects this daemon currently knows: project id plus, in local mode, " +
+			"the host and filesystem path of each project root. A project appears once a session " +
+			"from it has connected since the daemon started — a project whose sessions are all " +
+			"offline since the last daemon restart is not listed. Use this to discover which " +
+			"project a peer lives in before cross-project mail (the target address is " +
+			"'session@project'; mailbox_send accepts cross-project targets when the daemon " +
+			"serves both). Optional: includeSessions adds per-project counts (total and online) " +
+			"— counts are session records (a named mailbox plus its derived bookkeeping " +
+			"record), not unique mailboxes. Local mode only — against a remote daemon this " +
+			"tool errors (remote daemons do not expose the project listing).",
+		parameters: Type.Object({
+			includeSessions: Type.Optional(
+				Type.Boolean({
+					description:
+						"Include per-project counts (total, online); session records, not unique mailboxes. Costs one extra daemon query",
+				}),
+			),
+		}),
+		exposure: "deferred",
+		outputSchema: MailboxProjectsOutputSchema,
+		async execute(_toolCallId, params) {
+			const c = requireConnection();
+			if (c.remoteTarget) {
+				// the listing comes from the daemon's loopback HTTP API
+				// (/api/info), which remote daemons do not expose
+				throw new Error(
+					"mailbox: mailbox_projects is local-mode only — remote daemons do not expose the project listing",
+				);
+			}
+			const projects = await fetchProjectsViaApi();
+			let list: ProjectInfo[] = projects;
+			if (params.includeSessions) {
+				// /api/sessions (no project filter) spans every project;
+				// aggregate by project id
+				const sessions = await fetchSessionsViaApi();
+				const byProject = new Map<string, { total: number; online: number }>();
+				for (const s of sessions) {
+					if (!s.project) continue;
+					const agg = byProject.get(s.project) ?? { total: 0, online: 0 };
+					agg.total++;
+					if (s.online) agg.online++;
+					byProject.set(s.project, agg);
+				}
+				list = projects.map((p) => ({ ...p, ...byProject.get(p.project) }));
+			}
+			const text =
+					list.length === 0
+					? "no projects known yet — a project appears once a session from it has connected"
+					: list
+							.map((p) => {
+								const where = p.path ? ` ${p.path}` : "";
+								const counts =
+								p.total !== undefined ? ` (${p.total} sessions, ${p.online ?? 0} online)` : "";
+								return `${p.project}${where}${counts}`;
+							})
+							.join("\n");
+			return {
+				content: [{ type: "text", text }],
+				details: { projects: list },
+				structuredContent: asStructured({ projects: list } satisfies Static<typeof MailboxProjectsOutputSchema>),
 			};
 		},
 	});

@@ -333,7 +333,7 @@ try {
 		},
 	});
 	const runCommand = (args, ctx) => registeredCommands.get("mailbox").handler(args, ctx);
-	const toolNames = ["mailbox_list", "mailbox_read", "mailbox_send", "mailbox_reply", "mailbox_sessions"];
+	const toolNames = ["mailbox_list", "mailbox_read", "mailbox_send", "mailbox_reply", "mailbox_sessions", "mailbox_projects"];
 	for (const name of toolNames) {
 		assert(registeredTools.has(name), `tool registered: ${name}`);
 		assert(registeredTools.get(name).outputSchema !== undefined, `${name} declares outputSchema`);
@@ -689,6 +689,34 @@ try {
 		"json mode: no injection (pure event stream)",
 	);
 	await peer.stop();
+
+	// mailbox_projects: lists every project on the daemon; count must match
+	// the daemon's own /api/info listing exactly; includeSessions aggregates
+	// per-project counts from /api/sessions
+	const projectsTool = registeredTools.get("mailbox_projects");
+	assert(projectsTool.outputSchema !== undefined, "mailbox_projects declares outputSchema");
+	let pr = await exec(projectsTool, {});
+	validate(projectsTool, pr.structuredContent);
+	const { readFileSync: readFileSyncSync } = await import("node:fs");
+	const reg = JSON.parse(readFileSyncSync(join(home, "mailboxd.json"), "utf8"));
+	const infoResp = await fetch(`http://127.0.0.1:${reg.port}/api/info`);
+	const info = await infoResp.json();
+	assert(
+		pr.structuredContent.projects.length === info.projects.length,
+		`projects count matches /api/info (${pr.structuredContent.projects.length} vs ${info.projects.length})`,
+	);
+	const ownProject = pr.structuredContent.projects.find((p) => p.project === extProject);
+	assert(ownProject !== undefined, "own project listed");
+	assert(ownProject.path === projectDir, `own project path matches cwd (${ownProject.path})`);
+	assert(typeof ownProject.host === "string" && ownProject.host.length > 0, "own project host present (local mode)");
+	// without includeSessions: no counts
+	assert(ownProject.total === undefined && ownProject.online === undefined, "no counts without includeSessions");
+	pr = await exec(projectsTool, { includeSessions: true });
+	validate(projectsTool, pr.structuredContent);
+	const ownCounted = pr.structuredContent.projects.find((p) => p.project === extProject);
+	assert(ownCounted !== undefined && ownCounted.total !== undefined && ownCounted.total >= 1, "includeSessions: own project total >= 1");
+	assert(ownCounted !== undefined && ownCounted.online !== undefined && ownCounted.online >= 1, "includeSessions: own project online >= 1");
+	assert(pr.content[0].text.includes(extProject), "projects text lists own project id");
 } finally {
 	// the daemon is detached and holds the lock file in the temp home; stop
 	// it via the pid recorded in the registry so cleanup can remove the dir

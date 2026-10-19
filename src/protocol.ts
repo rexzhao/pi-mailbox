@@ -295,6 +295,31 @@ export const MailboxSessionsOutputSchema = Type.Object({
 	sessions: Type.Array(SessionInfoSchema),
 });
 
+/** A project served by the daemon (from its /api/info listing). */
+export type ProjectInfo = {
+	project: string;
+	/** Daemon hostname (local mode only). */
+	host?: string;
+	/** Absolute project root (local mode only). */
+	path?: string;
+	/** Registered sessions (includeSessions only). */
+	total?: number;
+	/** Currently connected sessions (includeSessions only). */
+	online?: number;
+};
+
+export const ProjectInfoSchema = Type.Object({
+	project: Type.String(),
+	host: Type.Optional(Type.String()),
+	path: Type.Optional(Type.String()),
+	total: Type.Optional(Type.Integer()),
+	online: Type.Optional(Type.Integer()),
+});
+
+export const MailboxProjectsOutputSchema = Type.Object({
+	projects: Type.Array(ProjectInfoSchema),
+});
+
 /** Mail counts for status summaries (connect results). */
 export const MailCountsSchema = Type.Object({
 	total: Type.Integer(),
