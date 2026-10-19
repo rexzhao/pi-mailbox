@@ -1874,7 +1874,9 @@ ${formatMailList(mails)}${more}`,
 					if (s.online) agg.online++;
 					byProject.set(s.project, agg);
 				}
-				list = projects.map((p) => ({ ...p, ...byProject.get(p.project) }));
+				// counts default to 0 for projects with no session records:
+				// "absent" and "0" read very differently to a model
+				list = projects.map((p) => ({ ...p, ...(byProject.get(p.project) ?? { total: 0, online: 0 }) }));
 			}
 			const text =
 					list.length === 0

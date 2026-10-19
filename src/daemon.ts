@@ -190,9 +190,10 @@ export async function fetchSessionsViaApi(
 	return body.sessions ?? [];
 }
 
-/** List every project served by the local daemon via /api/info (no
- * identity required — the same listing the web UI shows). Local mode
- * only: remote daemons do not expose the loopback HTTP API. */
+/** List the projects the local daemon currently knows via /api/info (no
+ * identity required — the same listing the web UI shows; a project appears
+ * once a session from it has connected since the daemon started). Local
+ * mode only: remote daemons do not expose the loopback HTTP API. */
 export async function fetchProjectsViaApi(): Promise<ProjectInfo[]> {
 	// non-spawning: a listing must never bring a daemon up (a fresh daemon
 	// knows no projects, so a spawn would silently return an empty list)
