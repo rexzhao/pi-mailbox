@@ -94,6 +94,19 @@ func (c *testClient) expectNotify() int {
 	}
 }
 
+// helloNamed registers with a NAMED claim (nameless logins are rejected
+// by the daemon); meta like hello, origin like helloLogin.
+func (c *testClient) helloNamed(rid int, project, root, session, origin, name, agent string, meta map[string]string) map[string]interface{} {
+	msg := map[string]interface{}{
+		"t": "hello", "rid": rid, "project": project, "projectRoot": root,
+		"session": session, "origin": origin, "agent": agent, "as": name,
+	}
+	if meta != nil {
+		msg["meta"] = meta
+	}
+	return c.request(msg)
+}
+
 func (c *testClient) hello(rid int, project, root, session, agent string, meta map[string]string) map[string]interface{} {
 	msg := map[string]interface{}{
 		"t": "hello", "rid": rid, "project": project, "projectRoot": root,
@@ -163,23 +176,13 @@ func TestDaemonLocalFlow(t *testing.T) {
 	tmp := t.TempDir()
 	projectRoot := filepath.Join(tmp, "proj")
 	os.MkdirAll(filepath.Join(projectRoot, ".pi", "mailbox"), 0o755)
-	sessionDir := filepath.Join(tmp, "sessions")
-	os.MkdirAll(sessionDir, 0o755)
-	// fake pi session file so the GC keeps the sessions alive
-	os.WriteFile(filepath.Join(sessionDir, "2026-01-01_sessA.jsonl"), []byte("{}\n"), 0o644)
-	os.WriteFile(filepath.Join(sessionDir, "2026-01-01_sessB.jsonl"), []byte("{}\n"), 0o644)
-
-	gcGrace = 0
-	defer func() {
-		gcGrace = time.Hour
-	}()
 
 	port, stop := bootDaemon(t, tmp, "", false)
 	defer stop()
 	const project = "proj-uuid-1"
 
 	a := dialTest(t, port)
-	wa := a.hello(1, project, projectRoot, "sessA", "agent-a", map[string]string{"_model": "prov/m1", "role": "worker"})
+	wa := a.helloNamed(1, project, projectRoot, "sessA", "orig-a", "alpha", "agent-a", map[string]string{"_model": "prov/m1", "role": "worker"})
 	if wa["t"] != "welcome" {
 		t.Fatalf("expected welcome, got %v", wa)
 	}
@@ -192,7 +195,7 @@ func TestDaemonLocalFlow(t *testing.T) {
 	}
 
 	b := dialTest(t, port)
-	wb := b.hello(1, project, projectRoot, "sessB", "agent-b", nil)
+	wb := b.helloNamed(1, project, projectRoot, "sessB", "orig-b", "beta", "agent-b", nil)
 	if wb["t"] != "welcome" {
 		t.Fatalf("expected welcome for B, got %v", wb)
 	}
@@ -207,7 +210,7 @@ func TestDaemonLocalFlow(t *testing.T) {
 	// A -> B send: B gets a notify push
 	a.send(map[string]interface{}{
 		"t": "send", "rid": 3,
-		"target":  map[string]string{"project": project, "session": "sessB"},
+		"target":  map[string]string{"project": project, "session": "beta"},
 		"subject": "hello", "body": "world",
 	})
 	sent := a.request(map[string]interface{}{"t": "ping", "rid": 99}) // drain: wait via ping
@@ -233,7 +236,7 @@ func TestDaemonLocalFlow(t *testing.T) {
 	// B reads it: readAt set
 	rd := b.request(map[string]interface{}{
 		"t": "read", "rid": 3,
-		"mail": map[string]string{"project": project, "session": "sessB", "mail": mailID},
+		"mail": map[string]string{"project": project, "session": "beta", "mail": mailID},
 	})
 	if rd["mail"].(map[string]interface{})["readAt"] == nil {
 		t.Fatalf("own read should mark readAt: %v", rd)
@@ -263,22 +266,27 @@ func TestDaemonLocalFlow(t *testing.T) {
 		t.Fatalf("expected no_mailbox, got %v", m)
 	}
 
-	// unnamed mailboxes are ephemeral: B disconnects and its mailbox DIES —
-	// sends to it now fail and it vanishes from offline listings
+	// offline delivery for the named account: B disconnects, its mailbox
+	// persists (file-backed), sends still queue, and it lists offline
 	b.ws.Close(websocket.StatusNormalClosure, "")
 	time.Sleep(100 * time.Millisecond)
 	if m := a.request(map[string]interface{}{
 		"t": "send", "rid": 5,
-		"target":  map[string]string{"project": project, "session": "sessB"},
+		"target":  map[string]string{"project": project, "session": "beta"},
 		"subject": "offline mail", "body": "while away",
-	}); m["code"] != "no_mailbox" {
-		t.Fatalf("send to a disconnected unnamed mailbox should be no_mailbox, got %v", m)
+	}); m["t"] != "sent" {
+		t.Fatalf("offline send to a disconnected NAMED mailbox should still work, got %v", m)
 	}
 	sess2 := a.request(map[string]interface{}{"t": "sessions", "rid": 6, "includeOffline": true})
+	var bOfflineEntry map[string]interface{}
 	for _, s := range sess2["sessions"].([]interface{}) {
-		if s.(map[string]interface{})["session"] == "sessB" {
-			t.Fatalf("disconnected unnamed mailbox must not be listed: %v", sess2)
+		sm := s.(map[string]interface{})
+		if sm["session"] == "beta" && !sm["online"].(bool) {
+			bOfflineEntry = sm
 		}
+	}
+	if bOfflineEntry == nil {
+		t.Fatalf("disconnected named mailbox should be listed offline: %v", sess2)
 	}
 
 	// offline delivery still works for NAMED accounts: C claims a name,
@@ -380,14 +388,14 @@ func TestDaemonCrossProjectSend(t *testing.T) {
 	port, stop := bootDaemon(t, tmp, "", false)
 	defer stop()
 	a := dialTest(t, port)
-	a.hello(1, "proj-1", root1, "s1", "a", nil)
+	a.helloNamed(1, "proj-1", root1, "s1", "orig-1", "cross-a", "a", nil)
 	b := dialTest(t, port)
-	b.hello(1, "proj-2", root2, "s2", "b", nil)
+	b.helloNamed(1, "proj-2", root2, "s2", "orig-2", "cross-b", "b", nil)
 
 	// cross-project send is allowed when the target project is registered
 	m := a.request(map[string]interface{}{
 		"t": "send", "rid": 2,
-		"target":  map[string]string{"project": "proj-2", "session": "s2"},
+		"target":  map[string]string{"project": "proj-2", "session": "cross-b"},
 		"subject": "cross", "body": "hi",
 	})
 	if m["t"] != "sent" {
@@ -399,7 +407,7 @@ func TestDaemonCrossProjectSend(t *testing.T) {
 	// unknown project still rejected
 	m2 := a.request(map[string]interface{}{
 		"t": "send", "rid": 3,
-		"target":  map[string]string{"project": "proj-unknown", "session": "s2"},
+		"target":  map[string]string{"project": "proj-unknown", "session": "cross-b"},
 		"subject": "x", "body": "y",
 	})
 	if m2["code"] != "external_target" {
@@ -415,14 +423,14 @@ func TestDaemonCursorSemantics(t *testing.T) {
 	defer stop()
 
 	a := dialTest(t, port)
-	a.hello(1, "p", root, "s1", "a", nil)
+	a.helloNamed(1, "p", root, "s1", "orig-1", "alpha", "a", nil)
 	b := dialTest(t, port)
-	b.hello(1, "p", root, "s2", "b", nil)
+	b.helloNamed(1, "p", root, "s2", "orig-2", "beta", "b", nil)
 
 	for i := 0; i < 5; i++ {
 		m := a.request(map[string]interface{}{
 			"t": "send", "rid": 100 + i,
-			"target":  map[string]string{"project": "p", "session": "s2"},
+			"target":  map[string]string{"project": "p", "session": "beta"},
 			"subject": fmt.Sprintf("mail-%d", i), "body": "x",
 		})
 		if m["t"] != "sent" {
@@ -485,9 +493,9 @@ func TestDaemonConcurrentAccess(t *testing.T) {
 	defer stop()
 
 	a := dialTest(t, port)
-	a.hello(1, "p", root, "s1", "a", nil)
+	a.helloNamed(1, "p", root, "s1", "orig-1", "alpha", "a", nil)
 	b := dialTest(t, port)
-	b.hello(1, "p", root, "s2", "b", nil)
+	b.helloNamed(1, "p", root, "s2", "orig-2", "beta", "b", nil)
 
 	done := make(chan struct{})
 	// A: send to B continuously
@@ -496,7 +504,7 @@ func TestDaemonConcurrentAccess(t *testing.T) {
 		for i := 0; i < 30; i++ {
 			a.send(map[string]interface{}{
 				"t": "send", "rid": 1000 + i,
-				"target":  map[string]string{"project": "p", "session": "s2"},
+				"target":  map[string]string{"project": "p", "session": "beta"},
 				"subject": fmt.Sprintf("m-%d", i), "body": "x",
 			})
 			time.Sleep(2 * time.Millisecond)
@@ -555,86 +563,6 @@ func TestStoreMixedTimestamps(t *testing.T) {
 
 // TestCleanupOriginGC verifies the on-demand cleanup with short session ids:
 // the mailbox is keyed by the short id, while the lifecycle check uses the
-// _origin meta (the client's full session id) to match the pi session file.
-func TestCleanupOriginGC(t *testing.T) {
-	tmp := t.TempDir()
-	projectRoot := filepath.Join(tmp, "proj")
-	os.MkdirAll(filepath.Join(projectRoot, ".pi", "mailbox"), 0o755)
-	sessionDir := filepath.Join(tmp, "sessions")
-	os.MkdirAll(sessionDir, 0o755)
-	// pi session files: sessA alive, sessB deleted later
-	os.WriteFile(filepath.Join(sessionDir, "2026-01-01_sessA.jsonl"), []byte("{}\n"), 0o644)
-	os.WriteFile(filepath.Join(sessionDir, "2026-01-01_sessB.jsonl"), []byte("{}\n"), 0o644)
-
-	gcGrace = 0
-	defer func() {
-		gcGrace = time.Hour
-	}()
-
-	port, stop := bootDaemon(t, tmp, "", false)
-	defer stop()
-	const project = "proj-gc"
-
-	// unnamed mailboxes are ephemeral now, so the lifecycle GC only ever
-	// sees LEGACY derived files: hand-craft two (mail + _origin meta), the
-	// way the pre-ephemeral daemon wrote them
-	legacy := func(short, origin string) {
-		t.Helper()
-		mailDir := filepath.Join(projectRoot, ".pi", "mailbox")
-		line1 := fmt.Sprintf(`{"t":"send","mail":{"id":"m-%s","from":{"project":"%s","session":"sender"},"subject":"x","body":"y","refs":null,"createdAt":"2026-01-01T00:00:00.000000000Z"}}`, short, project)
-		line2 := fmt.Sprintf(`{"t":"meta","set":{"_origin":"%s","_agent":"agent-%s"}}`, origin, short)
-		if err := os.WriteFile(filepath.Join(mailDir, short+".jsonl"), []byte(line1+"\n"+line2+"\n"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	legacy("shortaaaa", "sessA")
-	legacy("shortbbbb", "sessB")
-	// B's pi session file is gone: B's mailbox is an orphan
-	os.Remove(filepath.Join(sessionDir, "2026-01-01_sessB.jsonl"))
-
-	// A connects (its legacy file survives: A is online)
-	a := dialTest(t, port)
-	if w := a.helloShort(1, project, projectRoot, sessionDir, "shortaaaa", "sessA", "agent-a", nil); w["t"] != "welcome" {
-		t.Fatalf("A welcome: %v", w)
-	}
-	// B never connects, and its pi session file is gone: an orphan
-
-	// delete sessB's pi session file (already absent in this fixture — the
-	// orphan condition) and run the on-demand cleanup: B's mailbox must
-	// move to .trash, A's must stay
-	cm := a.request(map[string]interface{}{"t": "cleanup", "rid": 4})
-	if cm["t"] != "cleanup" {
-		t.Fatalf("cleanup failed: %v", cm)
-	}
-	results := cm["results"].([]interface{})
-	if len(results) != 1 {
-		t.Fatalf("expected 1 project result, got %v", results)
-	}
-	r := results[0].(map[string]interface{})
-	if r["project"] != project || int(r["moved"].(float64)) != 1 {
-		t.Fatalf("cleanup result wrong: %v", r)
-	}
-
-	mailDir := filepath.Join(projectRoot, ".pi", "mailbox")
-	if _, err := os.Stat(filepath.Join(mailDir, "shortaaaa.jsonl")); err != nil {
-		t.Fatalf("A's mailbox should survive: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(mailDir, "shortbbbb.jsonl")); !os.IsNotExist(err) {
-		t.Fatalf("B's mailbox should be gone: %v", err)
-	}
-	trashDir := filepath.Join(mailDir, ".trash")
-	trashEntries, _ := os.ReadDir(trashDir)
-	trashed := false
-	for _, e := range trashEntries {
-		if strings.HasSuffix(e.Name(), "shortbbbb.jsonl") {
-			trashed = true
-		}
-	}
-	if !trashed {
-		t.Fatalf("B's mailbox should be in .trash: %v", trashEntries)
-	}
-}
-
 // TestViewCommand covers `mailboxd view`: registry resolution, the remote
 // --host requirement, and URL/JSON output against a live daemon.
 func TestViewCommand(t *testing.T) {
@@ -719,13 +647,13 @@ func TestHTTPAPI(t *testing.T) {
 	base := fmt.Sprintf("http://127.0.0.1:%d", port)
 
 	a := dialTest(t, port)
-	a.hello(1, "p", root, "s1", "a", nil)
+	a.helloNamed(1, "p", root, "s1", "orig-1", "alpha", "a", nil)
 	b := dialTest(t, port)
-	b.hello(1, "p", root, "s2", "b", nil)
+	b.helloNamed(1, "p", root, "s2", "orig-2", "beta", "b", nil)
 	// a mail into b's mailbox (unread)
 	if m := a.request(map[string]interface{}{
 		"t": "send", "rid": 2,
-		"target":  map[string]string{"project": "p", "session": "s2"},
+		"target":  map[string]string{"project": "p", "session": "beta"},
 		"subject": "api test", "body": "x",
 	}); m["t"] != "sent" {
 		t.Fatalf("send failed: %v", m)
@@ -783,7 +711,7 @@ func TestHTTPAPI(t *testing.T) {
 	}
 
 	// mailbox listing: readAt must stay null (read-only invariant)
-	resp, body = get("/api/mailbox/s2@p", nil, "")
+	resp, body = get("/api/mailbox/beta@p", nil, "")
 	if resp.StatusCode != 200 || int(body["total"].(float64)) != 1 || int(body["totalUnread"].(float64)) != 1 {
 		t.Fatalf("mailbox: %v %v", resp.StatusCode, body)
 	}
@@ -793,7 +721,7 @@ func TestHTTPAPI(t *testing.T) {
 	}
 
 	// single mail: readAt must stay null
-	resp, body = get("/api/mail/s2@p/"+mailID, nil, "")
+	resp, body = get("/api/mail/beta@p/"+mailID, nil, "")
 	if resp.StatusCode != 200 || body["readAt"] != nil {
 		t.Fatalf("mail detail: %v %v", resp.StatusCode, body)
 	}
@@ -801,7 +729,7 @@ func TestHTTPAPI(t *testing.T) {
 	// the WS read still works and marks read AFTER the API calls
 	rd := b.request(map[string]interface{}{
 		"t": "read", "rid": 5,
-		"mail": map[string]string{"project": "p", "session": "s2", "mail": mailID},
+		"mail": map[string]string{"project": "p", "session": "beta", "mail": mailID},
 	})
 	if rd["mail"].(map[string]interface{})["readAt"] == nil {
 		t.Fatal("WS read should mark readAt after API access")
@@ -912,9 +840,9 @@ func TestHTTPThread(t *testing.T) {
 	base := fmt.Sprintf("http://127.0.0.1:%d", port)
 
 	a := dialTest(t, port)
-	a.hello(1, "p", root, "s1", "a", nil)
+	a.helloNamed(1, "p", root, "s1", "orig-1", "alpha", "a", nil)
 	b := dialTest(t, port)
-	b.hello(1, "p", root, "s2", "b", nil)
+	b.helloNamed(1, "p", root, "s2", "orig-2", "beta", "b", nil)
 
 	send := func(rid int, from *testClient, target, subject string, refs []map[string]string) string {
 		msg := map[string]interface{}{
@@ -933,13 +861,13 @@ func TestHTTPThread(t *testing.T) {
 	}
 
 	// m1: a -> b (lives in b's mailbox)
-	m1 := send(2, a, "s2", "root", nil)
+	m1 := send(2, a, "beta", "root", nil)
 	// r1: b replies to m1 (lives in a's mailbox, refs m1)
-	r1 := send(3, b, "s1", "Re: root", []map[string]string{{"project": "p", "session": "s2", "mail": m1}})
+	r1 := send(3, b, "alpha", "Re: root", []map[string]string{{"project": "p", "session": "beta", "mail": m1}})
 	// m2: a replies to r1 (lives in b's mailbox, refs r1 — NOT m1)
-	m2 := send(4, a, "s2", "Re: Re: root", []map[string]string{{"project": "p", "session": "s1", "mail": r1}})
+	m2 := send(4, a, "beta", "Re: Re: root", []map[string]string{{"project": "p", "session": "alpha", "mail": r1}})
 	// unrelated mail (must not appear)
-	send(5, a, "s2", "unrelated", nil)
+	send(5, a, "beta", "unrelated", nil)
 
 	getThread := func(path string) (int, map[string]interface{}) {
 		resp, err := http.Get(base + path)
@@ -953,11 +881,11 @@ func TestHTTPThread(t *testing.T) {
 	}
 
 	// thread of m1: r1 (direct) + m2 (transitive via r1), oldest first
-	code, body := getThread("/api/thread/s2@p/" + m1)
+	code, body := getThread("/api/thread/beta@p/" + m1)
 	if code != 200 {
 		t.Fatalf("thread: %v", code)
 	}
-	if body["owner"] != "s2@p" {
+	if body["owner"] != "beta@p" {
 		t.Fatalf("thread owner: %v", body["owner"])
 	}
 	replies := body["replies"].([]interface{})
@@ -970,24 +898,24 @@ func TestHTTPThread(t *testing.T) {
 		t.Fatalf("order should be oldest first: %v", body)
 	}
 	// owners point at the mailboxes holding the replies (for navigation)
-	if first["owner"] != "s1@p" || second["owner"] != "s2@p" {
+	if first["owner"] != "alpha@p" || second["owner"] != "beta@p" {
 		t.Fatalf("reply owners: %v %v", first["owner"], second["owner"])
 	}
 
 	// thread of r1: just m2
-	code, body = getThread("/api/thread/s1@p/" + r1)
+	code, body = getThread("/api/thread/alpha@p/" + r1)
 	if code != 200 || len(body["replies"].([]interface{})) != 1 {
 		t.Fatalf("thread of r1: %v %v", code, body)
 	}
 
 	// leaf mail: no replies
-	code, body = getThread("/api/thread/s2@p/" + m2)
+	code, body = getThread("/api/thread/beta@p/" + m2)
 	if code != 200 || len(body["replies"].([]interface{})) != 0 {
 		t.Fatalf("leaf thread: %v %v", code, body)
 	}
 
 	// unknown mail: 404
-	if code, _ = getThread("/api/thread/s2@p/nope"); code != 404 {
+	if code, _ = getThread("/api/thread/beta@p/nope"); code != 404 {
 		t.Fatalf("unknown mail: %v", code)
 	}
 }
@@ -1006,11 +934,11 @@ func TestHTTPThreads(t *testing.T) {
 	base := fmt.Sprintf("http://127.0.0.1:%d", port)
 
 	a := dialTest(t, port)
-	a.hello(1, "proj-1", root1, "s1", "a", nil)
+	a.helloNamed(1, "proj-1", root1, "s1", "orig-1", "alpha", "a", nil)
 	b := dialTest(t, port)
-	b.hello(1, "proj-1", root1, "s2", "b", nil)
+	b.helloNamed(1, "proj-1", root1, "s2", "orig-2", "beta", "b", nil)
 	c := dialTest(t, port)
-	c.hello(1, "proj-2", root2, "s3", "c", nil)
+	c.helloNamed(1, "proj-2", root2, "s3", "orig-3", "gamma", "c", nil)
 
 	send := func(rid int, from *testClient, project, target, subject string, refs []map[string]string) string {
 		msg := map[string]interface{}{
@@ -1029,17 +957,17 @@ func TestHTTPThreads(t *testing.T) {
 	}
 
 	// m1: a -> b, root in proj-1
-	m1 := send(2, a, "proj-1", "s2", "root thread", nil)
+	m1 := send(2, a, "proj-1", "beta", "root thread", nil)
 	// r1: b replies to m1 (lives in a's mailbox in proj-1)
-	r1 := send(3, b, "proj-1", "s1", "Re: root", []map[string]string{{"project": "proj-1", "session": "s2", "mail": m1}})
+	r1 := send(3, b, "proj-1", "alpha", "Re: root", []map[string]string{{"project": "proj-1", "session": "beta", "mail": m1}})
 	// orphan: refs a nonexistent mail -> must be listed as a root
-	orphan := send(4, a, "proj-1", "s2", "orphaned reply", []map[string]string{{"project": "proj-1", "session": "s2", "mail": "doesnotexist"}})
+	orphan := send(4, a, "proj-1", "beta", "orphaned reply", []map[string]string{{"project": "proj-1", "session": "beta", "mail": "doesnotexist"}})
 	// cross-project reply: c (proj-2) replies to m1; lives in b's mailbox in
 	// proj-1; sent last so m1's thread has the newest activity despite being
 	// created before the orphan (activity sort, not creation sort)
-	send(5, c, "proj-1", "s2", "cross reply", []map[string]string{{"project": "proj-1", "session": "s2", "mail": m1}})
+	send(5, c, "proj-1", "beta", "cross reply", []map[string]string{{"project": "proj-1", "session": "beta", "mail": m1}})
 	// unrelated project-2 root
-	p2root := send(6, c, "proj-2", "s3", "other project", nil)
+	p2root := send(6, c, "proj-2", "gamma", "other project", nil)
 
 	getThreads := func(project string) (int, map[string]interface{}) {
 		resp, err := http.Get(base + "/api/threads/" + project)
@@ -1084,7 +1012,7 @@ func TestHTTPThreads(t *testing.T) {
 		t.Fatalf("m1 lastReplyAt: %v", m1s)
 	}
 	// m1's owner is the mailbox holding it (b's)
-	if m1s["owner"] != "s2@proj-1" {
+	if m1s["owner"] != "beta@proj-1" {
 		t.Fatalf("m1 owner: %v", m1s["owner"])
 	}
 
@@ -1123,12 +1051,13 @@ func TestHTTPSend(t *testing.T) {
 	base := fmt.Sprintf("http://127.0.0.1:%d", port)
 
 	a := dialTest(t, port)
-	a.hello(1, "p", root, "s1", "a", nil)
+	a.helloNamed(1, "p", root, "s1", "orig-1", "alpha", "a", nil)
 	b := dialTest(t, port)
-	b.hello(1, "p", root, "s2", "b", nil)
+	b.helloNamed(1, "p", root, "s2", "orig-2", "beta", "b", nil)
 
-	// WS hello cannot register the reserved session id
-	if m := a.request(map[string]interface{}{"t": "hello", "rid": 99, "project": "p", "projectRoot": root, "session": "user", "agent": "x"}); m["code"] != "bad_hello" {
+	// WS hello cannot register the reserved session id (even with a
+	// name claim, which every hello now carries)
+	if m := a.request(map[string]interface{}{"t": "hello", "rid": 99, "project": "p", "projectRoot": root, "session": "user", "agent": "x", "as": "somebody"}); m["code"] != "bad_hello" {
 		t.Fatalf("hello as user should be rejected: %v", m)
 	}
 
@@ -1153,7 +1082,7 @@ func TestHTTPSend(t *testing.T) {
 		t.Fatalf("unknown project: %v", resp.StatusCode)
 	}
 	// invalid refs
-	if resp, _ := post("/api/send", map[string]any{"to": "s2@p", "subject": "x", "body": "y", "refs": []string{"garbage"}}); resp.StatusCode != 400 {
+	if resp, _ := post("/api/send", map[string]any{"to": "beta@p", "subject": "x", "body": "y", "refs": []string{"garbage"}}); resp.StatusCode != 400 {
 		t.Fatalf("invalid refs: %v", resp.StatusCode)
 	}
 	// POST to a read-only endpoint: 405
@@ -1168,12 +1097,12 @@ func TestHTTPSend(t *testing.T) {
 	}
 
 	// the user sends to s2; b is online and must get a notify push
-	resp, body := post("/api/send", map[string]any{"to": "s2@p", "subject": "from the web", "body": "hello"})
+	resp, body := post("/api/send", map[string]any{"to": "beta@p", "subject": "from the web", "body": "hello"})
 	if resp.StatusCode != 200 {
 		t.Fatalf("send: %v %v", resp.StatusCode, body)
 	}
 	userMailID := body["mail"].(map[string]interface{})["id"].(string)
-	if body["ref"] != "s2@p/"+userMailID {
+	if body["ref"] != "beta@p/"+userMailID {
 		t.Fatalf("ref: %v", body["ref"])
 	}
 	if n := b.expectNotify(); n < 1 {
@@ -1202,7 +1131,7 @@ func TestHTTPSend(t *testing.T) {
 		"t": "send", "rid": 3,
 		"target":  map[string]string{"project": "p", "session": "user"},
 		"subject": "Re: from the web", "body": "agent reply",
-		"refs": []map[string]string{{"project": "p", "session": "s2", "mail": userMailID}},
+		"refs": []map[string]string{{"project": "p", "session": "beta", "mail": userMailID}},
 	}); m["t"] != "sent" {
 		t.Fatalf("agent reply to user failed: %v", m)
 	}
@@ -1243,23 +1172,11 @@ func TestHTTPSend(t *testing.T) {
 		t.Fatalf("user session not listed: %v", sb)
 	}
 
-	// GC never collects the user mailbox even without a pi session file
-	moved, err := projStore(t, tmp, "p").GCOrphans(root, 0, map[string]bool{})
-	if err != nil || moved != 0 {
-		t.Fatalf("GC should keep the user mailbox: moved=%d err=%v", moved, err)
-	}
+	// the user mailbox persists (it never goes through hello, so it can
+	// never be rejected or ephemeral)
 	if _, err := os.Stat(filepath.Join(root, ".pi", "mailbox", "user.jsonl")); err != nil {
 		t.Fatalf("user mailbox file should exist: %v", err)
 	}
-}
-
-// projStore opens a raw Store for a project directory (GC assertion helper).
-func projStore(t *testing.T, tmp, project string) *Store {
-	store, err := NewStore(filepath.Join(tmp, "proj", ".pi", "mailbox"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return store
 }
 
 // TestHTTPDelete covers POST /api/delete: the mailbox (mails, meta,
@@ -1279,7 +1196,7 @@ func TestHTTPDelete(t *testing.T) {
 	base := fmt.Sprintf("http://127.0.0.1:%d", port)
 
 	a := dialTest(t, port)
-	a.hello(1, "p", root, "s1", "a", nil)
+	a.helloNamed(1, "p", root, "s1", "orig-1", "alpha", "a", nil)
 	// named login: unnamed mailboxes are ephemeral (no file, die with the
 	// connection), so deletion targets a named account
 	b := dialTest(t, port)

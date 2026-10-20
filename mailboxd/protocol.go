@@ -31,7 +31,6 @@ type HelloMsg struct {
 	Rid         int    `json:"rid"`
 	Project     string `json:"project"`
 	ProjectRoot string `json:"projectRoot,omitempty"`
-	SessionDir  string `json:"sessionDir,omitempty"`
 	// Session is the short mailbox session id the mailbox is keyed by.
 	Session string `json:"session"`
 	// As optionally logs in to a named mailbox: the connection is then keyed
@@ -109,14 +108,6 @@ type ReadMsg struct {
 	T    string  `json:"t"`
 	Rid  int     `json:"rid"`
 	Mail MailRef `json:"mail"`
-}
-
-type CleanupMsg struct {
-	T     string `json:"t"`
-	Rid   int    `json:"rid"`
-	Token string `json:"token,omitempty"`
-	/** Project UUID; empty = all projects. */
-	Project string `json:"project,omitempty"`
 }
 
 type ShutdownMsg struct {
@@ -212,18 +203,6 @@ type MailReply struct {
 	T    string      `json:"t"`
 	Rid  int         `json:"rid"`
 	Mail *MailRecord `json:"mail"`
-}
-
-type CleanupReply struct {
-	T       string          `json:"t"`
-	Rid     int             `json:"rid"`
-	Results []CleanupResult `json:"results"`
-}
-
-type CleanupResult struct {
-	Project string `json:"project"`
-	Moved   int    `json:"moved"`
-	Error   string `json:"error,omitempty"`
 }
 
 type ErrorReply struct {

@@ -100,14 +100,6 @@ func TestNamedMailboxLogin(t *testing.T) {
 	os.MkdirAll(filepath.Join(projectRoot, ".pi", "mailbox"), 0o755)
 	sessionDir := filepath.Join(tmp, "sessions")
 	os.MkdirAll(sessionDir, 0o755)
-	for _, origin := range []string{"originA", "originB", "originC"} {
-		os.WriteFile(filepath.Join(sessionDir, "2026-01-01_"+origin+".jsonl"), []byte("{}\n"), 0o644)
-	}
-
-	gcGrace = 0
-	defer func() {
-		gcGrace = time.Hour
-	}()
 
 	port, stop := bootDaemon(t, tmp, "", false)
 	defer stop()
@@ -129,7 +121,7 @@ func TestNamedMailboxLogin(t *testing.T) {
 
 	// 2. mail to the named mailbox is delivered (address = name)
 	s := dialTest(t, port)
-	if w := s.helloShort(1, project, projectRoot, sessionDir, "shortcccc", "originC", "agent-c", nil); w["t"] != "welcome" {
+	if w := s.helloLogin(1, project, projectRoot, sessionDir, "shortcccc", "originC", "agent-c", "helper-c", ""); w["t"] != "welcome" {
 		t.Fatalf("C welcome: %v", w)
 	}
 	if m := s.request(map[string]interface{}{
@@ -214,35 +206,29 @@ func TestNamedMailboxLogin(t *testing.T) {
 		t.Fatalf("expected session_bound, got %v", e)
 	}
 	// same-name re-login is fine (checked above as step 4/5)
-	// the reverse marker survives a plain re-hello of the derived record
+	// the reverse marker survives a same-name re-login
 	if w := b2.request(map[string]interface{}{
 		"t": "hello", "rid": 6, "project": project, "projectRoot": projectRoot,
 		"sessionDir": sessionDir, "session": "shortbbbb", "origin": "originB",
-		"agent": "agent-b",
+		"agent": "agent-b", "as": "reviewer",
 	}); w["t"] != "welcome" {
-		t.Fatalf("plain re-hello after login: %v", w)
+		t.Fatalf("same-name re-login after login: %v", w)
 	}
 	if e := b2.request(map[string]interface{}{
 		"t": "hello", "rid": 7, "project": project, "projectRoot": projectRoot,
 		"sessionDir": sessionDir, "session": "shortbbbb", "origin": "originB",
 		"agent": "agent-b", "as": "reviewer-three",
 	}); e["t"] != "error" || e["code"] != "session_bound" {
-		t.Fatalf("session_bound must survive a plain re-hello, got %v", e)
+		t.Fatalf("session_bound must survive a same-name re-login, got %v", e)
 	}
-	// _holds is not forgeable via hello meta
+	// _holds is not forgeable via hello meta: the forged value is
+	// ignored and the claim (here a re-claim of the held name) succeeds
 	if w := s.request(map[string]interface{}{
 		"t": "hello", "rid": 8, "project": project, "projectRoot": projectRoot,
 		"sessionDir": sessionDir, "session": "shortcccc", "origin": "originC",
-		"agent": "agent-c", "meta": map[string]string{"_holds": "reviewer"},
+		"agent": "agent-c", "as": "helper-c", "meta": map[string]string{"_holds": "reviewer"},
 	}); w["t"] != "welcome" {
-		t.Fatalf("forge attempt hello: %v", w)
-	}
-	if e := s.request(map[string]interface{}{
-		"t": "hello", "rid": 9, "project": project, "projectRoot": projectRoot,
-		"sessionDir": sessionDir, "session": "shortcccc", "origin": "originC",
-		"agent": "agent-c", "as": "someother",
-	}); e["t"] != "welcome" {
-		t.Fatalf("forged _holds must be ignored (claim should succeed), got %v", e)
+		t.Fatalf("forged _holds must be ignored (claim should succeed), got %v", w)
 	}
 
 	// 7b-release (model E): login A -> hello with release=A, as=B in ONE
@@ -276,14 +262,10 @@ func TestNamedMailboxLogin(t *testing.T) {
 	}); w["t"] != "welcome" || w["released"] != true {
 		t.Fatalf("no-op release should still welcome with released=true, got %v", w)
 	}
-	// release riding a nameless hello (no `as`): still processes
-	if w := b2.request(map[string]interface{}{
-		"t": "hello", "rid": 23, "project": project, "projectRoot": projectRoot,
-		"sessionDir": sessionDir, "session": "shortbbbb", "origin": "originB",
-		"agent": "agent-b", "release": "another-name",
-	}); w["t"] != "welcome" || w["released"] != true {
-		t.Fatalf("nameless hello with release should succeed, got %v", w)
-	}
+	// (release riding a NAMELESS hello is no longer reachable: nameless
+	// hellos are rejected outright. Release-riding is covered above by the
+	// different-name claim (rid 20) and the no-op release (rid 22) — every
+	// hello now carries a name claim.)
 
 	// 7c. self-heal: the ORIGINAL holder (originA) lost "reviewer" to B
 	// (takeover in step 7); its stale _holds must not block a new name
@@ -303,11 +285,11 @@ func TestNamedMailboxLogin(t *testing.T) {
 	// "reviewer" has no online holder; this re-login is the same-origin
 	// OFFLINE re-claim (row 2). Row 3 (same-origin online replace) is
 	// covered by step 4's a2 re-login.)
-	if w := b2.helloLogin(14, project, projectRoot, sessionDir, "shortbbbb", "originB", "agent-b", "reviewer", ""); w["t"] != "welcome" || w["mailbox"] != "reviewer" {
+	if w := b2.helloLogin(14, project, projectRoot, sessionDir, "shortbbbb", "originB", "agent-b", "another-name", ""); w["t"] != "welcome" || w["mailbox"] != "another-name" {
 		t.Fatalf("same-origin online re-login: %v", w)
 	}
 	c4 := dialTest(t, port)
-	if e := c4.helloLoginForce(11, project, projectRoot, sessionDir, "shortdddd", "originD", "agent-d", "reviewer", ""); e["t"] != "error" || e["code"] != "mailbox_in_use" {
+	if e := c4.helloLoginForce(11, project, projectRoot, sessionDir, "shortdddd", "originD", "agent-d", "another-name", ""); e["t"] != "error" || e["code"] != "mailbox_in_use" {
 		t.Fatalf("force must never displace an online holder, got %v", e)
 	}
 	if e := b2.helloLoginForce(12, project, projectRoot, sessionDir, "shortbbbb", "originB", "agent-b", "fresh-name-two", ""); e["t"] != "error" || e["code"] != "session_bound" {
@@ -318,18 +300,4 @@ func TestNamedMailboxLogin(t *testing.T) {
 		t.Fatalf("force on a free name should be a no-op success, got %v", w)
 	}
 
-	// 8. named mailboxes are exempt from the lifecycle GC: delete the
-	//    holder's pi session file, disconnect, run cleanup — the mailbox
-	//    must survive
-	os.Remove(filepath.Join(sessionDir, "2026-01-01_originB.jsonl"))
-	b2.ws.Close(websocket.StatusNormalClosure, "")
-	time.Sleep(100 * time.Millisecond)
-	cm := s.request(map[string]interface{}{"t": "cleanup", "rid": 4})
-	if cm["t"] != "cleanup" {
-		t.Fatalf("cleanup failed: %v", cm)
-	}
-	mailDir := filepath.Join(projectRoot, ".pi", "mailbox")
-	if _, err := os.Stat(filepath.Join(mailDir, "reviewer.jsonl")); err != nil {
-		t.Fatalf("named mailbox should survive the GC: %v", err)
-	}
 }

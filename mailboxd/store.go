@@ -149,10 +149,10 @@ type Store struct {
 	Dir string
 
 	mu sync.Mutex
-	// states is the in-memory mailbox state; ephemeral marks mailboxes that
-	// never touch disk (unnamed/derived ones): their events apply to the
-	// in-memory state only, the map entry survives DropState so a racing
-	// writer cannot resurrect a file, and a daemon restart clears both.
+	// states is the in-memory mailbox state; ephemeral marks records that
+	// never touch disk — with nameless logins rejected, that is exactly the
+	// derived record of a named login (the _holds marker): its events apply
+	// to the in-memory state only, and a daemon restart clears it.
 	states    map[string]*SessionState
 	ephemeral map[string]bool
 }
@@ -224,13 +224,18 @@ func (s *Store) MarkEphemeral(sessionID string) {
 	s.ephemeral[sessionID] = true
 }
 
-// DropState forgets a mailbox's in-memory state (the unnamed-mailbox
-// cleanup on disconnect). The ephemeral marker stays so a writer racing
-// the drop cannot resurrect a file on disk.
-func (s *Store) DropState(sessionID string) {
+// IsDerivedRecord reports whether the id resolves to a derived record:
+// a state with _origin but no _named marker — the in-memory _holds
+// bookkeeping of a named login, or a legacy pre-nameless file. Such a
+// record is not a mailbox: nothing would ever read mail sent to it.
+func (s *Store) IsDerivedRecord(sessionID string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.states, sessionID)
+	st, err := s.state(sessionID)
+	if err != nil {
+		return false
+	}
+	return st.Meta["_origin"] != "" && st.Meta["_named"] == ""
 }
 
 // persistLine appends an event line unless the mailbox is ephemeral.
@@ -720,88 +725,6 @@ func (s *Store) UnreadCount(sessionID string) (int, error) {
 		}
 	}
 	return n, nil
-}
-
-// GCOrphans moves mailbox files of sessions whose pi session file no longer
-// exists into .trash/. The online set is snapshotted by the caller before
-// taking the store lock, so no lock-order inversion is possible.
-func (s *Store) GCOrphans(sessionDir string, grace time.Duration, onlineSnapshot map[string]bool) (int, error) {
-	if sessionDir == "" {
-		return 0, nil
-	}
-	sessionEntries, err := os.ReadDir(sessionDir)
-	if err != nil {
-		return 0, nil
-	}
-	var sessionFiles []string
-	for _, e := range sessionEntries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".jsonl") {
-			sessionFiles = append(sessionFiles, e.Name())
-		}
-	}
-	if len(sessionFiles) == 0 {
-		return 0, nil
-	}
-	alive := func(sessionID string) bool {
-		if sessionID == webUserSession {
-			return true // the web user has no pi session file
-		}
-		// resolve the mailbox's origin (the client's full session id) for
-		// the session-file check; fall back to the mailbox filename for
-		// legacy/origin-less mailboxes
-		origin := sessionID
-		if st, err := s.state(sessionID); err == nil {
-			// named mailboxes are persistent accounts: they outlive any pi
-			// session and are only removed explicitly (web UI / cleanup)
-			if st.Meta["_named"] != "" {
-				return true
-			}
-			if o := st.Meta["_origin"]; o != "" {
-				origin = o
-			}
-		}
-		suffix := "_" + origin + ".jsonl"
-		for _, f := range sessionFiles {
-			if strings.HasSuffix(f, suffix) {
-				return true
-			}
-		}
-		return false
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	files, err := os.ReadDir(s.Dir)
-	if err != nil {
-		return 0, err
-	}
-	moved := 0
-	for _, entry := range files {
-		name := entry.Name()
-		if entry.IsDir() || !strings.HasSuffix(name, ".jsonl") {
-			continue
-		}
-		sessionID := strings.TrimSuffix(name, ".jsonl")
-		if onlineSnapshot[sessionID] || alive(sessionID) {
-			continue
-		}
-		info, err := entry.Info()
-		if err != nil || time.Since(info.ModTime()) < grace {
-			continue
-		}
-		trashDir := filepath.Join(s.Dir, ".trash")
-		if err := os.MkdirAll(trashDir, 0o755); err != nil {
-			return moved, err
-		}
-		stamp := time.Now().UTC().Format("2006-01-02T15-04-05.000")
-		dst := filepath.Join(trashDir, stamp+"_"+name)
-		if err := os.Rename(filepath.Join(s.Dir, name), dst); err != nil {
-			continue
-		}
-		delete(s.states, sessionID)
-		moved++
-	}
-	return moved, nil
 }
 
 // replayLine applies one JSONL event line to the state; returns false when

@@ -56,8 +56,6 @@ export interface HelloMsg {
 	project: string;
 	/** Absolute project root; local-mode daemons store data under its .pi/mailbox. */
 	projectRoot?: string;
-	/** pi session directory for this cwd; enables the daemon's lifecycle GC in local mode. */
-	sessionDir?: string;
 	/** Session id (short base36, derived from agent + pi session id); the mailbox is keyed by this. */
 	session: string;
 	/** Login: claim this named mailbox instead of the derived session id. Rejected with mailbox_in_use while a different origin holds it; same-origin reconnection replaces the previous connection. */

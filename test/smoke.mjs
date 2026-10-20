@@ -51,6 +51,7 @@ try {
 	const shortB = deriveSessionId("agent-b", "sessB");
 	const shortC = deriveSessionId("agent-c", "sessC");
 	const a = new MailboxConnection("local", projectDir, null, "sessA", "agent-a", events(logA), {
+		login: { as: "smoke-a" },
 		helloMeta: { _model: "prov/m1", role: "worker" },
 		canSpawn: true,
 	});
@@ -63,7 +64,9 @@ try {
 
 	// 2. second session joins the same project
 	const logB = { notify: [], connected: 0, disconnected: 0 };
-	const b = new MailboxConnection("local", projectDir, null, "sessB", "agent-b", events(logB));
+	const b = new MailboxConnection("local", projectDir, null, "sessB", "agent-b", events(logB), {
+		login: { as: "smoke-b" },
+	});
 	await b.start();
 	assert(b.connected, "B connected");
 	assert(b.mailbox.project === a.mailbox.project, "both sessions share the project UUID");
@@ -74,15 +77,17 @@ try {
 
 	// 4. send + notify + inbox totals + read
 	const logC = { notify: [], connected: 0, disconnected: 0 };
-	const c = new MailboxConnection("local", projectDir, null, "sessC", "agent-c", events(logC));
+	const c = new MailboxConnection("local", projectDir, null, "sessC", "agent-c", events(logC), {
+		login: { as: "smoke-c" },
+	});
 	await c.start();
 	const ref = await b.mailbox.sendMail(
-		{ project: a.mailbox.project, session: shortC },
+		{ project: a.mailbox.project, session: "smoke-c" },
 		"hello",
 		"world",
 		[],
 	);
-	assert(ref.session === shortC, "send returns the target short id");
+	assert(ref.session === "smoke-c", "send returns the claimed name");
 	await new Promise((r) => setTimeout(r, 200));
 	assert(logC.notify.includes(1), "notify pushed to recipient");
 
@@ -91,19 +96,19 @@ try {
 	assert(inb.mails[0].subject === "hello", "mail content");
 	const mailID = inb.mails[0].id;
 
-	const read = await c.mailbox.read({ project: a.mailbox.project, session: shortC, mail: mailID });
+	const read = await c.mailbox.read({ project: a.mailbox.project, session: "smoke-c", mail: mailID });
 	assert(read?.readAt !== null && read?.readAt !== undefined, "own read marks readAt");
 	const inb2 = await c.mailbox.inbox({ unreadOnly: true });
 	assert(inb2.mails.length === 0, "read mail no longer unread");
 
 	// sender can re-read by triple
-	const again = await b.mailbox.read({ project: a.mailbox.project, session: shortC, mail: mailID });
+	const again = await b.mailbox.read({ project: a.mailbox.project, session: "smoke-c", mail: mailID });
 	assert(again?.body === "world", "sender can read by triple");
 
 	// 5. meta ops: set/unset, system keys rejected, tags
 	await c.mailbox.setMeta({ set: { name: "worker-c", tags: "x,y" } });
 	let list = await a.mailbox.sessions();
-	let cInfo = list.find((s) => s.session === shortC);
+	let cInfo = list.find((s) => s.session === "smoke-c");
 	assert(cInfo?.name === "worker-c" && cInfo?.tags?.join(",") === "x,y", "name/tags visible in sessions");
 	let sysErr = null;
 	try {
@@ -114,22 +119,25 @@ try {
 	assert(sysErr && String(sysErr).includes("bad_meta"), "system key rejected via meta op");
 	await c.mailbox.setMeta({ unset: ["name"] });
 	list = await a.mailbox.sessions();
-	cInfo = list.find((s) => s.session === shortC);
+	cInfo = list.find((s) => s.session === "smoke-c");
 	assert(cInfo?.name === undefined && cInfo?.tags?.length === 2, "name unset, tags kept");
 	assert(c.mailbox.sessionMeta?.name === undefined, "sessionMeta kept in sync after unset");
 
-	// 6. unnamed mailboxes are ephemeral: they die with the connection —
-	// no offline delivery, no offline listing. Named accounts keep both.
+	// 6. nameless logins are rejected outright: every connection must
+	// claim a named account. Named accounts keep offline delivery.
 	await c.stop();
-	let deadErr = null;
+	const logGhost = { notify: [], connected: 0, disconnected: 0 };
+	let namelessErr = null;
 	try {
-		await b.mailbox.sendMail({ project: a.mailbox.project, session: shortC }, "offline mail", "while away", []);
+		const ghost = new MailboxConnection("local", projectDir, null, "sessGhost", "agent-ghost", events(logGhost));
+		await ghost.start();
 	} catch (e) {
-		deadErr = e;
+		namelessErr = e;
 	}
-	assert(deadErr && String(deadErr).includes("no_mailbox"), "send to a disconnected unnamed mailbox: no_mailbox");
-	const withOffline = await a.mailbox.sessions(true);
-	assert(!withOffline.some((s) => s.session === shortC), "disconnected unnamed mailbox not listed");
+	assert(
+		namelessErr && String(namelessErr).includes("name_required"),
+		`nameless login rejected with name_required: ${namelessErr}`,
+	);
 
 	// named offline delivery + listing + reconnect backfill
 	const logD4 = { notify: [], connected: 0, disconnected: 0 };

@@ -13,10 +13,9 @@ var (
 
 // Project is the isolated state of one project (identified by its UUID).
 type Project struct {
-	ID         string
-	Store      *Store
-	RootPath   string // absolute project root (local mode only; informational)
-	SessionDir string // pi session directory, for the lifecycle GC (local mode)
+	ID       string
+	Store    *Store
+	RootPath string // absolute project root (local mode only; informational)
 
 	mu     sync.Mutex
 	online map[string]*conn // session id -> registered connection
@@ -66,18 +65,13 @@ func (p *Project) Register(sessionID string, c *conn) *conn {
 	return old
 }
 
-// Unregister removes a session binding if it still points at c. It
-// reports whether THIS connection was the registered one (a replacement
-// re-hello or a reconnect elsewhere may have taken over) — the caller
-// uses that to decide whether the mailbox dies with the connection.
-func (p *Project) Unregister(sessionID string, c *conn) bool {
+// Unregister removes a session binding if it still points at c.
+func (p *Project) Unregister(sessionID string, c *conn) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.online[sessionID] == c {
 		delete(p.online, sessionID)
-		return true
 	}
-	return false
 }
 
 func (p *Project) OnlineCount() int {

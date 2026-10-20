@@ -69,8 +69,8 @@ export function setupIsolatedDaemon(label) {
  * session id — so real mailboxes can never match, even when their names
  * merely start with a test-ish prefix (e.g. a legit "pr-lead"). The name
  * shape check (prefix + base36 timestamp) is a secondary guard. */
-const TEST_ORIGIN_PREFIXES = ["login-test-", "notif-test-", "held-holder-", "name-taker-"];
-const TEST_NAME_SHAPE = /^(nr|nt|held|pr)-[0-9a-z]{6,}$/;
+const TEST_ORIGIN_PREFIXES = ["login-test-", "notif-test-", "held-holder-", "name-taker-", "login-sender-"];
+const TEST_NAME_SHAPE = /^(nr|nt|held|pr|snd)-[0-9a-z]{6,}$/;
 
 export async function sweepTestMailboxes(connection, apiDelete, project) {
 	try {

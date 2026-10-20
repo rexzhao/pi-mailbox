@@ -39,7 +39,7 @@ export class MailboxError extends Error {
  * name, or a daemon that ignored the login (old daemon). These stop the
  * reconnect loop instead of hammering the daemon with a doomed hello.
  */
-const FATAL_LOGIN_CODES = new Set(["mailbox_in_use", "bad_name", "login_failed", "name_held", "session_bound"]);
+const FATAL_LOGIN_CODES = new Set(["mailbox_in_use", "bad_name", "login_failed", "name_held", "session_bound", "name_required"]);
 
 export function isFatalLoginError(err: unknown): boolean {
 	return err instanceof MailboxError && FATAL_LOGIN_CODES.has(err.code);
@@ -62,7 +62,6 @@ export class MailboxClient {
 	private readonly hello: {
 		project: string;
 		projectRoot?: string;
-		sessionDir?: string;
 		session: string;
 		as?: string;
 		tags?: string;
@@ -81,7 +80,6 @@ export class MailboxClient {
 		hello: {
 			project: string;
 			projectRoot?: string;
-			sessionDir?: string;
 			session: string;
 			as?: string;
 			tags?: string;
@@ -456,7 +454,6 @@ export class MailboxConnection {
 		const hello: {
 			project: string;
 			projectRoot?: string;
-			sessionDir?: string;
 			session: string;
 			as?: string;
 			tags?: string;
@@ -490,7 +487,6 @@ export class MailboxConnection {
 			}
 			url = endpoint.url;
 			hello.projectRoot = this.projectDir;
-			hello.sessionDir = this.sessionDirProvider?.();
 		} else {
 			url = `ws://${this.remote!.host}:${this.remote!.port}`;
 			hello.token = this.remote!.token;
@@ -510,7 +506,6 @@ export class MailboxConnection {
 		hello: {
 			project: string;
 			projectRoot?: string;
-			sessionDir?: string;
 			session: string;
 			as?: string;
 			tags?: string;

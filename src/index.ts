@@ -828,7 +828,7 @@ export default function (pi: ExtensionAPI) {
 				canSpawn,
 			},
 		);
-		// the daemon's lifecycle GC needs the pi session directory (local mode)
+		// the herdr wake path needs the pi session directory (not the hello)
 		connection.sessionDirProvider = () => ctx.sessionManager.getSessionDir();
 		conn = connection;
 		try {

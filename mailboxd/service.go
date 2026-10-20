@@ -22,8 +22,6 @@ import (
 	"github.com/coder/websocket"
 )
 
-var gcGrace = time.Hour
-
 // projectIDRe constrains project ids; the id becomes a directory name in
 // remote mode, so it must not contain path separators or traversal.
 var projectIDRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
@@ -41,11 +39,8 @@ type conn struct {
 	closed  bool
 
 	project *Project
-	session string // mailbox id: the login name, or the derived session id
+	session string // mailbox id: the claimed login name (nameless logins are rejected)
 	agent   string
-	// nameless: this connection registered without a name claim — its
-	// (derived) mailbox is ephemeral and dies with the connection
-	nameless bool
 }
 
 func (c *conn) isOpen() bool {
@@ -100,11 +95,8 @@ func (d *Daemon) httpHandler() http.Handler {
 			d.removeConn(c)
 			if c.project != nil {
 				// Only unregister if THIS connection is still the registered
-				// one (a replacement re-hello may have taken over). An unnamed
-				// (derived) mailbox dies with its connection: drop the state.
-				if c.project.Unregister(c.session, c) && c.nameless {
-					c.project.Store.DropState(c.session)
-				}
+				// one (a replacement re-hello may have taken over).
+				c.project.Unregister(c.session, c)
 			}
 			c.close()
 		}()
@@ -167,8 +159,6 @@ func (c *conn) handleMessage(t string, rid int, data []byte) error {
 		return c.handleInbox(rid, data)
 	case "read":
 		return c.handleRead(rid, data)
-	case "cleanup":
-		return c.handleCleanup(rid, data)
 	case "shutdown":
 		return c.handleShutdown(rid, data)
 	default:
@@ -196,18 +186,27 @@ func (c *conn) handleHello(rid int, data []byte) error {
 		c.send(ErrorReply{T: "error", Rid: &ridCopy, Code: "bad_hello", Message: "invalid project or session"})
 		return nil
 	}
+	// unnamed mailboxes are not allowed: every connection must claim a
+	// named account. (Unnamed mailboxes were an ephemeral in-memory
+	// experiment; they no longer exist at all — this is a hard invariant.)
+	if msg.As == "" {
+		ridCopy := rid
+		c.send(ErrorReply{T: "error", Rid: &ridCopy, Code: "name_required",
+			Message: "unnamed mailboxes are not allowed; connect with as=<name> (log in to a named account)"})
+		return nil
+	}
 	// named-mailbox login: validate the name, then enforce exclusivity —
 	// a second concurrent session (different origin) is rejected, while
 	// the same origin reconnecting replaces the old connection below
 	var claim *Claim
-	mailboxID := msg.Session
+	mailboxID := msg.As
 	var proj *Project
 
 	// deferred release (model E): a logout that could not reach the daemon
 	// rides this hello. MUST run before the session_bound check below —
 	// otherwise {as: Y, release: X} is rejected for holding X before the
-	// release can clear it. Independent of `as`: rides nameless hellos,
-	// re-claims, and different-name claims alike. Only the caller's own
+	// release can clear it. Independent of the claimed name: rides
+	// re-claims and different-name claims alike. Only the caller's own
 	// derived record is touched, only _holds (never _origin, never the
 	// named record), and only if _holds still matches the exact name.
 	// "Nothing to release" is still a DELIVERED answer (the client clears
@@ -229,7 +228,7 @@ func (c *conn) handleHello(rid int, data []byte) error {
 		}
 	}
 
-	if msg.As != "" {
+	{
 		if err := ValidateMailboxName(msg.As); err != nil {
 			ridCopy := rid
 			c.send(ErrorReply{T: "error", Rid: &ridCopy, Code: "bad_name", Message: err.Error()})
@@ -304,31 +303,24 @@ func (c *conn) handleHello(rid int, data []byte) error {
 	}
 
 	// same ws re-helloing as a different session: drop the old registration
-	// (an unnamed mailbox being switched away from dies here too)
 	if c.project != nil && c.session != "" && c.session != mailboxID {
-		if c.project.Unregister(c.session, c) && c.nameless {
-			c.project.Store.DropState(c.session)
-		}
+		c.project.Unregister(c.session, c)
 	}
 	c.project = proj
 	c.session = mailboxID
 	c.agent = msg.Agent
-	c.nameless = claim == nil
 	if old := proj.Register(mailboxID, c); old != nil && old != c {
 		// same session reconnected elsewhere: replace the old connection
 		old.close()
 	}
 
-	// unnamed (derived) mailboxes are ephemeral: in-memory only, never
-	// written to disk, dropped when the connection ends. The derived
-	// record of a NAMED login (the _holds marker below) is ephemeral too:
-	// the binding lives in memory for this daemon's lifetime.
+	// the derived record of a named login (the _holds marker below) is
+	// ephemeral: in-memory only, never written to disk — unnamed mailboxes
+	// are rejected, so nothing unnamed ever lands anywhere
 	proj.Store.MarkEphemeral(msg.Session)
-	if claim != nil {
-		// named mailbox: the file is what makes offline delivery work
-		if err := proj.Store.EnsureSession(mailboxID); err != nil {
-			log.Printf("ensure session %s: %v", mailboxID, err)
-		}
+	// the named mailbox's file is what makes offline delivery work
+	if err := proj.Store.EnsureSession(mailboxID); err != nil {
+		log.Printf("ensure session %s: %v", mailboxID, err)
 	}
 
 	// registration-time meta merge happens atomically inside the store
@@ -370,14 +362,11 @@ func (d *Daemon) project(msg HelloMsg) (*Project, error) {
 	if p, ok := d.projects[msg.Project]; ok {
 		// fill in fields an earlier load may not have had: the read-only
 		// API can load a project on demand without a sessionDir, and the
-		// first real hello must still arm the lifecycle GC (and give the
-		// web UI its path) rather than hitting this early return forever
+		// first real hello must still give the web UI its path rather
+		// than hitting this early return forever
 		if !d.Remote {
 			if p.RootPath == "" && msg.ProjectRoot != "" {
 				p.RootPath = msg.ProjectRoot
-			}
-			if p.SessionDir == "" && msg.SessionDir != "" {
-				p.SessionDir = msg.SessionDir
 			}
 		}
 		return p, nil
@@ -402,9 +391,6 @@ func (d *Daemon) project(msg HelloMsg) (*Project, error) {
 	p := &Project{ID: msg.Project, Store: store, online: map[string]*conn{}}
 	if !d.Remote {
 		p.RootPath = msg.ProjectRoot
-	}
-	if !d.Remote && msg.SessionDir != "" {
-		p.SessionDir = msg.SessionDir
 	}
 	d.projects[msg.Project] = p
 	return p, nil
@@ -564,6 +550,14 @@ func (c *conn) handleSend(rid int, data []byte) error {
 	if !targetProj.Store.HasMailbox(msg.Target.Session) {
 		return c.errorReply(rid, "no_mailbox",
 			fmt.Sprintf("target session %s has no mailbox (never registered)", msg.Target.Session))
+	}
+	// a derived record (the in-memory _holds bookkeeping of a named login,
+	// or a legacy pre-nameless file) is not a mailbox: mail sent there
+	// would never be read (lost on the next restart). Reject instead of
+	// silently dropping it — address the claimed name.
+	if targetProj.Store.IsDerivedRecord(msg.Target.Session) {
+		return c.errorReply(rid, "no_mailbox",
+			fmt.Sprintf("target %s is a derived record, not a mailbox; address the claimed name", msg.Target.Session))
 	}
 	mail := &MailRecord{
 		ID:      newShortID(),
@@ -725,53 +719,6 @@ func (c *conn) handleInbox(rid int, data []byte) error {
 		reply.NextCursor = encodeInboxCursor(page[len(page)-1])
 	}
 	c.send(reply)
-	return nil
-}
-
-// handleCleanup runs the orphan-mailbox GC on demand for the requested
-// project (or all projects). Only local-mode projects with a session
-// directory can be cleaned (remote mode has no pi session files to check).
-func (c *conn) handleCleanup(rid int, data []byte) error {
-	var msg CleanupMsg
-	if err := json.Unmarshal(data, &msg); err != nil {
-		return c.errorReply(rid, "bad_cleanup", "unparsable cleanup")
-	}
-	if c.daemon.AuthToken != "" && !secureTokenEqual(msg.Token, c.daemon.AuthToken) {
-		return c.errorReply(rid, "unauthorized", "invalid token")
-	}
-
-	results := []CleanupResult{}
-	c.daemon.mu.Lock()
-	projects := make([]*Project, 0, len(c.daemon.projects))
-	for _, p := range c.daemon.projects {
-		if msg.Project == "" || p.ID == msg.Project {
-			projects = append(projects, p)
-		}
-	}
-	c.daemon.mu.Unlock()
-
-	for _, p := range projects {
-		if p.SessionDir == "" {
-			if msg.Project != "" {
-				results = append(results, CleanupResult{Project: p.ID, Error: "no session directory (remote mode?)"})
-			}
-			continue
-		}
-		online := map[string]bool{}
-		for sid := range p.OnlineSnapshot() {
-			online[sid] = true
-		}
-		moved, err := p.Store.GCOrphans(p.SessionDir, gcGrace, online)
-		result := CleanupResult{Project: p.ID, Moved: moved}
-		if err != nil {
-			result.Error = err.Error()
-		}
-		results = append(results, result)
-		if moved > 0 {
-			log.Printf("cleanup project %s: moved %d orphan mailbox(es)", p.ID, moved)
-		}
-	}
-	c.send(CleanupReply{T: "cleanup", Rid: rid, Results: results})
 	return nil
 }
 

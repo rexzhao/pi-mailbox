@@ -64,9 +64,10 @@ console.log(`test session: ${derivedId} (origin ${origin}), named mailbox: ${NAM
 
 // the sender connection also boots the isolated daemon (canSpawn), so the
 // spawned agent's probe finds it running
+const SENDER_NAME = `snd-${Date.now().toString(36)}`;
 const sender = new MailboxConnection("local", projectDir, null, `login-sender-${Date.now().toString(36)}`, "pi", {
 	onNotify: () => {}, onConnected: () => {}, onDisconnected: () => {},
-}, { canSpawn: true });
+}, { login: { as: SENDER_NAME }, canSpawn: true });
 await sender.start();
 PROJECT_ID = sender.mailbox.project;
 await sweepTestMailboxes(sender, apiDelete, PROJECT_ID);

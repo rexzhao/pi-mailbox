@@ -29,15 +29,12 @@ below.
   "Comments" are modeled as new mails that reference the original via `refs`.
 - Offline delivery: the target of a send must have a mailbox (i.e. have
   registered at least once) but does not need to be online — offline mail
-  is delivered as unread on the target's next connection. Delivery is
-  best-effort: once a session's pi session is deleted and its mailbox is
-  collected by the GC, mail to it fails (no_mailbox) and previously sent
-  mail becomes unreachable.
+  is delivered as unread on the target's next connection.
 - Sessions register per project; a session may instead **log in to a named
   mailbox** (`/mailbox login <name> [tags=a,b]` or `mailbox_connect` with
   `as`): the mailbox is then keyed by the name, inheriting its mails, tags,
-  and meta wholesale. Named mailboxes are persistent accounts — they are
-  exempt from the lifecycle GC and only removed explicitly. Login names are
+  and meta wholesale. Named mailboxes are persistent accounts — only
+  removed explicitly. Login names are
   3-32 chars `[a-z][a-z0-9_-]` (never a derived-id shape, `user` reserved).
   A session may hold at most one name: the daemon tracks the reverse
   binding (`_holds` on the session's own record, O(1) at login) and rejects
@@ -45,9 +42,9 @@ below.
   `/mailbox logout` (model E): the client records a pending release that
   rides the NEXT hello, surviving daemon downtime and pi restarts. The
   daemon clears `_holds` on the caller's derived record only if it still
-  matches the released name — never `_origin` (the GC needs it), never the
-  named record. A stale reverse binding (the name was taken over or
-  deleted) self-heals against the authoritative `_origin`. The release is
+  matches the released name — never `_origin`, never the named record. A
+  stale reverse binding (the name was taken over or deleted) self-heals
+  against the authoritative `_origin`. The release is
   client-asserted, same trust class as `force` within a project.
   The extension refuses nameless connections entirely: a session with no
   login gets "no login for this session" from every connect path — named
@@ -80,8 +77,8 @@ below.
   now held falls back to the derived identity (surfaced in the tool output)
   instead of failing the connection. `/mailbox logout` (alias `off`)
   disconnects AND clears the binding. Named mailboxes are permanent
-  accounts: they are never GC'd and can only be deleted from the web UI
-  (or `POST /api/delete`) while offline.
+  accounts: they are only deleted explicitly from the web UI (or
+  `POST /api/delete`) while offline.
 - Session meta is cookie-like key/value data (`Record<string, string>`;
   keys match `/^[a-zA-Z_][a-zA-Z0-9_.-]{0,63}$/`, values are capped at 512
   chars, at most 32 user keys and 8 system keys). Keys starting with `_` are
@@ -94,13 +91,12 @@ below.
 - Storage is a per-session JSONL event log at
   `<project>/.pi/mailbox/<sessionId>.jsonl` (`send` / `read` / `meta` events),
   lazily loaded, replayed on service start.
-- Lifecycle GC: mailboxes are collected only for sessions whose pi session
-  file is gone. Three safety layers, because pi session files are lazily
-  created: the GC runs ~30s after the service starts (after reconnecting
-  clients have re-registered), skips currently online sessions, and only
-  collects files idle for over an hour. Collected files land in
-  `<project>/.pi/mailbox/.trash/`; unreadable or empty session directories
-  disable the GC entirely.
+- No unnamed mailboxes: every connection must claim a named account
+  (hello without `as` is rejected with `name_required`). The derived
+  bookkeeping record of a named login (the `_holds` reverse marker) is
+  in-memory only for the daemon's lifetime: `session_bound` is enforced
+  across reconnects, but a daemon restart forgets the binding. Mailbox
+  files on disk are never garbage-collected; remove stale ones manually.
 - Delivery: new-mail notices are coalesced at turn boundaries. While the
   agent runs, arriving notifies are held and flushed as ONE steered
   message at the next `turn_end` (the earliest moment a steered message is
@@ -291,14 +287,13 @@ resolving and surface as orphan roots).
 Note on identity changes: ids are derivations, so any change to the
   derivation inputs (agent kind, session id, host id, project path) maps a
   session to a new mailbox. The old mailbox file is not migrated — its mails
-  stay on disk, invisible to the relocated session, and are collected by
-  `mailboxd cleanup` once the underlying pi session is gone (or immediately
-  if the mailbox has no live origin).
+  stay on disk, invisible to the relocated session; delete it manually if
+  no longer wanted.
 
 The wire protocol is protocol v2: `hello` carries the short project id,
-  the project root (local mode), an optional pi session directory (lifecycle
-  GC), the session's origin id (the full pi session id, stored as the
-  `_origin` system meta for the lifecycle GC), and an optional token; `welcome`/`pong` carry a `protocolVersion`.
+  the project root (local mode), and the session's origin id (the full pi
+  session id, stored as the `_origin` system meta), plus an optional token;
+  `welcome`/`pong` carry a `protocolVersion`.
   Cross-project sends are allowed when the target project is also registered
   on the daemon. See `mailboxd/protocol.go`.
 

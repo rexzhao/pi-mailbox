@@ -46,11 +46,6 @@ func main() {
 			commonFlags(fs)
 			fs.Parse(os.Args[2:])
 			os.Exit(stopDaemon(commonRegistry, commonToken))
-		case "cleanup":
-			fs := flag.NewFlagSet("cleanup", flag.ExitOnError)
-			commonFlags(fs)
-			fs.Parse(os.Args[2:])
-			os.Exit(cleanupDaemon(commonRegistry, commonToken))
 		case "view":
 			fs := flag.NewFlagSet("view", flag.ExitOnError)
 			commonFlags(fs)
@@ -370,7 +365,6 @@ func printUsage() {
 	fmt.Println("Usage:")
 	fmt.Println("  mailboxd [daemon-flags]       start the daemon (or: mailboxd serve [daemon-flags])")
 	fmt.Println("  mailboxd stop [options]       stop the running daemon")
-	fmt.Println("  mailboxd cleanup [options]    run orphan-mailbox cleanup on the running daemon")
 	fmt.Println("  mailboxd view [options]       print the web UI address of the running daemon")
 	fmt.Println("  mailboxd version              print the version")
 	fmt.Println()
@@ -389,7 +383,7 @@ func printUsage() {
 	fmt.Println("  --json                    print JSON {url, host, port, instanceId, remote, protocolVersion}")
 	fmt.Println("  --token-file <path>       file containing the connection token")
 	fmt.Println()
-	fmt.Println("Subcommand options (stop / cleanup / view):")
+	fmt.Println("Subcommand options (stop / view):")
 	fmt.Println("  --registry <file>         registry file path")
 	fmt.Println("  --token <secret>          connection token")
 }
