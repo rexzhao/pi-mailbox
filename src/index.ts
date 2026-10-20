@@ -452,6 +452,83 @@ export default function (pi: ExtensionAPI) {
 		refreshFooter();
 		void autoConnect(event, ctx);
 	});
+	// renaming the session to a name that is a valid mailbox name, when
+	// this session is not logged in anywhere, logs in to that mailbox —
+	// the same effect as /mailbox login <name> (never forces a takeover)
+	pi.on("session_info_changed", (event, ctx) => {
+		void maybeLoginFromSessionName(event.name, ctx);
+	});
+	/** Rename-login in flight: a second rename while the first attempt is
+	 * still settling is ignored (it would hit session_bound against the
+	 * in-flight identity and surface a confusing warning). */
+	let renameLoginInFlight = false;
+
+	/**
+	 * Auto-login from a session rename: fires only when the session has no
+	 * mailbox identity yet (not connected, no stored binding) and the new
+	 * name is a VALID mailbox name (strict lowercase grammar — anything
+	 * else is just a display name, not a login attempt). Requires a
+	 * running daemon (no spawn); failures surface as a notice, never a
+	 * force.
+	 */
+	async function maybeLoginFromSessionName(
+		name: string | undefined,
+		ctx: {
+			sessionManager: {
+				getSessionId(): string;
+				getCwd(): string;
+				getSessionDir(): string;
+				getEntries?(): Array<{ type: string; customType?: string; data?: unknown }>;
+			};
+			model?: { id: string; provider: string } | undefined;
+			ui?: { notify(message: string, kind?: string): void };
+		},
+	): Promise<void> {
+		if (name === undefined) return; // name cleared
+		if (conn?.connected) return; // already connected under an identity
+		if (readStoredLogin(ctx)) return; // has a login binding: renaming does not re-login
+		if (!validMailboxName(name)) return; // not mailbox-name-shaped: just a display name
+		if (renameLoginInFlight) return; // a rename-login is still settling
+		renameLoginInFlight = true;
+		try {
+			await loginFromSessionName(name, ctx);
+		} finally {
+			renameLoginInFlight = false;
+		}
+	}
+
+	async function loginFromSessionName(
+		name: string,
+		ctx: {
+			sessionManager: {
+				getSessionId(): string;
+				getCwd(): string;
+				getSessionDir(): string;
+				getEntries?(): Array<{ type: string; customType?: string; data?: unknown }>;
+			};
+			model?: { id: string; provider: string } | undefined;
+			ui?: { notify(message: string, kind?: string): void };
+		},
+	): Promise<void> {
+		const endpoint = await connectLocalDaemonIfRunning();
+		if (!endpoint) {
+			ctx.ui?.notify(
+				`mailbox: session name '${name}' is a valid mailbox name, but the daemon is not running — run /mailbox start service, then /mailbox login ${name}`,
+				"info",
+			);
+			return;
+		}
+		try {
+			const connection = await startConnection(ctx, null, { as: name });
+			storeLogin(name);
+			ctx.ui?.notify(`mailbox: logged in as ${connection.address} (from the session name)`, "info");
+		} catch (err) {
+			ctx.ui?.notify(
+				`mailbox: auto-login from the session name failed: ${err instanceof Error ? err.message : String(err)}`,
+				"warning",
+			);
+		}
+	}
 	pi.on("agent_start", () => {
 		busy = true;
 	});

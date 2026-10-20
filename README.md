@@ -174,6 +174,13 @@ below.
 - `/mailbox logout` — log out: disconnect, clear the login binding, and
   record a pending daemon-side release that rides the next hello
   (`off` is an alias)
+- Rename-to-login: renaming the pi session (pi's `/name`) to a name that
+  is a VALID mailbox name, while the session has no mailbox identity yet
+  (not connected, no stored binding), logs in to that mailbox — the same
+  effect as `/mailbox login <name>`. Display names that are not valid
+  mailbox names (uppercase, spaces, non-ASCII) never trigger it; a
+  rename never re-logins an identified session and never forces a
+  takeover; the daemon must already be running (no spawn).
 - `/mailbox delete <name> [<name> ...]` — hard-delete mailboxes in this
   project (mails, meta, registration — irreversibly; local mode only, no
   login required). Works for named and derived mailboxes; the holder

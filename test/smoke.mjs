@@ -26,6 +26,12 @@ if (!existsSync(daemonBin)) {
 const home = mkdtempSync(join(tmpdir(), "pi-mailboxd-home-"));
 process.env.PI_MAILBOXD_DIR = home;
 process.env.PI_MAILBOXD = daemonBin;
+// daemon log for diagnosability (kept across runs; small): spawn-related
+// flakes used to be undiagnosable because the detached daemon's stderr
+// was discarded
+const daemonLog = join(tmpdir(), `pi-mailbox-smoke-daemon-${process.pid}.log`);
+process.env.PI_MAILBOXD_LOG = daemonLog;
+console.log(`daemon log: ${daemonLog}`);
 
 const projectDir = mkdtempSync(join(tmpdir(), "pi-mailbox-project-"));
 mkdirSync(join(projectDir, ".pi"), { recursive: true });
@@ -540,9 +546,17 @@ try {
 		restartNoLogin && /service restarted/.test(restartNoLogin.msg) && /login <name>/.test(restartNoLogin.msg),
 		`restart service without login restarts the service: ${restartNoLogin?.msg}`,
 	);
-	// liveness: the daemon must actually be back up after the restart
+	// liveness: the daemon must actually be back up after the restart —
+	// POLLED (the command's internal 500ms sleep is not a guarantee; a
+	// stale registry read right here was the suspected cause of the
+	// section-13-tail fetch flake)
 	const { connectLocalDaemonIfRunning } = await import("../src/daemon.ts");
-	assert((await connectLocalDaemonIfRunning()) !== null, "daemon is live after restart service");
+	let liveEndpoint = null;
+	for (let i = 0; i < 50 && !liveEndpoint; i++) {
+		liveEndpoint = await connectLocalDaemonIfRunning();
+		if (!liveEndpoint) await new Promise((r) => setTimeout(r, 100));
+	}
+	assert(liveEndpoint !== null, "daemon is live after restart service (polled)");
 
 	// identity rule is shipped with the mailbox: present in the namespace
 	// instructions (every tool registration), the mailbox_connect
@@ -840,6 +854,38 @@ try {
 	assert(dup2.connected && !dup1.connected, "no ping-pong: winner stays up, loser stays down");
 	await dup1.stop();
 	await dup2.stop();
+
+	// 16. rename-to-login: a session_info_changed with a valid mailbox
+	// name, while not logged in, logs in to that mailbox (like /mailbox
+	// login); never re-logins an identified session; invalid names are
+	// just display names
+	const infoChanged = registeredEvents.get("session_info_changed");
+	assert(typeof infoChanged === "function", "session_info_changed handler registered");
+	// negative: while connected, a rename does NOT re-login
+	cmdNotifies.length = 0;
+	await infoChanged({ type: "session_info_changed", name: "renamed-name" }, cmdCtx(recordedEntries));
+	await new Promise((r) => setTimeout(r, 400));
+	assert(!cmdNotifies.some((n) => /logged in/.test(n.msg)), "rename while connected does not re-login");
+	// logout (disconnects + clears the binding), then rename -> auto-login
+	await runCommand("logout", cmdCtx(recordedEntries));
+	cmdNotifies.length = 0;
+	await infoChanged({ type: "session_info_changed", name: "renamed-name" }, cmdCtx(recordedEntries));
+	let loginNote = null;
+	for (let i = 0; i < 30 && !loginNote; i++) {
+		await new Promise((r) => setTimeout(r, 100));
+		loginNote = cmdNotifies.find((n) => /logged in/.test(n.msg)) ?? null;
+	}
+	assert(loginNote && loginNote.msg.includes("renamed-name"), `rename with a valid name logs in: ${loginNote?.msg}`);
+	assert(
+		recordedEntries.some((e) => e.customType === "pi-mailbox-login" && e.data?.name === "renamed-name"),
+		"auto-login persists the binding",
+	);
+	// invalid name while logged out: no login
+	await runCommand("logout", cmdCtx(recordedEntries));
+	cmdNotifies.length = 0;
+	await infoChanged({ type: "session_info_changed", name: "Not A Valid Name" }, cmdCtx(recordedEntries));
+	await new Promise((r) => setTimeout(r, 600));
+	assert(!cmdNotifies.some((n) => /logged in/.test(n.msg)), "invalid name does not log in");
 } finally {
 	// the daemon is detached and holds the lock file in the temp home; stop
 	// it via the pid recorded in the registry so cleanup can remove the dir

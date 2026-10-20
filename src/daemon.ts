@@ -15,7 +15,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { closeSync, existsSync, openSync } from "node:fs";
 import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { createHash, randomBytes } from "node:crypto";
@@ -113,12 +113,24 @@ function spawnMailboxd(): void {
 			"mailboxd binary not found; set PI_MAILBOXD or build it with `go build` in mailboxd/",
 		);
 	}
+	// optional daemon log (tests set PI_MAILBOXD_LOG so spawn-related
+	// flakes are diagnosable; the daemon logs to stderr, which is
+	// otherwise discarded by the detached spawn)
+	let stderr: "ignore" | number = "ignore";
+	if (process.env.PI_MAILBOXD_LOG) {
+		try {
+			stderr = openSync(process.env.PI_MAILBOXD_LOG, "a");
+		} catch {
+			// fall back to discarding stderr
+		}
+	}
 	const child = spawn(bin, [], {
 		detached: true,
-		stdio: ["ignore", "ignore", "ignore"],
+		stdio: ["ignore", "ignore", stderr],
 		windowsHide: true,
 		env: { ...process.env },
 	});
+	if (typeof stderr === "number") closeSync(stderr); // the child holds its own dup
 	// absorb spawn errors (ENOENT etc.) so they surface via the registry
 	// timeout instead of crashing the pi process with an unhandled 'error'
 	child.on("error", () => {
