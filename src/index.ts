@@ -220,10 +220,12 @@ type FooterData = ConstructorParameters<typeof FooterComponent>[1];
 
 /**
  * The default pi footer with the session's mailbox address riding on the
- * FIRST line, right after the git branch — no extra footer height. The
+ * FIRST line, AFTER the session name — no extra footer height. The
  * stats line and any extension statuses render unchanged through
- * super.render(); only line 1 is recomposed (cwd (branch) <address>
- * • sessionName, truncated before styling so ANSI codes stay intact).
+ * super.render(); only line 1 is recomposed (cwd (branch) • sessionName
+ * <address>, truncated before styling so ANSI codes stay intact). The
+ * name keeps pi's default position, so connection transitions only
+ * append/remove the trailing address instead of relocating the name.
  */
 class MailboxFooterComponent extends FooterComponent {
 	private readonly footerTheme: { fg(style: string, text: string): string };
@@ -264,13 +266,18 @@ class MailboxFooterComponent extends FooterComponent {
 			let line = shortCwd(this.sessionRef.sessionManager.getCwd());
 			const branch = this.dataRef.getGitBranch();
 			if (branch) line += ` (${branch})`;
+			// session name FIRST (byte-identical position to pi's default
+			// footer), mail address AFTER it: connected/disconnected transitions
+			// then only append/remove the trailing address instead of moving
+			// the name around (which read as flicker), and truncation eats the
+			// address before the name
+			const sessionName = this.sessionRef.sessionManager.getSessionName();
+			if (sessionName) line += ` • ${sessionName}`;
 			if (address) line += ` ${address}`;
 			// unread badge after the address: only while connected and only
 			// when there is something unread (U+2709, visual width 1)
 			const unread = this.getUnread();
 			if (address && unread !== null && unread > 0) line += ` ✉${unread}`;
-			const sessionName = this.sessionRef.sessionManager.getSessionName();
-			if (sessionName) line += ` • ${sessionName}`;
 			const styled = this.footerTheme.fg("dim", truncateVisual(line, width));
 			if (lines.length === 0) return [styled]; // degraded: at least line 1
 			lines[0] = styled;

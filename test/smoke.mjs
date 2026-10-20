@@ -622,6 +622,24 @@ try {
 	}
 	assert(decremented, `footer badge decremented to ${unreadBefore - 1} after a read: ${renderLine1()}`);
 
+	// ordering (pinned): the session name sits at pi's default position and
+	// the mail address comes AFTER it — a swap back to the old
+	// "address • name" order fails here
+	const ordered = renderLine1();
+	assert(
+		ordered.includes("smoke-footer-agent") &&
+			ordered.indexOf("smoke-footer-agent") < ordered.indexOf("extsmoke@"),
+		`footer order: name before address (${ordered})`,
+	);
+	// truncation (pinned): at a width that fits the name but not the
+	// address, the name survives and the address/badge are eaten first
+	const cut = ordered.indexOf("extsmoke@");
+	const narrow = component.render(cut)[0];
+	assert(
+		narrow.includes("smoke-footer-agent") && !narrow.includes("extsmoke@") && !narrow.includes("\u2709"),
+		`footer truncation keeps the name, eats the address first (${narrow})`,
+	);
+
 	// startConnection race: a failing concurrent connect must not orphan a
 	// live one. A = same-origin reconnect (extsmoke, succeeds); B = claim of
 	// a name held ONLINE by a foreign-origin raw connection (mailbox_in_use,
