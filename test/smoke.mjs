@@ -861,6 +861,43 @@ try {
 	// just display names
 	const infoChanged = registeredEvents.get("session_info_changed");
 	assert(typeof infoChanged === "function", "session_info_changed handler registered");
+
+	// 16a. /mailbox argument completions (while connected as extsmoke)
+	const mailboxCmd = registeredCommands.get("mailbox");
+	assert(typeof mailboxCmd.getArgumentCompletions === "function", "getArgumentCompletions registered");
+	// first argument: subcommands with placeholder labels and typed values
+	let compl = await mailboxCmd.getArgumentCompletions("lo");
+	assert(
+		compl && compl.length === 2 && compl.every((i) => i.value.endsWith(" ")),
+		`subcommand completion 'lo' -> login/logout: ${JSON.stringify(compl)}`,
+	);
+	assert(
+		compl.some((i) => i.value === "login " && i.label === "login <name>"),
+		"login completion: value is typed text, label carries the placeholder",
+	);
+	compl = await mailboxCmd.getArgumentCompletions("start");
+	assert(
+		compl && compl.length === 1 && compl[0].value === "start service ",
+		`multi-word subcommand completes as one value: ${JSON.stringify(compl)}`,
+	);
+	assert(await mailboxCmd.getArgumentCompletions("zzz") === null, "no subcommand match -> null");
+	// login <name>: live name list through the connected session
+	compl = await mailboxCmd.getArgumentCompletions("login ");
+	assert(
+		compl && compl.some((i) => i.value === "extsmoke " && i.description === "online"),
+		`login name completion includes the online extsmoke: ${JSON.stringify((compl ?? []).slice(0, 3))}`,
+	);
+	assert(compl.every((i) => i.value !== "user "), "user is never offered as a login name");
+	// delete <name>: online holders are not deletable -> filtered out
+	compl = await mailboxCmd.getArgumentCompletions("delete ");
+	assert(
+		compl && !compl.some((i) => i.value === "extsmoke "),
+		"delete name completion omits the online extsmoke",
+	);
+	assert(compl.some((i) => i.value === "smoke-reviewer "), "delete offers offline named mailboxes");
+	// two-plus arguments: no suggestions
+	assert(await mailboxCmd.getArgumentCompletions("login a b") === null, "third argument -> null");
+
 	// negative: while connected, a rename does NOT re-login
 	cmdNotifies.length = 0;
 	await infoChanged({ type: "session_info_changed", name: "renamed-name" }, cmdCtx(recordedEntries));

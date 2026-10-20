@@ -1085,8 +1085,80 @@ export default function (pi: ExtensionAPI) {
 	// command
 	// -----------------------------------------------------------------------
 
+	/**
+	 * /mailbox argument completions (pi's RegisteredCommand hook): the
+	 * provider receives everything after the command name, filters itself,
+	 * and returns items whose value carries a trailing space so the cursor
+	 * advances past the word (pi's own MCP extension set the convention).
+	 *
+	 * First argument: subcommands with descriptions. "login"/"resume
+	 * <name>": known mailbox names (live query, connected only — never
+	 * spawns). "delete <name>": offline names only (online holders cannot
+	 * be deleted). Everything else: null (no suggestions).
+	 */
+	async function mailboxArgumentCompletions(
+		argumentPrefix: string,
+	): Promise<Array<{ value: string; label: string; description?: string }> | null> {
+		// [value (what gets typed), label (what gets shown), description]
+		const subs: Array<[string, string, string]> = [
+			["login", "login <name>", "log in to a named mailbox"],
+			["logout", "logout", "disconnect and clear the binding"],
+			["resume", "resume <name>", "resume a named mailbox's session"],
+			["delete", "delete <name>", "delete an offline named mailbox"],
+			["start service", "start service", "start the daemon (the only spawn path)"],
+			["stop service", "stop service", "stop the daemon"],
+			["restart service", "restart service", "restart the daemon"],
+			["view", "view", "open the daemon's web UI"],
+			["status", "status", "connection status"],
+			["list", "list", "list this session's mail"],
+			["meta", "meta", "show this session's meta"],
+			["name", "name <n>", "set the display name meta"],
+			["tag", "tag <a,b>", "set the tags meta"],
+			["set", "set k=v", "set meta values"],
+			["unset", "unset k", "remove meta values"],
+			["read", "read <mail-ref>", "read one mail"],
+			["more", "more <cursor>", "next page of mail"],
+		];
+		const parts = argumentPrefix.trimStart().split(/\s+/);
+		if (parts.length === 1) {
+			const typed = parts[0] ?? "";
+			const items = subs
+				.filter(([value]) => value.startsWith(typed))
+				.map(([value, label, desc]) => ({ value: value + " ", label, description: desc }));
+			return items.length > 0 ? items : null;
+		}
+		const action = parts[0];
+		const typed = parts[1] ?? "";
+		if (parts.length > 2) return null;
+		if (action !== "login" && action !== "resume" && action !== "delete") return null;
+		// name completion: live query through the connected session only
+		// (never spawns; daemon down -> no suggestions)
+		const c = conn;
+		if (!c?.connected) return null;
+		let sessions: SessionInfo[];
+		try {
+			sessions = await c.mailbox.sessions(true);
+		} catch {
+			return null; // transient daemon hiccup: no suggestions
+		}
+		// validMailboxName encodes exactly the exclusions (user, derived
+		// shape) plus the full grammar — DRY over an inline re-implementation
+		const named = sessions.filter((s) => validMailboxName(s.session));
+		const deletable = action === "delete";
+		const items = named
+			.filter((s) => (deletable ? !s.online : true))
+			.filter((s) => s.session.startsWith(typed))
+			.map((s) => ({
+				value: s.session + " ",
+				label: s.session,
+				description: s.online ? "online" : "offline",
+			}));
+		return items.length > 0 ? items : null;
+	}
+
 	pi.registerCommand("mailbox", {
 		description: "Connect to the project mailbox, list mails, and manage the connection",
+		getArgumentCompletions: (argumentPrefix: string) => mailboxArgumentCompletions(argumentPrefix),
 		handler: async (args, ctx) => {
 			const arg = args.trim();
 

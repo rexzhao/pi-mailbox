@@ -135,6 +135,13 @@ below.
 
 ## Commands
 
+`/mailbox` supports argument completions (pi's getArgumentCompletions
+hook): subcommands with descriptions for the first argument, and live
+mailbox-name completion for `login`/`resume` (all named mailboxes,
+marked online/offline) and `delete` (offline ones only — online holders
+cannot be deleted). Name completion queries through the connected
+session only; a down daemon yields no suggestions.
+
 - While connected, the session's mailbox address (name@project) rides on
   the pi footer's FIRST line, right after the project path and git branch
   — a custom footer component subclassing pi's default (stats line and
