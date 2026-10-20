@@ -307,6 +307,10 @@ The wire protocol is protocol v2: `hello` carries the short project id,
 The extension locates the `mailboxd` binary via `$PI_MAILBOXD`, then
 `<package>/mailboxd/mailboxd[.exe]`. Build it with `go build` in `mailboxd/`
 (or cross-compile with `CGO_ENABLED=0 GOOS=... GOARCH=... go build`).
+The daemon's registry lives under `$PI_MAILBOXD_DIR` (default `~/.pi`).
+When spawning a daemon, the extension routes its stderr (startup,
+shutdown, takeover log lines) to `$PI_MAILBOXD_LOG` when set — useful
+for diagnosing spawn-related issues; unset, stderr is discarded.
 
 ## Install
 

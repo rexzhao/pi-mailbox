@@ -886,6 +886,9 @@ try {
 	await infoChanged({ type: "session_info_changed", name: "Not A Valid Name" }, cmdCtx(recordedEntries));
 	await new Promise((r) => setTimeout(r, 600));
 	assert(!cmdNotifies.some((n) => /logged in/.test(n.msg)), "invalid name does not log in");
+
+	// success: drop this run's daemon log (kept on failure for diagnosis)
+	rmSync(daemonLog, { force: true });
 } finally {
 	// the daemon is detached and holds the lock file in the temp home; stop
 	// it via the pid recorded in the registry so cleanup can remove the dir
