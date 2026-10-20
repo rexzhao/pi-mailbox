@@ -747,6 +747,40 @@ try {
 	assert(ownCounted !== undefined && ownCounted.total !== undefined && ownCounted.total >= 1, "includeSessions: own project total >= 1");
 	assert(ownCounted !== undefined && ownCounted.online !== undefined && ownCounted.online >= 1, "includeSessions: own project online >= 1");
 	assert(pr.content[0].text.includes(extProject), "projects text lists own project id");
+
+	// 14. canSpawn is ONE-SHOT: a connection that may spawn on its first
+	// attempt must NOT resurrect a deliberately stopped daemon from its
+	// reconnect loop (200-1000ms retry delays; we wait past them)
+	const logR = { notify: [], connected: 0, disconnected: 0 };
+	const r1 = new MailboxConnection("local", projectDir, null, "respawn-sess-1", "respawn-agent", events(logR), {
+		login: { as: "respawn-guard" },
+		canSpawn: true,
+	});
+	await r1.start();
+	assert(r1.connected, "canSpawn connection established (daemon was running)");
+	const { readFileSync: rf } = await import("node:fs");
+	const reg1 = JSON.parse(rf(join(home, "mailboxd.json"), "utf8"));
+	process.kill(reg1.pid, "SIGTERM");
+	await new Promise((r) => setTimeout(r, 2600)); // daemon exits + retries fire
+	let resurrected = false;
+	try {
+		const reg2 = JSON.parse(rf(join(home, "mailboxd.json"), "utf8"));
+		if (typeof reg2.pid === "number" && reg2.pid !== reg1.pid) resurrected = true;
+	} catch {
+		// registry gone: daemon down and nobody respawned it
+	}
+	assert(!resurrected, "a canSpawn connection's retry loop must NOT respawn a stopped daemon");
+	await r1.stop();
+	// an explicit start DOES bring it back: a fresh canSpawn connection
+	// (same session id => same origin: an offline same-origin re-claim)
+	const logR2 = { notify: [], connected: 0, disconnected: 0 };
+	const r2 = new MailboxConnection("local", projectDir, null, "respawn-sess-1", "respawn-agent", events(logR2), {
+		login: { as: "respawn-guard" },
+		canSpawn: true,
+	});
+	await r2.start();
+	assert(r2.connected, "a fresh explicit-start connection DOES spawn the daemon");
+	await r2.stop();
 } finally {
 	// the daemon is detached and holds the lock file in the temp home; stop
 	// it via the pid recorded in the registry so cleanup can remove the dir

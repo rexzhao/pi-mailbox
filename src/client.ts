@@ -315,7 +315,12 @@ export interface ConnectionOptions {
 	release?: string;
 	/** Registration-time meta defaults: system keys (`_`-prefixed) refresh on every connect; user keys apply only when absent. */
 	helloMeta?: Record<string, string>;
-	/** When true, the connection may spawn a new daemon when none is running. Only /mailbox start service sets this. */
+	/**
+	 * When true, the FIRST connect attempt may spawn a new daemon when none
+	 * is running (the explicit-start intent of /mailbox start|restart service
+	 * and /mailbox login). Reconnect attempts NEVER spawn: a deliberately
+	 * stopped daemon must stay down until someone explicitly starts it again.
+	 */
 	canSpawn?: boolean;
 }
 
@@ -337,6 +342,8 @@ export class MailboxConnection {
 	private client: MailboxClient | null = null;
 	private reconnectTimer: NodeJS.Timeout | null = null;
 	private stopped = false;
+	/** canSpawn is one-shot: only the first attempt may bring a daemon up. */
+	private spawnUsed = false;
 	/** True when the last failure was a permanent login rejection (no retry). */
 	get loginRejected(): boolean {
 		return this.loginRejectedFlag;
@@ -476,7 +483,8 @@ export class MailboxConnection {
 		};
 		if (this.mode === "local") {
 			let endpoint;
-			if (this.options.canSpawn) {
+			if (this.options.canSpawn && !this.spawnUsed) {
+				this.spawnUsed = true;
 				endpoint = await resolveLocalDaemon();
 			} else {
 				const running = await connectLocalDaemonIfRunning();
