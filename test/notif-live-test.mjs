@@ -41,9 +41,12 @@ console.log(`test session origin: ${origin}, named mailbox: ${NAME}`);
 
 // 1. fresh tab + start pi (new extension code) with a long-ish task
 // sweep BEFORE this run's agent exists, so it can never consider it
+// connections never spawn the daemon: bring it up explicitly first
+const { resolveLocalDaemon } = await import("../src/daemon.ts");
+await resolveLocalDaemon();
 const preSender = new MailboxConnection("local", projectDir, null, `notif-sweep-${Date.now().toString(36)}`, "pi", {
 	onNotify: () => {}, onConnected: () => {}, onDisconnected: () => {},
-}, { canSpawn: true });
+});
 await preSender.start();
 await sweepTestMailboxes(preSender, apiDelete, preSender.mailbox.project);
 await preSender.stop();
@@ -65,7 +68,7 @@ await herdr([
 // 2. sender client: wait until the named mailbox is online, then send 3 mails mid-run
 const sender = new MailboxConnection("local", projectDir, null, `notif-sender-${Date.now().toString(36)}`, "pi", {
 	onNotify: () => {}, onConnected: () => {}, onDisconnected: () => {},
-}, { canSpawn: true });
+});
 await sender.start();
 let online = false;
 for (let i = 0; i < 200; i++) {

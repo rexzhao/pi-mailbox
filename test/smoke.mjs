@@ -50,10 +50,13 @@ try {
 	const shortA = deriveSessionId("agent-a", "sessA");
 	const shortB = deriveSessionId("agent-b", "sessB");
 	const shortC = deriveSessionId("agent-c", "sessC");
+	// connections never spawn: the daemon is brought up explicitly (the
+	// /mailbox start service command's spawn path)
+	const { resolveLocalDaemon } = await import("../src/daemon.ts");
+	await resolveLocalDaemon();
 	const a = new MailboxConnection("local", projectDir, null, "sessA", "agent-a", events(logA), {
 		login: { as: "smoke-a" },
 		helloMeta: { _model: "prov/m1", role: "worker" },
-		canSpawn: true,
 	});
 	await a.start();
 	assert(a.connected, "A connected (daemon spawned via resolveLocalDaemon)");
@@ -228,7 +231,6 @@ try {
 	const logD1 = { notify: [], connected: 0, disconnected: 0 };
 	const d1 = new MailboxConnection("local", projectDir, null, "sessD1", "agent-d", events(logD1), {
 		login: { as: "smoke-reviewer", tags: "review,urgent" },
-		canSpawn: true,
 	});
 	await d1.start();
 	assert(d1.address === `smoke-reviewer@${d1.mailbox.project}`, "login address uses the claimed name");
@@ -270,7 +272,6 @@ try {
 	const logD5 = { notify: [], connected: 0, disconnected: 0 };
 	const d5 = new MailboxConnection("local", projectDir, null, "sessD5", "agent-d", events(logD5), {
 		login: { as: "smoke-release-test" },
-		canSpawn: true,
 	});
 	await d5.start();
 	assert(d5.releaseAcked === false, "a hello without release must not set releaseAcked");
@@ -353,10 +354,13 @@ try {
 	const extension = (await import("../src/index.ts")).default;
 	extension(piMock);
 	const cmdNotifies = [];
+	// same session id as fakeCtx: the start/restart service commands
+	// connect with this ctx, and their origin must match the extsmoke
+	// holder for the same-origin re-claim to work
 	const cmdCtx = (entries = []) => ({
 		ui: { notify: (msg, kind) => cmdNotifies.push({ msg, kind }) },
 		sessionManager: {
-			getSessionId: () => "smoke-cmd-session",
+			getSessionId: () => "smoke-ext-session-id",
 			getCwd: () => projectDir,
 			getSessionDir: () => join(projectDir, ".pi", "sessions", "smoke-cmd"),
 			getEntries: () => entries,
@@ -748,16 +752,15 @@ try {
 	assert(ownCounted !== undefined && ownCounted.online !== undefined && ownCounted.online >= 1, "includeSessions: own project online >= 1");
 	assert(pr.content[0].text.includes(extProject), "projects text lists own project id");
 
-	// 14. canSpawn is ONE-SHOT: a connection that may spawn on its first
-	// attempt must NOT resurrect a deliberately stopped daemon from its
-	// reconnect loop (200-1000ms retry delays; we wait past them)
+	// 14. connections NEVER spawn the daemon: a deliberately stopped
+	// daemon stays down (retry loops are probe-only), and only the explicit
+	// /mailbox start service command brings it back up
 	const logR = { notify: [], connected: 0, disconnected: 0 };
 	const r1 = new MailboxConnection("local", projectDir, null, "respawn-sess-1", "respawn-agent", events(logR), {
 		login: { as: "respawn-guard" },
-		canSpawn: true,
 	});
 	await r1.start();
-	assert(r1.connected, "canSpawn connection established (daemon was running)");
+	assert(r1.connected, "probe-only connection established (daemon was running)");
 	const { readFileSync: rf } = await import("node:fs");
 	const reg1 = JSON.parse(rf(join(home, "mailboxd.json"), "utf8"));
 	process.kill(reg1.pid, "SIGTERM");
@@ -769,18 +772,28 @@ try {
 	} catch {
 		// registry gone: daemon down and nobody respawned it
 	}
-	assert(!resurrected, "a canSpawn connection's retry loop must NOT respawn a stopped daemon");
+	assert(!resurrected, "a connection's retry loop must NOT respawn a stopped daemon");
 	await r1.stop();
-	// an explicit start DOES bring it back: a fresh canSpawn connection
-	// (same session id => same origin: an offline same-origin re-claim)
-	const logR2 = { notify: [], connected: 0, disconnected: 0 };
-	const r2 = new MailboxConnection("local", projectDir, null, "respawn-sess-1", "respawn-agent", events(logR2), {
-		login: { as: "respawn-guard" },
-		canSpawn: true,
-	});
-	await r2.start();
-	assert(r2.connected, "a fresh explicit-start connection DOES spawn the daemon");
-	await r2.stop();
+	// the explicit start-service COMMAND path DOES bring it back (the only
+	// spawn path): drive it through the harness's registered command
+	cmdNotifies.length = 0;
+	await runCommand("start service", cmdCtx(recordedEntries)); // extsmoke binding
+	let restarted = false;
+	for (let i = 0; i < 30 && !restarted; i++) {
+		await new Promise((r) => setTimeout(r, 100));
+		try {
+			const reg3 = JSON.parse(rf(join(home, "mailboxd.json"), "utf8"));
+			restarted = typeof reg3.pid === "number" && reg3.pid > 0;
+		} catch {
+			// not yet
+		}
+	}
+	assert(restarted, "/mailbox start service respawns the daemon (the only spawn path)");
+	const lastNotify = cmdNotifies[cmdNotifies.length - 1];
+	assert(
+		lastNotify && /connected as|service started/.test(lastNotify.msg),
+		`start service after respawn: ${lastNotify?.msg}`,
+	);
 } finally {
 	// the daemon is detached and holds the lock file in the temp home; stop
 	// it via the pid recorded in the registry so cleanup can remove the dir

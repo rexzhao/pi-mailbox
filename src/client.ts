@@ -315,13 +315,6 @@ export interface ConnectionOptions {
 	release?: string;
 	/** Registration-time meta defaults: system keys (`_`-prefixed) refresh on every connect; user keys apply only when absent. */
 	helloMeta?: Record<string, string>;
-	/**
-	 * When true, the FIRST connect attempt may spawn a new daemon when none
-	 * is running (the explicit-start intent of /mailbox start|restart service
-	 * and /mailbox login). Reconnect attempts NEVER spawn: a deliberately
-	 * stopped daemon must stay down until someone explicitly starts it again.
-	 */
-	canSpawn?: boolean;
 }
 
 export interface ConnectionEvents {
@@ -342,8 +335,6 @@ export class MailboxConnection {
 	private client: MailboxClient | null = null;
 	private reconnectTimer: NodeJS.Timeout | null = null;
 	private stopped = false;
-	/** canSpawn is one-shot: only the first attempt may bring a daemon up. */
-	private spawnUsed = false;
 	/** True when the last failure was a permanent login rejection (no retry). */
 	get loginRejected(): boolean {
 		return this.loginRejectedFlag;
@@ -482,25 +473,22 @@ export class MailboxConnection {
 			meta: this.options.helloMeta,
 		};
 		if (this.mode === "local") {
-			let endpoint;
-			if (this.options.canSpawn && !this.spawnUsed) {
-				this.spawnUsed = true;
-				endpoint = await resolveLocalDaemon();
-			} else {
-				const running = await connectLocalDaemonIfRunning();
-				if (!running) {
-					throw new Error("mailbox: daemon not running; run /mailbox start service");
-				}
-				endpoint = running;
+			// connections NEVER spawn the daemon: only the explicit
+			// /mailbox start service command brings it up (resolveLocalDaemon
+			// at the command layer). A stopped daemon stays down; the retry
+			// loop stays armed and reconnects once one is running again.
+			const running = await connectLocalDaemonIfRunning();
+			if (!running) {
+				throw new Error("mailbox: daemon not running; run /mailbox start service");
 			}
-			url = endpoint.url;
+			url = running.url;
 			hello.projectRoot = this.projectDir;
 		} else {
 			url = `ws://${this.remote!.host}:${this.remote!.port}`;
 			hello.token = this.remote!.token;
 		}
-		// stop() may have run during the async resolution above (up to 10s
-		// for a daemon spawn); bail instead of opening a post-stop connection
+		// stop() may have run during the async resolution above; bail
+		// instead of opening a post-stop connection
 		if (this.stopped || generation !== this.generation) return;
 		await this.openClient(url, hello);
 		this.events.onConnected();

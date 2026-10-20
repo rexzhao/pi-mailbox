@@ -720,7 +720,7 @@ export default function (pi: ExtensionAPI) {
 			const endpoint = await connectLocalDaemonIfRunning();
 			if (shuttingDown) return; // session ended during the probe
 			if (!endpoint) return; // daemon down: stay silent, no spawn
-			await startConnection(ctx, null, false); // binding auto-applies
+			await startConnection(ctx, null); // binding auto-applies
 			// the runtime may have been torn down (resume/quit) while the
 			// connect was in flight: do not leave an adopted orphan
 			if (shuttingDown) {
@@ -755,7 +755,6 @@ export default function (pi: ExtensionAPI) {
 			model?: { id: string; provider: string } | undefined;
 		},
 		remote: RemoteTarget | null,
-		canSpawn = false,
 		login?: { as: string; tags?: string; force?: boolean } | null,
 	): Promise<MailboxConnection> {
 		// the previous connection is only torn down after the new one is
@@ -825,7 +824,6 @@ export default function (pi: ExtensionAPI) {
 				login: effectiveLogin ?? undefined,
 				release: pendingRelease ?? undefined,
 				helloMeta,
-				canSpawn,
 			},
 		);
 		// the herdr wake path needs the pi session directory (not the hello)
@@ -1001,17 +999,21 @@ export default function (pi: ExtensionAPI) {
 					}
 					// starting the SERVICE is decoupled from the named-account
 					// connect policy: a session that never logged in can still
-					// bring the daemon up. Connect (and spawn) only when a
-					// stored binding exists; otherwise just ensure the daemon
-					// runs and say how to connect.
+					// bring the daemon up. This command is the ONLY spawn path
+					// (connections never spawn): bring the daemon up explicitly,
+					// then connect when a stored binding exists.
+					const wasRunning = (await connectLocalDaemonIfRunning()) !== null;
+					await resolveLocalDaemon(); // spawn if dead; resolve if alive
 					if (readStoredLogin(ctx)) {
-						const connection = await startConnection(ctx, null, true);
+						const connection = await startConnection(ctx, null);
 						ctx.ui.notify(`mailbox: connected as ${connection.address}`, "info");
-					} else if (await connectLocalDaemonIfRunning()) {
-						ctx.ui.notify("mailbox: service already running — run /mailbox login <name> to connect", "info");
 					} else {
-						await resolveLocalDaemon(); // spawn; login-free
-						ctx.ui.notify("mailbox: service started — run /mailbox login <name> to connect", "info");
+						ctx.ui.notify(
+							wasRunning
+								? "mailbox: service already running — run /mailbox login <name> to connect"
+								: "mailbox: service started — run /mailbox login <name> to connect",
+							"info",
+						);
 					}
 				} catch (err) {
 					ctx.ui.notify(`mailbox: ${err instanceof Error ? err.message : String(err)}`, "error");
@@ -1297,7 +1299,9 @@ export default function (pi: ExtensionAPI) {
 					// --force is the human's confirmation for an offline
 					// takeover, so this path bypasses the agent-side gate.
 					const prev = conn?.connected ? conn.address : null;
-					const connection = await startConnection(ctx, null, true, { as: name, tags, force: forceFlag });
+					// no spawn here: login requires a running daemon (start service
+					// is the only command that brings one up)
+					const connection = await startConnection(ctx, null, { as: name, tags, force: forceFlag });
 					storeLogin(name);
 					const meta = connection.mailbox.sessionMeta ?? {};
 					const inherited = tags ? "" : ` (tags inherited: ${meta.tags ?? "(none)"})`;
@@ -1384,13 +1388,14 @@ export default function (pi: ExtensionAPI) {
 					}
 					// wait briefly for the daemon to release the lock
 					await new Promise((resolve) => setTimeout(resolve, 500));
-					// same decoupling as start service: restart the daemon
-					// regardless of login; reconnect only with a stored binding
+					// same decoupling as start service, and the same rule: the
+					// explicit command is the only spawn path (stop + start);
+					// reconnect only with a stored binding
+					await resolveLocalDaemon();
 					if (readStoredLogin(ctx)) {
-						const connection = await startConnection(ctx, null, true);
+						const connection = await startConnection(ctx, null);
 						ctx.ui.notify(`mailbox: restarted as ${connection.address}`, "info");
 					} else {
-						await resolveLocalDaemon();
 						ctx.ui.notify("mailbox: service restarted — run /mailbox login <name> to connect", "info");
 					}
 				} catch (err) {
@@ -1634,7 +1639,7 @@ ${formatMailList(mails)}${more}`,
 					"mailbox: no running mailboxd daemon found. Ask the user to run `/mailbox start service` to start it.",
 				);
 			}
-			const connection = await startConnection(ctx, null, false, login);
+			const connection = await startConnection(ctx, null, login);
 			if (login) storeLogin(login.as); // persist: resumes auto-login
 			const status = await connectionStatus(connection);
 			return {
