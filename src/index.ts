@@ -760,6 +760,8 @@ export default function (pi: ExtensionAPI) {
 				getEntries?(): Array<{ type: string; customType?: string; data?: unknown }>;
 			};
 			model?: { id: string; provider: string } | undefined;
+			/** Optional so minimal/harness contexts work; used only for the replaced-signal notice. */
+			ui?: { notify(message: string, kind?: string): void };
 		},
 		remote: RemoteTarget | null,
 		login?: { as: string; tags?: string; force?: boolean } | null,
@@ -825,6 +827,19 @@ export default function (pi: ExtensionAPI) {
 					activateTools(false);
 					footerUnread = null; // no badge while disconnected
 					refreshFooter();
+					// replaced-signal: another live connection for THIS session
+					// identity took over (typically the same session open in two
+					// agents). The connection has stood down (no retry loop —
+					// retrying would ping-pong forever); say so once. Self-
+					// switches (startConnection replacing our own previous
+					// connection) do not land here: conn already points at the
+					// new connection when the old one's close fires.
+					if (conn?.replaced && !conn.connected) {
+						ctx.ui?.notify(
+							"mailbox: this session's mailbox was taken over by another connection — is this session open in two places? Close the other one, then reconnect with /mailbox start service",
+							"warning",
+						);
+					}
 				},
 			},
 			{

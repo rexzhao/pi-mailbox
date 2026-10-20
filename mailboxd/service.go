@@ -75,6 +75,39 @@ func (c *conn) close() {
 	c.ws.CloseNow()
 }
 
+// closeReplaced closes with the app-defined status 4000/"replaced": the
+// kicked client recognizes it and STOPS retrying. Without the signal, two
+// live agents sharing one session identity would replace each other
+// forever (each side's reconnect kicks the other — a connection ping-pong
+// that surfaced as a flickering footer). Async: the close handshake must
+// not block the replacing hello.
+func (c *conn) closeReplaced() {
+	c.closeMu.Lock()
+	if c.closed {
+		c.closeMu.Unlock()
+		return
+	}
+	c.closed = true
+	ws := c.ws
+	c.closeMu.Unlock()
+	go func() {
+		// best-effort graceful close with the signal, BOUNDED: a silent
+		// peer (a SIGSTOP'd duplicate — exactly the pathological case this
+		// signal exists for) never echoes the close frame, and an unbounded
+		// Close would hold the socket until the TCP path dies
+		done := make(chan struct{})
+		go func() {
+			_ = ws.Close(websocket.StatusCode(4000), "replaced")
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+		}
+		ws.CloseNow()
+	}()
+}
+
 // httpHandler dispatches between the WebSocket protocol and the read-only
 // web UI (see api.go) on the same port.
 func (d *Daemon) httpHandler() http.Handler {
@@ -310,8 +343,9 @@ func (c *conn) handleHello(rid int, data []byte) error {
 	c.session = mailboxID
 	c.agent = msg.Agent
 	if old := proj.Register(mailboxID, c); old != nil && old != c {
-		// same session reconnected elsewhere: replace the old connection
-		old.close()
+		// same session reconnected elsewhere: replace the old connection,
+		// signalling the kick so the loser stands down instead of fighting
+		old.closeReplaced()
 	}
 
 	// the derived record of a named login (the _holds marker below) is

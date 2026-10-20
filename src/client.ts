@@ -57,6 +57,8 @@ export class MailboxClient {
 	releaseAcked = false;
 	/** Set when closed on purpose; suppresses reconnect handling in the caller. */
 	closed = false;
+	/** True when the daemon closed us with status 4000/"replaced": another connection for the same session identity won. */
+	replaced = false;
 
 	private readonly url: string;
 	private readonly hello: {
@@ -111,7 +113,8 @@ export class MailboxClient {
 				reject(err);
 				if (!this.closed) this.onUnexpectedClose();
 			});
-			ws.on("close", () => {
+			ws.on("close", (code: number) => {
+				if (code === 4000) this.replaced = true; // the daemon's replaced-signal
 				if (!this.closed) this.onUnexpectedClose();
 			});
 		});
@@ -335,6 +338,8 @@ export class MailboxConnection {
 	private client: MailboxClient | null = null;
 	private reconnectTimer: NodeJS.Timeout | null = null;
 	private stopped = false;
+	/** Set when the daemon's replaced-signal (close status 4000) closed us. */
+	private replacedFlag = false;
 	/** True when the last failure was a permanent login rejection (no retry). */
 	get loginRejected(): boolean {
 		return this.loginRejectedFlag;
@@ -519,9 +524,19 @@ export class MailboxConnection {
 			(unread) => this.events.onNotify(unread),
 			() => {
 				if (this.client === client) {
+					const replaced = client.replaced;
 					this.client = null;
+					if (replaced) {
+						// another live connection for this session identity won
+						// (the same session open in two agents): stand down —
+						// retrying would just kick the winner and ping-pong
+						// forever. Reconnect explicitly once the duplicate is
+						// closed.
+						this.stopped = true;
+						this.replacedFlag = true;
+					}
 					this.events.onDisconnected();
-					this.scheduleReconnect(this.generation);
+					if (!replaced) this.scheduleReconnect(this.generation);
 				}
 			},
 		);
@@ -532,6 +547,11 @@ export class MailboxConnection {
 	/** True when the current client's welcome acked a release. */
 	get releaseAcked(): boolean {
 		return this.client?.releaseAcked ?? false;
+	}
+
+	/** True when this connection was closed with the daemon's replaced-signal (status 4000): another connection for the same session identity took over and the retry loop has stood down. */
+	get replaced(): boolean {
+		return this.replacedFlag;
 	}
 
 	/** Connected client; throws when disconnected. */

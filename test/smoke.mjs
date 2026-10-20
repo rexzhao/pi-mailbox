@@ -812,6 +812,34 @@ try {
 		lastNotify && /connected as|service started/.test(lastNotify.msg),
 		`start service after respawn: ${lastNotify?.msg}`,
 	);
+
+	// 15. replaced-signal: two connections with the SAME identity — the
+	// loser gets close status 4000 and STANDS DOWN (no retry), so two live
+	// agents on one session cannot ping-pong forever
+	const logDup1 = { notify: [], connected: 0, disconnected: 0 };
+	const dup1 = new MailboxConnection("local", projectDir, null, "dup-sess", "dup-agent", events(logDup1), {
+		login: { as: "dup-test" },
+	});
+	await dup1.start();
+	const logDup2 = { notify: [], connected: 0, disconnected: 0 };
+	const dup2 = new MailboxConnection("local", projectDir, null, "dup-sess", "dup-agent", events(logDup2), {
+		login: { as: "dup-test" },
+	});
+	await dup2.start();
+	assert(dup2.connected, "the second (replacing) connection wins");
+	let loserReplaced = false;
+	for (let i = 0; i < 30 && !loserReplaced; i++) {
+		await new Promise((r) => setTimeout(r, 100));
+		loserReplaced = dup1.replaced;
+	}
+	assert(loserReplaced, "the loser sees the replaced signal");
+	assert(!dup1.connected, "the loser is down");
+	// and it STAYS down: after the retry window, the winner is still the
+	// only connection (the old behavior was an endless kick ping-pong)
+	await new Promise((r) => setTimeout(r, 2600));
+	assert(dup2.connected && !dup1.connected, "no ping-pong: winner stays up, loser stays down");
+	await dup1.stop();
+	await dup2.stop();
 } finally {
 	// the daemon is detached and holds the lock file in the temp home; stop
 	// it via the pid recorded in the registry so cleanup can remove the dir
