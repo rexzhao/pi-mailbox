@@ -40,4 +40,18 @@ func TestReplacedSignal(t *testing.T) {
 	} else if got := websocket.CloseStatus(err); got != websocket.StatusCode(4000) {
 		t.Fatalf("close status = %v, want 4000 (replaced)", got)
 	}
+
+	// case-VARIANT re-claim of the same identity (display case changes,
+	// identity does not): the replace+signal must fire exactly the same
+	a2 := dialTest(t, port)
+	if w := a2.helloLogin(2, project, root, "", "shortaaaa", "sessA", "agent-a", "Replaced-Test", ""); w["t"] != "welcome" || w["mailbox"] != "Replaced-Test" {
+		t.Fatalf("case-variant re-claim welcome: %v", w)
+	}
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel2()
+	if _, _, err := b.ws.Read(ctx2); err == nil {
+		t.Fatal("expected the case-variant replaced connection to close")
+	} else if got := websocket.CloseStatus(err); got != websocket.StatusCode(4000) {
+		t.Fatalf("case-variant close status = %v, want 4000 (replaced)", got)
+	}
 }
