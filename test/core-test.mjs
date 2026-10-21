@@ -178,6 +178,21 @@ try {
 		assert(items !== null && values.includes("core-offline ") && !values.includes("core-delta ") && !values.includes("core-alpha "), `delete completion lists offline names only (${values.join(",")})`);
 	}
 
+	// 3c. logout completion: claimed-spelling labels, case-folded prefix
+	//     matching, and the current marker surviving a disconnect
+	{
+		const h = fakeHost({ sessionId: "core-sess-compl" });
+		const cc = new MailboxController(h.host);
+		await cc.login({ as: "Compl-Mixed" });
+		await cc.disconnectAll();
+		let items = await cc.completeCommand("logout ");
+		const it = (items ?? []).find((i) => i.value === "compl-mixed ");
+		assert(items !== null && it !== undefined && it.label === "Compl-Mixed", `logout shows the claimed spelling (${JSON.stringify(items)})`);
+		assert(it !== undefined && it.description === "current identity", "the current marker survives a disconnect (binding fallback)");
+		items = await cc.completeCommand("logout COMPL");
+		assert(items !== null && items.length === 1, `logout matches the typed prefix case-insensitively (${JSON.stringify(items)})`);
+	}
+
 	// 4. multi-identity notification: one coalesced deliver, grouped by mailbox
 	b.state.busy = false; // idle: the 300ms debounce path
 	const peerLog = { notify: [], connected: 0, disconnected: 0 };

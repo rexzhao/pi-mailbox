@@ -189,6 +189,27 @@ export class MailboxController {
 		return [...this.connections.keys()];
 	}
 
+	/**
+	 * All held identities with their CLAIMED spellings: live connections
+	 * (mailboxId carries the claimed case) plus any bound-but-disconnected
+	 * names still in the persisted binding. Completion surfaces use this.
+	 */
+	get heldIdentities(): Array<{ canonical: string; claimed: string }> {
+		const byCanonical = new Map<string, string>();
+		for (const [canonical, c] of this.connections) byCanonical.set(canonical, c.mailboxId);
+		for (const n of this.host.loginStore.readLogin()?.names ?? []) {
+			const canonical = n.toLowerCase();
+			if (!byCanonical.has(canonical)) byCanonical.set(canonical, n);
+		}
+		return [...byCanonical.entries()].map(([canonical, claimed]) => ({ canonical, claimed }));
+	}
+
+	/** The current identity's canonical name, falling back to the persisted binding's current (claimed, folded) when disconnected. */
+	get currentIdentity(): string | null {
+		if (this.current !== null) return this.current;
+		return this.host.loginStore.readLogin()?.current.toLowerCase() ?? null;
+	}
+
 	/** The remote target in use (null = local daemon). */
 	get remoteTarget(): RemoteTarget | null {
 		return this.remote;

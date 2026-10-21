@@ -571,15 +571,20 @@ export async function mailboxArgumentCompletions(
 
 	// logout: ONLY the session's own names are valid targets — never the
 	// whole project. Works disconnected too (a binding-only name still
-	// queues a deferred release).
+	// queues a deferred release). Matching is case-folded on BOTH the
+	// canonical and the claimed spelling (like the other name commands),
+	// and labels carry the claimed spelling; the current-identity marker
+	// falls back to the persisted binding while disconnected.
 	if (action === "logout") {
-		const items = [...ownNames]
-			.filter((n) => n.startsWith(typed))
-			.sort()
-			.map((n) => ({
-				value: n + " ",
-				label: n,
-				description: n === controller.currentName ? "current identity" : "held",
+		const typedFolded = typed.toLowerCase();
+		const current = controller.currentIdentity;
+		const items = controller.heldIdentities
+			.filter(({ canonical, claimed }) => canonical.startsWith(typedFolded) || claimed.toLowerCase().startsWith(typedFolded))
+			.sort((a, b) => a.canonical.localeCompare(b.canonical))
+			.map(({ canonical, claimed }) => ({
+				value: canonical + " ",
+				label: claimed,
+				description: canonical === current ? "current identity" : "held",
 			}));
 		return items.length > 0 ? items : null;
 	}
