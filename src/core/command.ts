@@ -582,7 +582,9 @@ export async function mailboxArgumentCompletions(
 			.filter(({ canonical, claimed }) => canonical.startsWith(typedFolded) || claimed.toLowerCase().startsWith(typedFolded))
 			.sort((a, b) => a.canonical.localeCompare(b.canonical))
 			.map(({ canonical, claimed }) => ({
-				value: canonical + " ",
+				// the value REPLACES the whole argument string (pi's completion
+				// convention — see its MCP extension): keep the typed action
+				value: `${action} ${canonical} `,
 				label: claimed,
 				description: canonical === current ? "current identity" : "held",
 			}));
@@ -609,7 +611,9 @@ export async function mailboxArgumentCompletions(
 		.filter((s) => (deletable ? !s.online : !ownNames.has(s.session)))
 		.filter((s) => s.session.startsWith(typed) || ((s.meta ?? {})._case ?? "").startsWith(typed))
 		.map((s) => ({
-			value: s.session + " ",
+			// the value REPLACES the whole argument string (pi's completion
+			// convention — see its MCP extension): keep the typed action
+			value: `${action} ${s.session} `,
 			label: (s.meta ?? {})._case ?? s.session,
 			description: s.online ? "online" : "offline",
 		}));

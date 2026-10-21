@@ -167,15 +167,15 @@ try {
 		await off.stop(); // leaves a named mailbox that is registered but offline
 		let items = await ca.completeCommand("logout ");
 		let values = (items ?? []).map((i) => i.value);
-		assert(items !== null && values.includes("core-alpha ") && values.includes("core-beta ") && values.length === 2, `logout completion lists exactly the own held names (${values.join(",")})`);
-		assert(items.find((i) => i.value === "core-beta ").description === "current identity", "logout marks the current identity");
+		assert(items !== null && values.includes("logout core-alpha ") && values.includes("logout core-beta ") && values.length === 2, `logout completion lists exactly the own held names (${values.join(",")})`);
+		assert(items.find((i) => i.value === "logout core-beta ").description === "current identity", "logout marks the current identity");
 		items = await ca.completeCommand("login ");
 		values = (items ?? []).map((i) => i.value);
-		assert(items !== null && !values.includes("core-alpha ") && !values.includes("core-beta "), `login completion excludes the own held names (${values.join(",")})`);
-		assert(values.includes("core-delta ") && items.find((i) => i.value === "core-delta ").description === "online", "login completion offers peers with online markers");
+		assert(items !== null && !values.includes("login core-alpha ") && !values.includes("login core-beta "), `login completion excludes the own held names (${values.join(",")})`);
+		assert(values.includes("login core-delta ") && items.find((i) => i.value === "login core-delta ").description === "online", "login completion offers peers with online markers");
 		items = await ca.completeCommand("delete ");
 		values = (items ?? []).map((i) => i.value);
-		assert(items !== null && values.includes("core-offline ") && !values.includes("core-delta ") && !values.includes("core-alpha "), `delete completion lists offline names only (${values.join(",")})`);
+		assert(items !== null && values.includes("delete core-offline ") && !values.includes("delete core-delta ") && !values.includes("delete core-alpha "), `delete completion lists offline names only (${values.join(",")})`);
 	}
 
 	// 3c. logout completion: claimed-spelling labels, case-folded prefix
@@ -186,7 +186,7 @@ try {
 		await cc.login({ as: "Compl-Mixed" });
 		await cc.disconnectAll();
 		let items = await cc.completeCommand("logout ");
-		const it = (items ?? []).find((i) => i.value === "compl-mixed ");
+		const it = (items ?? []).find((i) => i.value === "logout compl-mixed ");
 		assert(items !== null && it !== undefined && it.label === "Compl-Mixed", `logout shows the claimed spelling (${JSON.stringify(items)})`);
 		assert(it !== undefined && it.description === "current identity", "the current marker survives a disconnect (binding fallback)");
 		items = await cc.completeCommand("logout COMPL");

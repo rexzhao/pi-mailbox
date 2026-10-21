@@ -887,21 +887,21 @@ try {
 	// with online/offline markers.
 	compl = await mailboxCmd.getArgumentCompletions("login ");
 	assert(
-		compl && !compl.some((i) => i.value === "extsmoke "),
+		compl && !compl.some((i) => i.value === "login extsmoke "),
 		`login name completion excludes the own held name extsmoke: ${JSON.stringify((compl ?? []).slice(0, 3))}`,
 	);
 	assert(
 		(compl ?? []).some((i) => i.description === "offline"),
 		"login name completion still offers other named mailboxes",
 	);
-	assert(compl.every((i) => i.value !== "user "), "user is never offered as a login name");
+	assert(compl.every((i) => i.value !== "login user "), "user is never offered as a login name");
 	// delete <name>: online holders are not deletable -> filtered out
 	compl = await mailboxCmd.getArgumentCompletions("delete ");
 	assert(
-		compl && !compl.some((i) => i.value === "extsmoke "),
+		compl && !compl.some((i) => i.value === "delete extsmoke "),
 		"delete name completion omits the online extsmoke",
 	);
-	assert(compl.some((i) => i.value === "smoke-reviewer "), "delete offers offline named mailboxes");
+	assert(compl.some((i) => i.value === "delete smoke-reviewer "), "delete offers offline named mailboxes");
 	// two-plus arguments: no suggestions
 	assert(await mailboxCmd.getArgumentCompletions("login a b") === null, "third argument -> null");
 
