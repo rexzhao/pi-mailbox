@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -25,11 +26,11 @@ import (
 
 var sessionIDRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
-// mailboxNameRe is the grammar for named mailboxes (login names): 1-32
+// mailboxNameRe is the grammar for named mailboxes (login names): 1-255
 // chars, letter first, no dots (filename safety). Case is DISPLAY-only:
 // the canonical identity (store keys, registration, comparisons) is the
 // lowercased name; the claimed spelling rides the _case system meta.
-var mailboxNameRe = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]{0,31}$`)
+var mailboxNameRe = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]{0,254}$`)
 
 // derivedIDRe is the shape of client-derived session ids (10 base36 chars);
 // login names must not collide with it so addresses stay unambiguous.
@@ -50,7 +51,7 @@ var windowsReserved = map[string]bool{
 // identity is lowercase). Returns a user-facing reason.
 func ValidateMailboxName(name string) error {
 	if !mailboxNameRe.MatchString(name) {
-		return fmt.Errorf("name must match [A-Za-z][A-Za-z0-9_-]{0,31} (1-32 chars, letter first)")
+		return fmt.Errorf("name must match [A-Za-z][A-Za-z0-9_-]{0,254} (1-255 chars, letter first)")
 	}
 	if derivedIDRe.MatchString(name) {
 		return fmt.Errorf("name must not be 10 lowercase alphanumerics (reserved for derived session ids)")
@@ -489,7 +490,7 @@ func (s *Store) HelloMerge(sessionID, agent, origin string, meta map[string]stri
 	}
 	// authoritative unset: stored system keys not kept by this hello.
 	// _holds is exempt: it is the session's name binding, managed only by
-	// the claim path (BindName/UnbindName) — a plain re-hello must not
+	// the claim path (AddHold/RemoveHolds) — a plain re-hello must not
 	// wash it away. _case is claim-managed too, but it IS refreshed by
 	// every claim (the welcome's mailbox field matches), so it needs no
 	// exemption: an unset only happens if no claim occurs, which is
@@ -652,22 +653,50 @@ func (s *Store) MetaSnapshot(sessionID string) (map[string]string, error) {
 	return copyMeta(st.Meta), nil
 }
 
-// HoldsOf returns the name this session's derived mailbox is bound to
-// (the _holds marker); empty when it holds none.
-func (s *Store) HoldsOf(sessionID string) string {
+// HoldsSet returns the names this session's derived mailbox is bound to
+// (the _holds marker, a comma-separated set); empty when it holds none.
+func (s *Store) HoldsSet(sessionID string) []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	st, err := s.state(sessionID)
 	if err != nil {
-		return ""
+		return nil
 	}
-	return st.Meta["_holds"]
+	return parseHolds(st.Meta["_holds"])
 }
 
-// BindName records the reverse login marker on the session's own derived
-// mailbox: _holds (the claimed name) plus _origin (so the lifecycle GC keeps
-// the record alive while the pi session lives). name == "" unbinds.
-func (s *Store) BindName(sessionID, origin, name string) error {
+// parseHolds splits a _holds value into canonical names (sorted, deduped).
+// The name grammar has no commas, so the split is unambiguous.
+func parseHolds(v string) []string {
+	if v == "" {
+		return nil
+	}
+	seen := make(map[string]bool)
+	out := []string{}
+	for _, part := range strings.Split(v, ",") {
+		name := strings.TrimSpace(part)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func joinHolds(names []string) string {
+	sorted := append([]string(nil), names...)
+	sort.Strings(sorted)
+	return strings.Join(sorted, ",")
+}
+
+// AddHold adds a name to the session's reverse login marker on its own
+// derived mailbox: _holds (the claimed names, a set — a session may hold
+// several at once) plus _origin (so the lifecycle GC keeps the record
+// alive while the pi session lives). Idempotent. _holds values are
+// canonical (lowercase): names are case-insensitive.
+func (s *Store) AddHold(sessionID, origin, name string) error {
 	path, err := s.sessionFile(sessionID)
 	if err != nil {
 		return err
@@ -678,22 +707,61 @@ func (s *Store) BindName(sessionID, origin, name string) error {
 	if err != nil {
 		return err
 	}
-	// _holds is a canonical (lowercase) binding: names are case-insensitive
 	name = strings.ToLower(name)
 	set := map[string]string{}
-	unset := []string{}
-	if name != "" {
-		if st.Meta["_holds"] != name {
-			set["_holds"] = name
-		}
-		if origin != "" && st.Meta["_origin"] != origin {
-			set["_origin"] = origin
-		}
-	} else if st.Meta["_holds"] != "" {
-		unset = append(unset, "_holds")
+	holds := parseHolds(st.Meta["_holds"])
+	if !slices.Contains(holds, name) {
+		holds = append(holds, name)
+		set["_holds"] = joinHolds(holds)
 	}
-	if len(set) == 0 && len(unset) == 0 {
+	if origin != "" && st.Meta["_origin"] != origin {
+		set["_origin"] = origin
+	}
+	if len(set) == 0 {
 		return nil
+	}
+	ev := map[string]interface{}{"t": "meta", "set": set}
+	data, _ := json.Marshal(ev)
+	if err := s.persistLine(sessionID, path, string(data)); err != nil {
+		return err
+	}
+	applyMeta(st, set, nil)
+	return nil
+}
+
+// RemoveHolds removes names from the session's _holds set; the marker is
+// unset entirely when the set becomes empty. Unknown names are no-ops.
+func (s *Store) RemoveHolds(sessionID string, names ...string) error {
+	path, err := s.sessionFile(sessionID)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st, err := s.state(sessionID)
+	if err != nil {
+		return err
+	}
+	remove := make(map[string]bool)
+	for _, n := range names {
+		remove[strings.ToLower(n)] = true
+	}
+	holds := parseHolds(st.Meta["_holds"])
+	kept := make([]string, 0, len(holds))
+	for _, h := range holds {
+		if !remove[h] {
+			kept = append(kept, h)
+		}
+	}
+	if len(kept) == len(holds) {
+		return nil // nothing matched
+	}
+	set := map[string]string{}
+	unset := []string{}
+	if len(kept) > 0 {
+		set["_holds"] = joinHolds(kept)
+	} else {
+		unset = append(unset, "_holds")
 	}
 	ev := map[string]interface{}{"t": "meta"}
 	if len(set) > 0 {

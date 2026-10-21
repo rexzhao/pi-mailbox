@@ -199,14 +199,15 @@ func TestNamedMailboxLogin(t *testing.T) {
 		t.Fatalf("B should inherit the mail, got %v", in)
 	}
 
-	// 7b. one name per session (session_bound):
-	// B (originB, now holding "reviewer") tries a second name -> rejected
-	if e := b2.request(map[string]interface{}{
+	// 7b. multi-name login: B (originB, now holding "reviewer") adds a
+	// second name on the same session -> allowed (a name still has at
+	// most one holder; a session may hold several)
+	if w := b2.request(map[string]interface{}{
 		"t": "hello", "rid": 5, "project": project, "projectRoot": projectRoot,
 		"sessionDir": sessionDir, "session": "shortbbbb", "origin": "originB",
 		"agent": "agent-b", "as": "reviewer-two",
-	}); e["t"] != "error" || e["code"] != "session_bound" {
-		t.Fatalf("expected session_bound, got %v", e)
+	}); w["t"] != "welcome" {
+		t.Fatalf("expected welcome for a second name on the same session, got %v", w)
 	}
 	// same-name re-login is fine (checked above as step 4/5)
 	// the reverse marker survives a same-name re-login
@@ -217,12 +218,12 @@ func TestNamedMailboxLogin(t *testing.T) {
 	}); w["t"] != "welcome" {
 		t.Fatalf("same-name re-login after login: %v", w)
 	}
-	if e := b2.request(map[string]interface{}{
+	if w := b2.request(map[string]interface{}{
 		"t": "hello", "rid": 7, "project": project, "projectRoot": projectRoot,
 		"sessionDir": sessionDir, "session": "shortbbbb", "origin": "originB",
 		"agent": "agent-b", "as": "reviewer-three",
-	}); e["t"] != "error" || e["code"] != "session_bound" {
-		t.Fatalf("session_bound must survive a same-name re-login, got %v", e)
+	}); w["t"] != "welcome" {
+		t.Fatalf("a third name on the same session must be allowed, got %v", w)
 	}
 	// _holds is not forgeable via hello meta: the forged value is
 	// ignored and the claim (here a re-claim of the held name) succeeds
@@ -281,9 +282,9 @@ func TestNamedMailboxLogin(t *testing.T) {
 		t.Fatalf("stale _holds should self-heal and allow a new name, got %v", w)
 	}
 
-	// 7d. force edge cases: online holder still refuses; session_bound is
-	// not bypassed; force on a free name is a no-op. c4 is a fresh
-	// nameless session so the earlier checks cannot short-circuit.
+	// 7d. force edge cases: online holder still refuses; force on a free
+	// name (while already holding another) is a plain additional claim. c4
+	// is a fresh nameless session so the earlier checks cannot short-circuit.
 	// (b2's plain re-hello in 7b re-registered it under its derived id, so
 	// "reviewer" has no online holder; this re-login is the same-origin
 	// OFFLINE re-claim (row 2). Row 3 (same-origin online replace) is
@@ -295,12 +296,109 @@ func TestNamedMailboxLogin(t *testing.T) {
 	if e := c4.helloLoginForce(11, project, projectRoot, sessionDir, "shortdddd", "originD", "agent-d", "another-name", ""); e["t"] != "error" || e["code"] != "mailbox_in_use" {
 		t.Fatalf("force must never displace an online holder, got %v", e)
 	}
-	if e := b2.helloLoginForce(12, project, projectRoot, sessionDir, "shortbbbb", "originB", "agent-b", "fresh-name-two", ""); e["t"] != "error" || e["code"] != "session_bound" {
-		t.Fatalf("force must not bypass session_bound, got %v", e)
+	if w := b2.helloLoginForce(12, project, projectRoot, sessionDir, "shortbbbb", "originB", "agent-b", "fresh-name-two", ""); w["t"] != "welcome" {
+		t.Fatalf("force on a free name must succeed as an additional claim, got %v", w)
 	}
 	c5 := dialTest(t, port) // c4's socket was closed by the mailbox_in_use rejection
 	if w := c5.helloLoginForce(13, project, projectRoot, sessionDir, "shortdddd", "originD", "agent-d", "free-name-three", ""); w["t"] != "welcome" || w["mailbox"] != "free-name-three" {
 		t.Fatalf("force on a free name should be a no-op success, got %v", w)
 	}
 
+}
+
+// TestMultiNameLogin pins the multi-login invariants: one session may
+// hold several names at once (each on its own connection), a name still
+// has at most ONE holder (online rejection without force, offline
+// takeover with force), notify routes to the owning connection, a stale
+// hold self-heals, and a comma-separated release list clears several
+// names in ONE hello (ownership of a released name stays with its last
+// holder until taken over with force or deleted).
+func TestMultiNameLogin(t *testing.T) {
+	tmp := t.TempDir()
+	root := filepath.Join(tmp, "proj")
+	os.MkdirAll(filepath.Join(root, ".pi", "mailbox"), 0o755)
+	port, stop := bootDaemon(t, tmp, "", false)
+	defer stop()
+	const project = "proj-multi"
+
+	// one session (shortmulti/originM), two names, two connections
+	m1 := dialTest(t, port)
+	if w := m1.helloLogin(101, project, root, "", "shortmulti", "originM", "agent-m", "multi-one", ""); w["t"] != "welcome" {
+		t.Fatalf("first name login: %v", w)
+	}
+	m2 := dialTest(t, port)
+	if w := m2.helloLogin(102, project, root, "", "shortmulti", "originM", "agent-m", "multi-two", ""); w["t"] != "welcome" {
+		t.Fatalf("second name on the same session: %v", w)
+	}
+
+	// both names are online in the project listing
+	sess := m1.request(map[string]interface{}{"t": "sessions", "rid": 103, "includeOffline": true})
+	online := map[string]bool{}
+	if list, ok := sess["sessions"].([]interface{}); ok {
+		for _, it := range list {
+			s := it.(map[string]interface{})
+			if s["project"] == project {
+				online[s["session"].(string)] = s["online"] == true
+			}
+		}
+	}
+	if !online["multi-one"] || !online["multi-two"] {
+		t.Fatalf("both held names must be online, got %v", online)
+	}
+
+	// notify routing: mail to multi-two notifies its own connection
+	if m := m1.request(map[string]interface{}{
+		"t": "send", "rid": 104,
+		"target":  map[string]string{"project": project, "session": "multi-two"},
+		"subject": "hi", "body": "x",
+	}); m["t"] != "sent" {
+		t.Fatalf("send to multi-two: %v", m)
+	}
+	if n := m2.expectNotify(); n != 1 {
+		t.Fatalf("multi-two's connection must be notified, got %d", n)
+	}
+
+	// exclusivity: a foreign origin cannot claim a name held ONLINE
+	other := dialTest(t, port)
+	if e := other.helloLogin(105, project, root, "", "shortother", "originO", "agent-o", "multi-one", ""); e["t"] != "error" || e["code"] != "mailbox_in_use" {
+		t.Fatalf("online holder must reject a foreign claim, got %v", e)
+	}
+
+	// offline exclusivity: m1 disconnects; multi-one stays owned (name_held
+	// without force, force takes it over)
+	other = dialTest(t, port) // the mailbox_in_use rejection closed the socket
+	m1.ws.Close(websocket.StatusNormalClosure, "")
+	time.Sleep(100 * time.Millisecond)
+	if e := other.helloLogin(106, project, root, "", "shortother", "originO", "agent-o", "multi-one", ""); e["t"] != "error" || e["code"] != "name_held" {
+		t.Fatalf("offline holder must demand force, got %v", e)
+	}
+	if w := other.helloLoginForce(107, project, root, "", "shortother", "originO", "agent-o", "multi-one", ""); w["t"] != "welcome" {
+		t.Fatalf("forced takeover of the offline name: %v", w)
+	}
+
+	// the original session's stale hold self-heals on its next claim
+	m3 := dialTest(t, port)
+	if w := m3.helloLogin(108, project, root, "", "shortmulti", "originM", "agent-m", "multi-three", ""); w["t"] != "welcome" {
+		t.Fatalf("stale hold must self-heal on the next claim, got %v", w)
+	}
+
+	// comma-separated release list clears several names in ONE hello;
+	// ownership of the released names stays with originM (foreign claims
+	// still need force — release only drops the reverse marker)
+	if w := m3.request(map[string]interface{}{
+		"t": "hello", "rid": 109, "project": project, "projectRoot": root,
+		"session": "shortmulti", "origin": "originM", "agent": "agent-m",
+		"as": "multi-three", "release": "multi-two,multi-three",
+	}); w["t"] != "welcome" || w["released"] != true {
+		t.Fatalf("comma release list must clear the named holds, got %v", w)
+	}
+	m2.ws.Close(websocket.StatusNormalClosure, "") // multi-two goes offline
+	time.Sleep(100 * time.Millisecond)
+	other2 := dialTest(t, port)
+	if e := other2.helloLogin(110, project, root, "", "shortother2", "originO2", "agent-o", "multi-two", ""); e["t"] != "error" || e["code"] != "name_held" {
+		t.Fatalf("released name stays owned by its last holder (force to take over), got %v", e)
+	}
+	if w := other2.helloLoginForce(111, project, root, "", "shortother2", "originO2", "agent-o", "multi-two", ""); w["t"] != "welcome" {
+		t.Fatalf("force takes over the released name: %v", w)
+	}
 }

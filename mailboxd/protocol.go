@@ -44,10 +44,11 @@ type HelloMsg struct {
 	// Online holders are never displaced; same-origin reconnects and free
 	// names never need it. Strictly per-hello, never persisted.
 	Force bool `json:"force,omitempty"`
-	// Release carries the name whose _holds binding the caller is owed a
-	// release for (the daemon-side half of /mailbox logout, deferred to
-	// the next hello so it survives daemon downtime). Only the caller's
-	// own derived record is touched, and only if _holds still matches.
+	// Release carries the name (or comma-separated list of names) whose
+	// _holds binding the caller is owed a release for (the daemon-side
+	// half of /mailbox logout, deferred to the next hello so it survives
+	// daemon downtime). Only the caller's own derived record is touched,
+	// and only names still in its _holds set are removed.
 	Release string `json:"release,omitempty"`
 	// Origin is the client's full session id (e.g. the pi session UUID);
 	// persisted as the _origin system meta, used by the lifecycle GC to

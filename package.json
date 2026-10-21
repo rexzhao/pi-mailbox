@@ -1,18 +1,23 @@
 {
 	"name": "pi-mailbox",
-	"version": "0.1.0",
+	"version": "1.0.0",
 	"private": true,
 	"type": "module",
-	"description": "Mailbox service and pi extension for cross-session agent messaging",
+	"description": "Mailbox service and pi extension for cross-session agent messaging, with a host-agnostic core (MailboxController) for embedding",
 	"scripts": {
-		"check": "tsc --noEmit"
+		"check": "tsc --noEmit",
+		"check:core": "tsc --noEmit -p tsconfig.core.json"
 	},
 	"pi": {
 		"extensions": [
 			"./src/index.ts"
 		]
 	},
+	"exports": {
+		"./core": "./src/core/index.ts"
+	},
 	"dependencies": {
+		"typebox": "^1.3.27",
 		"ws": "8.22.0"
 	},
 	"devDependencies": {
@@ -20,7 +25,6 @@
 		"typescript": "5.9.3"
 	},
 	"peerDependencies": {
-		"@earendil-works/pi-coding-agent": ">=0.99.1",
-		"typebox": "*"
+		"@earendil-works/pi-coding-agent": ">=0.99.1"
 	}
 }

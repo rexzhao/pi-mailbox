@@ -1,0 +1,591 @@
+/**
+ * The /mailbox command as a host-agnostic handler: the host registers
+ * `mailbox` with its own command system and forwards the raw argument
+ * string; all output goes through host.notify. Subcommand behavior and
+ * wording match the historical pi extension (multi-login adds: login
+ * accumulates identities, logout takes an optional name).
+ */
+import { spawnSync } from "node:child_process";
+import { MailboxError, type RemoteTarget } from "../client.ts";
+import { connectLocalDaemonIfRunning, deriveProjectId, fetchSessionsViaApi, findMailboxdBinary } from "../daemon.ts";
+import type { SessionInfo } from "../protocol.ts";
+import type { MailboxController } from "./controller.ts";
+import { formatDeleteSummary, formatMail, formatMailList, formatSessions, parseMailRef } from "./format.ts";
+import { validMailboxName } from "./names.ts";
+
+type Level = "info" | "warning" | "error";
+
+/** All command output funnels through the host's notify. */
+function out(controller: MailboxController, msg: string, level: Level = "info"): void {
+	controller.hostNotify(msg, level);
+}
+
+function errMsg(err: unknown): string {
+	return err instanceof Error ? err.message : String(err);
+}
+
+export async function executeMailboxCommand(controller: MailboxController, rawArg: string): Promise<void> {
+	const arg = rawArg.trim();
+	const host = controller.hostRef;
+
+	if (arg === "start service") {
+		try {
+			if (controller.connected) {
+				out(controller, "mailbox: already connected", "info");
+				return;
+			}
+			// starting the SERVICE is decoupled from the named-account
+			// connect policy: a session that never logged in can still
+			// bring the daemon up. This command is the ONLY spawn path
+			// (connections never spawn): bring the daemon up explicitly,
+			// then connect when a stored binding exists.
+			const wasRunning = await controller.probeRunningDaemon();
+			await controller.ensureDaemon(); // spawn if dead; resolve if alive
+			const binding = host.loginStore.readLogin();
+			if (binding && binding.names.length > 0) {
+				const connection = await controller.connectBinding();
+				out(controller, `mailbox: connected as ${connection.address}`, "info");
+			} else {
+				out(
+					controller,
+					wasRunning
+						? "mailbox: service already running — run /mailbox login <name> to connect"
+						: "mailbox: service started — run /mailbox login <name> to connect",
+					"info",
+				);
+			}
+		} catch (err) {
+			out(controller, `mailbox: ${errMsg(err)}`, "error");
+		}
+		return;
+	}
+
+	if (arg === "view") {
+		try {
+			const url = await controller.resolveViewUrl();
+			// open the full URL (token in the fragment for remote); show
+			// the address without the token so it never lands in the
+			// persistent session transcript
+			const remote = controller.remoteTarget;
+			const fullUrl = remote?.token ? `${url}#t=${remote.token}` : url;
+			out(
+				controller,
+				remote?.token ? `mailbox: ${url} (token applied via URL fragment; omitted here)` : `mailbox: ${url}`,
+				"info",
+			);
+			host.openUrl?.(fullUrl);
+		} catch (err) {
+			out(controller, `mailbox: ${errMsg(err)}`, "error");
+		}
+		return;
+	}
+
+	if (arg === "resume" || arg.startsWith("resume ")) {
+		const name = arg.slice(6).trim().toLowerCase();
+		if (!name) {
+			out(controller, "Usage: /mailbox resume <name>  (switch this terminal to the named mailbox's session)", "warning");
+			return;
+		}
+		try {
+			if (!host.switchSession) {
+				out(controller, "mailbox: resume is not supported by this host (no session switching)", "error");
+				return;
+			}
+			// resolve via the daemon's read-only HTTP API: resume must
+			// not require this session to have a mailbox of its own
+			const projectRoot = host.identity.cwd;
+			const projectId = await deriveProjectId(projectRoot);
+			const sessions = await fetchSessionsViaApi({ id: projectId, root: projectRoot });
+			const info = sessions.find((s) => s.session === name && s.project === projectId);
+			if (!info) {
+				out(controller, `mailbox: no such named mailbox '${name}' in this project`, "error");
+				return;
+			}
+			if ((info.meta ?? {})._named !== "1") {
+				out(controller, `mailbox: '${name}' is not a named mailbox`, "error");
+				return;
+			}
+			const origin = (info.meta ?? {})._origin;
+			if (!origin) {
+				out(controller, `mailbox: '${name}' has no recorded session to resume`, "error");
+				return;
+			}
+			// self-check FIRST: resuming your own name while connected
+			// as it must say "already this session", not "holder
+			// running elsewhere"
+			if (origin === host.identity.sessionId) {
+				out(controller, `mailbox: '${name}' is already this session`, "info");
+				return;
+			}
+			if (info.online) {
+				out(
+					controller,
+					`mailbox: '${name}' is online — its holder session is running elsewhere; close it first (or send it a note instead)`,
+					"error",
+				);
+				return;
+			}
+			// the session file must exist (switching to a dead id would
+			// silently create an empty session)
+			const sessionFile = controller.findSessionFile(origin);
+			if (!sessionFile) {
+				out(
+					controller,
+					`mailbox: the session behind '${name}' is gone (file deleted); claim the name with /mailbox login ${name} [--force] instead`,
+					"error",
+				);
+				return;
+			}
+			// a live-but-disconnected pi on that session file would now be
+			// doubled; detect it through the host (herdr pane) when available
+			const livePane = (await host.findLiveSession?.(origin)) ?? null;
+			if (livePane) {
+				out(
+					controller,
+					`mailbox: the session behind '${name}' is still running in herdr pane ${livePane}; close it first`,
+					"error",
+				);
+				return;
+			}
+			// switch this terminal to the target session in place;
+			// session_shutdown (reason "resume") stops our mailbox
+			// connection on the way. Its stored binding auto-logins
+			// it as '<name>' on startup. On a vetoed switch the
+			// connection is untouched.
+			const { cancelled } = await host.switchSession(sessionFile);
+			if (cancelled) out(controller, "mailbox: resume cancelled (still connected as before)", "warning");
+		} catch (err) {
+			out(controller, `mailbox: ${errMsg(err)}`, "error");
+		}
+		return;
+	}
+
+	if (arg === "delete" || arg.startsWith("delete ")) {
+		// whitespace-separated names (the grammar has no spaces), lowercased, deduped
+		const names = [...new Set(arg.slice(7).trim().split(/\s+/).filter(Boolean).map((n) => n.toLowerCase()))];
+		if (names.length === 0) {
+			out(controller, "Usage: /mailbox delete <name> [<name> ...]  (hard-delete mailboxes in this project: mails, meta, registration)", "warning");
+			return;
+		}
+		try {
+			if (names.length === 1) {
+				const name = names[0]!;
+				const projectRoot = host.identity.cwd;
+				const projectId = await deriveProjectId(projectRoot);
+				const sessions = await fetchSessionsViaApi({ id: projectId, root: projectRoot });
+				const info = sessions.find((s) => s.session === name && s.project === projectId);
+				if (!info) {
+					out(controller, `mailbox: no such mailbox '${name}' in this project`, "error");
+					return;
+				}
+				// online mailboxes are never deleted — the daemon refuses a
+				// live mailbox, and that includes one's own current login:
+				// log out explicitly first, then delete (the owner's
+				// decision: no implicit disconnect inside delete)
+				if (info.online) {
+					// the held name is canonical; fold for the comparison
+					const own = controller.isHeld(name);
+					out(
+						controller,
+						own
+							? `mailbox: '${name}' is your own current login — run /mailbox logout first, then delete`
+							: `mailbox: '${name}' is online — its holder must disconnect first (the daemon refuses to delete a live mailbox)`,
+						"error",
+					);
+					return;
+				}
+				const totals = await controller.mailboxTotals(name);
+				await controller.deleteMailbox(name);
+				out(
+					controller,
+					`mailbox: deleted '${name}'${totals ? ` (${totals.total} mails, ${totals.totalUnread} unread)` : ""} — irreversibly`,
+					"info",
+				);
+				return;
+			}
+			// batch: best-effort in the order given; a per-name outcome
+			// never aborts the batch.
+			const outcome = await controller.deleteMailboxes(names);
+			const summary = formatDeleteSummary(outcome);
+			out(controller, summary.text, summary.level);
+		} catch (err) {
+			out(controller, `mailbox: delete failed: ${errMsg(err)}`, "error");
+		}
+		return;
+	}
+
+	if (arg === "list client" || arg === "list client all") {
+		try {
+			const includeOffline = arg === "list client all";
+			let sessions: SessionInfo[];
+			let self: { project: string; sessions: string[] } | undefined;
+			if (controller.connected) {
+				const c = controller.requireConnection();
+				sessions = await c.mailbox.sessions(includeOffline);
+				self = { project: c.mailbox.project!, sessions: controller.heldNames };
+			} else {
+				// read-only HTTP API: the listing works without a
+				// mailbox of one's own — a fresh, not-yet-logged-in
+				// session can still browse names
+				const projectRoot = host.identity.cwd;
+				const projectId = await deriveProjectId(projectRoot);
+				sessions = (await fetchSessionsViaApi({ id: projectId, root: projectRoot })).filter(
+					(s) => s.project === projectId && (includeOffline || s.online),
+				);
+			}
+			const online = sessions.filter((s) => s.online).length;
+			const scope = includeOffline ? `${online} online / ${sessions.length} total` : `${online} online`;
+			const note = controller.connected ? "" : " (not connected — read-only view; /mailbox to connect)";
+			out(controller, `mailbox: ${scope}${note}
+${formatSessions(sessions, self)}`, "info");
+		} catch (err) {
+			out(controller, `mailbox: ${errMsg(err)}`, "error");
+		}
+		return;
+	}
+
+	if (arg === "login" || arg.startsWith("login ")) {
+		const rest = arg.slice(5).trim();
+		if (!rest) {
+			out(controller, "Usage: /mailbox login <name> [tags=a,b,...] [--force]  (log in to a named mailbox; repeat to hold several)", "warning");
+			return;
+		}
+		const forceFlag = /(^|\s)--force(\s|$)/.test(rest);
+		const restClean = rest.replace(/(^|\s)--force(\s|$)/, " ").trim();
+		const m = /^(\S+)(?:\s+(\S.*))?$/.exec(restClean);
+		const name = (m?.[1] ?? "").toLowerCase();
+		let tags: string | undefined;
+		if (m?.[2]) {
+			const tm = /^tags=(.*)$/.exec(m[2].trim());
+			if (!tm) {
+				out(controller, "Usage: /mailbox login <name> [tags=a,b,...] [--force]", "warning");
+				return;
+			}
+			tags = tm[1];
+		}
+		if (!validMailboxName(name)) {
+			out(
+				controller,
+				"mailbox: invalid name (1-255 chars, letter first, [A-Za-z0-9_-], not a derived-id shape, 'user' reserved)",
+				"warning",
+			);
+			return;
+		}
+		try {
+			// multi-login: an explicit login ADDS the name to the held set
+			// (a held name still rejects with name_held / mailbox_in_use).
+			// --force is the human's confirmation for an offline takeover,
+			// so this path bypasses the agent-side gate.
+			const prev = controller.connected ? controller.address : null;
+			const connection = await controller.login({ as: name, tags, force: forceFlag });
+			const meta = connection.mailbox.sessionMeta ?? {};
+			const inherited = tags ? "" : ` (tags inherited: ${meta.tags ?? "(none)"})`;
+			const holding = controller.heldNames;
+			const holdingNote = holding.length > 1 ? ` — holding: ${holding.join(", ")}` : "";
+			out(
+				controller,
+				`mailbox: logged in as ${connection.address}${inherited}${holdingNote}${prev && holding.length === 1 ? `; was ${prev}` : ""}`,
+				"info",
+			);
+		} catch (err) {
+			out(controller, `mailbox: login failed: ${errMsg(err)}`, "error");
+		}
+		return;
+	}
+
+	if (arg === "logout" || arg === "off" || arg.startsWith("logout ")) {
+		// logout with no name (or "off"): disconnect and release ALL held
+		// names; "logout <name>": release just that one
+		const name = arg.startsWith("logout ") ? arg.slice(7).trim().toLowerCase() : null;
+		if (name !== null && !name) {
+			out(controller, "Usage: /mailbox logout [<name>]  (no name: log out of every held mailbox)", "warning");
+			return;
+		}
+		try {
+			await controller.logout(name);
+		} catch (err) {
+			out(controller, `mailbox: ${errMsg(err)}`, "error");
+		}
+		return;
+	}
+
+	if (arg === "stop service") {
+		try {
+			await controller.disconnectAll();
+			// gracefully stop the daemon via the shutdown protocol
+			const bin = findMailboxdBinary();
+			if (bin) {
+				const result = spawnSync(bin, ["stop"], {
+					env: { ...process.env },
+					encoding: "utf8",
+					timeout: 10_000,
+				});
+				if (result.status === 0) {
+					out(controller, "mailbox: daemon stopped", "info");
+				} else {
+					out(
+						controller,
+						`mailbox: daemon stop: ${result.stderr?.trim() || result.stdout?.trim() || "failed"}`,
+						"warning",
+					);
+				}
+			} else {
+				out(controller, "mailbox: disconnected (mailboxd binary not found for stop)", "warning");
+			}
+		} catch (err) {
+			out(controller, `mailbox: ${errMsg(err)}`, "error");
+		}
+		return;
+	}
+
+	if (arg === "restart service") {
+		try {
+			await controller.disconnectAll();
+			const bin = findMailboxdBinary();
+			if (bin) {
+				const result = spawnSync(bin, ["stop"], {
+					env: { ...process.env },
+					encoding: "utf8",
+					timeout: 10_000,
+				});
+				if (result.status !== 0) {
+					out(
+						controller,
+						`mailbox: daemon stop failed: ${result.stderr?.trim() || result.stdout?.trim() || "unknown error"}`,
+						"warning",
+					);
+				}
+			} else {
+				out(controller, "mailbox: mailboxd binary not found; cannot stop daemon", "warning");
+			}
+			// wait briefly for the daemon to release the lock
+			await new Promise((resolve) => setTimeout(resolve, 500));
+			// same decoupling as start service, and the same rule: the
+			// explicit command is the only spawn path (stop + start);
+			// reconnect only with a stored binding
+			await controller.ensureDaemon();
+			const binding = host.loginStore.readLogin();
+			if (binding && binding.names.length > 0) {
+				const connection = await controller.connectBinding();
+				out(controller, `mailbox: restarted as ${connection.address}`, "info");
+			} else {
+				out(controller, "mailbox: service restarted — run /mailbox login <name> to connect", "info");
+			}
+		} catch (err) {
+			out(controller, `mailbox: ${errMsg(err)}`, "error");
+		}
+		return;
+	}
+
+	let remote: RemoteTarget | null = null;
+	let readId: string | null = null;
+	let moreCursor: string | null = null;
+	let metaUpdate: { set?: Record<string, string>; unset?: string[] } | null = null;
+	if (arg.startsWith("read ")) {
+		readId = arg.slice(5).trim();
+	} else if (arg.startsWith("more ")) {
+		moreCursor = arg.slice(5).trim();
+	} else if (arg.startsWith("name ")) {
+		metaUpdate = { set: { name: arg.slice(5).trim() } };
+	} else if (arg.startsWith("tag ")) {
+		const tags = arg
+			.slice(4)
+			.split(",")
+			.map((t) => t.trim())
+			.filter((t) => t.length > 0);
+		metaUpdate = { set: { tags: tags.join(",") } };
+	} else if (arg.startsWith("set ")) {
+		const set: Record<string, string> = {};
+		for (const pair of arg.slice(4).trim().split(/\s+/)) {
+			const eq = pair.indexOf("=");
+			if (eq <= 0) {
+				out(controller, "Usage: /mailbox set k=v [k2=v2 ...]", "warning");
+				return;
+			}
+			const key = pair.slice(0, eq);
+			if (key.startsWith("_")) {
+				out(controller, "mailbox: keys starting with _ are system-reserved", "warning");
+				return;
+			}
+			set[key] = pair.slice(eq + 1);
+		}
+		metaUpdate = { set };
+	} else if (arg.startsWith("unset ")) {
+		const keys = arg
+			.slice(6)
+			.trim()
+			.split(/\s+/)
+			.filter((k) => k.length > 0);
+		if (keys.length === 0) {
+			out(controller, "Usage: /mailbox unset k [k2 ...]", "warning");
+			return;
+		}
+		if (keys.some((k) => k.startsWith("_"))) {
+			out(controller, "mailbox: keys starting with _ are system-reserved", "warning");
+			return;
+		}
+		metaUpdate = { unset: keys };
+	} else if (
+		arg === "name" ||
+		arg === "tag" ||
+		arg === "meta" ||
+		arg === "list" ||
+		arg === "list mail"
+	) {
+		// show metadata / sessions / inbox below; `list` defaults to mail
+	} else if (arg !== "") {
+		const m = /^([A-Za-z0-9.-]+):(\d+)(?:\s+(\S+))?$/.exec(arg);
+		if (!m) {
+			out(
+				controller,
+				"Usage: /mailbox [login <name> [tags=a,b] [--force] | logout [<name>] | resume <name> | delete <name> [<name> ...] | start service | stop service | restart service | view | status | list [client [all]|mail] | meta | name <n> | tag <a,b> | set k=v | unset k | read <mail-ref> | more <cursor> | host:port [token]]",
+				"warning",
+			);
+			return;
+		}
+		remote = { host: m[1]!, port: Number(m[2]), token: m[3] };
+	}
+
+	try {
+		// host:port always (re)connects; otherwise connect only when
+		// the daemon is already running (never spawn — use
+		// /mailbox start service to start the daemon)
+		if (remote) {
+			controller.setRemote(remote);
+			await controller.connectBinding();
+			out(controller, "mailbox: connected", "info");
+		} else if (!controller.connected) {
+			const endpoint = await connectLocalDaemonIfRunning();
+			if (endpoint) {
+				await controller.connectBinding();
+				out(controller, "mailbox: connected", "info");
+			}
+		}
+		const c = controller.requireConnection();
+		if (metaUpdate) {
+			await c.mailbox.setMeta(metaUpdate);
+			const desc = metaUpdate.set
+				? Object.entries(metaUpdate.set)
+						.map(([k, v]) => `${k} = ${v || "(empty)"}`)
+						.join(", ")
+				: `unset ${metaUpdate.unset!.join(", ")}`;
+			out(controller, `mailbox: ${desc}`, "info");
+			return;
+		}
+		if (arg === "name" || arg === "tag" || arg === "meta") {
+			const meta = c.mailbox.sessionMeta ?? {};
+			const text =
+				Object.keys(meta).length === 0
+					? "mailbox: no meta set"
+					: `mailbox: ${Object.entries(meta)
+							.map(([k, v]) => `${k}=${v}`)
+							.join("\n         ")}`;
+			out(controller, text, "info");
+			return;
+		}
+		if (readId) {
+			const own = { project: c.mailbox.project!, session: c.mailboxId };
+			const ref = parseMailRef(readId, own);
+			const mail = await c.mailbox.read(ref);
+			if (mail) void controller.refreshUnread(); // reading own mail marks it read
+			if (!mail) {
+				out(controller, `mailbox: mail ${readId} not found`, "warning");
+			} else {
+				out(controller, formatMail(mail, ref), "info");
+			}
+			return;
+		}
+		const showList = arg === "list" || arg === "list mail" || moreCursor !== null;
+		const { mails, nextCursor } = await c.mailbox.inbox(undefined, { cursor: moreCursor ?? undefined });
+		const unread = mails.filter((m) => !m.readAt).length;
+		if (!showList) {
+			// plain /mailbox (or a fresh host:port connect): one status line
+			out(controller, `mailbox: ${await controller.statusSummary(c)} — /mailbox list to view`, "info");
+			return;
+		}
+		const more = nextCursor ? `
+(older mails: /mailbox more ${nextCursor})` : "";
+		out(
+			controller,
+			`mailbox: page: ${unread} unread / ${mails.length} shown
+${formatMailList(mails)}${more}`,
+			"info",
+		);
+	} catch (err) {
+		out(controller, `mailbox: ${errMsg(err)}`, "error");
+	}
+}
+
+/**
+ * /mailbox argument completions (pi's RegisteredCommand hook shape): the
+ * provider receives everything after the command name, filters itself,
+ * and returns items whose value carries a trailing space so the cursor
+ * advances past the word.
+ *
+ * First argument: subcommands with descriptions. "login"/"resume
+ * <name>": known mailbox names (live query, connected only — never
+ * spawns). "delete <name>": offline names only (online holders cannot
+ * be deleted). Everything else: null (no suggestions).
+ */
+export async function mailboxArgumentCompletions(
+	controller: MailboxController,
+	argumentPrefix: string,
+): Promise<Array<{ value: string; label: string; description?: string }> | null> {
+	// [value (what gets typed), label (what gets shown), description]
+	const subs: Array<[string, string, string]> = [
+		["login", "login <name>", "log in to a named mailbox (repeat to hold several)"],
+		["logout", "logout [<name>]", "disconnect and clear the binding"],
+		["resume", "resume <name>", "resume a named mailbox's session"],
+		["delete", "delete <name>", "delete an offline named mailbox"],
+		["start service", "start service", "start the daemon (the only spawn path)"],
+		["stop service", "stop service", "stop the daemon"],
+		["restart service", "restart service", "restart the daemon"],
+		["view", "view", "open the daemon's web UI"],
+		["status", "status", "connection status"],
+		["list", "list", "list this session's mail"],
+		["meta", "meta", "show this session's meta"],
+		["name", "name <n>", "set the display name meta"],
+		["tag", "tag <a,b>", "set the tags meta"],
+		["set", "set k=v", "set meta values"],
+		["unset", "unset k", "remove meta values"],
+		["read", "read <mail-ref>", "read one mail"],
+		["more", "more <cursor>", "next page of mail"],
+	];
+	const parts = argumentPrefix.trimStart().split(/\s+/);
+	if (parts.length === 1) {
+		const typed = parts[0] ?? "";
+		const items = subs
+			.filter(([value]) => value.startsWith(typed))
+			.map(([value, label, desc]) => ({ value: value + " ", label, description: desc }));
+		return items.length > 0 ? items : null;
+	}
+	const action = parts[0];
+	const typed = parts[1] ?? "";
+	if (parts.length > 2) return null;
+	if (action !== "login" && action !== "resume" && action !== "delete" && action !== "logout") return null;
+	// name completion: live query through the connected session only
+	// (never spawns; daemon down -> no suggestions)
+	if (!controller.connected) return null;
+	let sessions: SessionInfo[];
+	try {
+		sessions = await controller.requireConnection().mailbox.sessions(true);
+	} catch {
+		return null; // transient daemon hiccup: no suggestions
+	}
+	// validMailboxName encodes exactly the exclusions (user, derived
+	// shape) plus the full grammar — DRY over an inline re-implementation
+	const named = sessions.filter((s) => validMailboxName(s.session));
+	const deletable = action === "delete";
+	const items = named
+		.filter((s) => (deletable ? !s.online : true))
+		.filter((s) => s.session.startsWith(typed) || ((s.meta ?? {})._case ?? "").startsWith(typed))
+		.map((s) => ({
+			value: s.session + " ",
+			label: (s.meta ?? {})._case ?? s.session,
+			description: s.online ? "online" : "offline",
+		}));
+	return items.length > 0 ? items : null;
+}
+
+// MailboxError is re-exported for the shell's fatal-error surfacing.
+export { MailboxError };

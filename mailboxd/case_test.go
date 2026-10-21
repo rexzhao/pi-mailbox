@@ -14,7 +14,7 @@ import (
 )
 
 // TestNameCaseInsensitivity pins the display-case model: names may carry
-// case (1-32 chars, letter first), the canonical identity is lowercase
+// case (1-255 chars, letter first), the canonical identity is lowercase
 // (files, registration, comparisons), the claimed spelling is display-only
 // (_case meta + the welcome's mailbox field), and every address use
 // (send/read/delete) is case-insensitive.

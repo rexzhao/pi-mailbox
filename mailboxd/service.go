@@ -254,12 +254,31 @@ func (c *conn) handleHello(rid int, data []byte) error {
 			c.send(ErrorReply{T: "error", Rid: &ridCopy, Code: "bad_project", Message: err.Error()})
 			return nil
 		}
-		// release names are case-insensitive: compare canonically
-		if holds := proj.Store.HoldsOf(msg.Session); holds == strings.ToLower(msg.Release) {
-			if err := proj.Store.BindName(msg.Session, msg.Origin, ""); err != nil {
-				log.Printf("deferred release of %s from %s: %v", msg.Release, msg.Session, err)
+		// release names are case-insensitive and may arrive as a
+		// comma-separated list (multi-name logout); each applies
+		// independently against the caller's own _holds set. NOTE the
+		// welcome's Released only means "the release was RECEIVED", never
+		// "applied": an old daemon that does not know the list form acks a
+		// comma release without applying it (documented degradation — the
+		// client clears its pending set on any ack).
+		holds := proj.Store.HoldsSet(msg.Session)
+		var released []string
+		for _, rn := range strings.Split(msg.Release, ",") {
+			rn = strings.ToLower(strings.TrimSpace(rn))
+			if rn == "" {
+				continue
+			}
+			for _, h := range holds {
+				if h == rn {
+					released = append(released, rn)
+				}
+			}
+		}
+		if len(released) > 0 {
+			if err := proj.Store.RemoveHolds(msg.Session, released...); err != nil {
+				log.Printf("deferred release of %v from %s: %v", released, msg.Session, err)
 			} else {
-				log.Printf("deferred release: %s released %s", msg.Session, msg.Release)
+				log.Printf("deferred release: %s released %v", msg.Session, released)
 			}
 		}
 	}
@@ -279,19 +298,22 @@ func (c *conn) handleHello(rid int, data []byte) error {
 				return nil
 			}
 		}
-		// one name per session: the reverse marker (_holds on the
-		// session's own derived record) makes this O(1). A stale marker
-		// (the name was taken over or deleted meanwhile) self-heals
-		// against the authoritative _origin.
-		if holds := proj.Store.HoldsOf(msg.Session); holds != "" && holds != mailboxID {
-			if proj.Store.HasMailbox(holds) && proj.Store.OriginOf(holds) == msg.Origin {
-				ridCopy := rid
-				c.send(ErrorReply{T: "error", Rid: &ridCopy, Code: "session_bound",
-					Message: fmt.Sprintf("session already holds mailbox '%s'; a session may not log in with a second name", holds)})
-				return nil
+		// multi-name login: a session may hold several names at once
+		// (each name still exclusively held by exactly one session). The
+		// reverse marker (_holds on the session's own derived record) is a
+		// set; stale entries (the name was taken over or deleted meanwhile)
+		// self-heal against the authoritative _origin.
+		if holds := proj.Store.HoldsSet(msg.Session); len(holds) > 0 {
+			var stale []string
+			for _, h := range holds {
+				if !proj.Store.HasMailbox(h) || proj.Store.OriginOf(h) != msg.Origin {
+					stale = append(stale, h)
+				}
 			}
-			if err := proj.Store.BindName(msg.Session, msg.Origin, ""); err != nil {
-				log.Printf("heal _holds for %s: %v", msg.Session, err)
+			if len(stale) > 0 {
+				if err := proj.Store.RemoveHolds(msg.Session, stale...); err != nil {
+					log.Printf("heal _holds for %s: %v", msg.Session, err)
+				}
 			}
 		}
 		// online holder of the name that is not ours: needs a confirmed force
@@ -365,9 +387,9 @@ func (c *conn) handleHello(rid int, data []byte) error {
 		return err
 	}
 	// named login: maintain the reverse marker on the session's own
-	// derived record (session -> name), the counterpart of _origin
+	// derived record (session -> its held names), the counterpart of _origin
 	if claim != nil {
-		if err := proj.Store.BindName(msg.Session, msg.Origin, claim.Name); err != nil {
+		if err := proj.Store.AddHold(msg.Session, msg.Origin, claim.Name); err != nil {
 			return err
 		}
 	}

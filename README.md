@@ -34,22 +34,34 @@ below.
   mailbox** (`/mailbox login <name> [tags=a,b]` or `mailbox_connect` with
   `as`): the mailbox is then keyed by the name, inheriting its mails, tags,
   and meta wholesale. Named mailboxes are persistent accounts — only
-  removed explicitly. Login names are 1-32 chars `[A-Za-z][A-Za-z0-9_-]`
+  removed explicitly. Login names are 1-255 chars `[A-Za-z][A-Za-z0-9_-]`
   (never a derived-id shape, `user` reserved case-insensitively). Case is
   DISPLAY-only: the canonical identity is lowercase (mailbox files,
   registration, comparisons), the claimed spelling is kept for display
   (the `_case` meta, the welcome's mailbox field), and every address use
-  — login, send, read, delete — is case-insensitive.
-  A session may hold at most one name: the daemon tracks the reverse
-  binding (`_holds` on the session's own record, O(1) at login) and rejects
-  a second name with `session_bound`. The binding is released by
-  `/mailbox logout` (model E): the client records a pending release that
-  rides the NEXT hello, surviving daemon downtime and pi restarts. The
-  daemon clears `_holds` on the caller's derived record only if it still
-  matches the released name — never `_origin`, never the named record. A
-  stale reverse binding (the name was taken over or deleted) self-heals
+  — login, send, read, delete — is case-insensitive. One wrinkle: the
+  `/mailbox login <Name>` command lowercases its argument (historical
+  behavior), so THAT path claims the lowercase spelling and refreshes
+  `_case` accordingly; `mailbox_connect as=`, rename-to-login, and resume
+  keep the claimed spelling as typed.
+  MULTI-LOGIN: a session may hold several names at once — each name is
+  its own connection (notify routes per connection), a name is still
+  held by AT MOST one session, and the daemon tracks the reverse binding
+  (`_holds` on the session's own record: a set of names, O(1) per login).
+  Consecutive `/mailbox login <name>` calls accumulate identities; the
+  last successful login is the CURRENT identity (tools and commands act
+  on it unless given `as=<name>`); `/mailbox logout <name>` releases one
+  name, `/mailbox logout` (alias `off`) releases all. Bindings are
+  released by logout (model E): the client records pending releases that
+  ride the NEXT hello (a comma-separated name list), surviving daemon
+  downtime and pi restarts. The daemon clears the names from `_holds` on
+  the caller's derived record — never `_origin`, never the named record.
+  A stale reverse binding (a name was taken over or deleted) self-heals
   against the authoritative `_origin`. The release is
   client-asserted, same trust class as `force` within a project.
+  Old daemons (pre multi-login) still enforce one name per session: a
+  second login is rejected with `session_bound` and the client degrades
+  to single-login (bidirectional version compatibility).
   The extension refuses nameless connections entirely: a session with no
   login gets "no login for this session" from every connect path — named
   accounts are the only identity.
@@ -65,7 +77,8 @@ below.
     The agent-side force is gated: it is only honored within 5 minutes
     after a normal attempt for the same name failed with `name_held`
     (typing `--force` in the command is itself the user's confirmation).
-  - S already holds another name: `session_bound` — force does not bypass.
+  - S already holds other names: fine (multi-login) — force is irrelevant
+    for the claim itself; the exclusivity rules above still apply per name.
   Note "offline" means the mailbox connection is down: a pi process that
   is alive but disconnected can be taken over after confirmation. A
   displaced session's next auto-login fails (name_held/mailbox_in_use),
@@ -76,12 +89,13 @@ below.
   member replace even a live holder by replaying the origin — acceptable in
   the local/remote trust model, but prefer asking the holder to log out.
   Login overwrites the display name with the claimed name and the tags
-  when given (omitted tags are inherited). The binding is persisted in the
-  pi session file, so resumes auto-login; a stored binding whose name is
-  now held falls back to the derived identity (surfaced in the tool output)
-  instead of failing the connection. `/mailbox logout` (alias `off`)
-  disconnects AND clears the binding. Named mailboxes are permanent
-  accounts: they are only deleted explicitly from the web UI (or
+  when given (omitted tags are inherited). The FULL set of held names is
+  persisted in the pi session file (`pi-mailbox-login` entries), so resumes
+  auto-login into every held identity; a stored binding name that is now
+  held elsewhere is dropped from the binding with a displacement notice
+  instead of failing the connection. `/mailbox logout [<name>]` (alias
+  `off` for all) disconnects AND clears the binding. Named mailboxes are
+  permanent accounts: they are only deleted explicitly from the web UI (or
   `POST /api/delete`) while offline.
 - Session meta is cookie-like key/value data (`Record<string, string>`;
   keys match `/^[a-zA-Z_][a-zA-Z0-9_.-]{0,63}$/`, values are capped at 512
@@ -98,8 +112,8 @@ below.
 - No unnamed mailboxes: every connection must claim a named account
   (hello without `as` is rejected with `name_required`). The derived
   bookkeeping record of a named login (the `_holds` reverse marker) is
-  in-memory only for the daemon's lifetime: `session_bound` is enforced
-  across reconnects, but a daemon restart forgets the binding. Mailbox
+  in-memory only for the daemon's lifetime: the multi-name set is
+  remembered across reconnects, but a daemon restart forgets it. Mailbox
   files on disk are never garbage-collected; remove stale ones manually.
 - Delivery: new-mail notices are coalesced at turn boundaries. While the
   agent runs, arriving notifies are held and flushed as ONE steered
@@ -181,10 +195,16 @@ session only; a down daemon yields no suggestions.
 - `/mailbox meta` — show this session's full meta
 - `/mailbox read <mailId>` — view one mail
 - `/mailbox login <name> [tags=a,b]` — log in to a named mailbox (persistent
-  identity; tags overwrite when given, inherited when omitted)
-- `/mailbox logout` — log out: disconnect, clear the login binding, and
-  record a pending daemon-side release that rides the next hello
-  (`off` is an alias)
+  identity; tags overwrite when given, inherited when omitted). MULTI-LOGIN:
+  repeated logins ADD names to the session's held set (the last one becomes
+  the current identity the tools and commands act on); a held name still
+  rejects with name_held/mailbox_in_use and force works per name as before.
+  The footer shows the current address plus `+N` when more identities are
+  held; the unread badge totals across all of them.
+- `/mailbox logout [<name>]` — log out of one held name (disconnect its
+  connection, drop it from the binding, record a pending daemon-side
+  release that rides the next hello); without a name, log out of EVERY
+  held identity (`off` is an alias of the full logout)
 - Rename-to-login: renaming the pi session (pi's `/name`) to a name that
   is a VALID mailbox name, while the session has no mailbox identity yet
   (not connected, no stored binding), logs in to that mailbox — the same
@@ -225,19 +245,24 @@ session only; a down daemon yields no suggestions.
 declared from the start so the agent can enable the mailbox on its own when
 it needs to talk to other sessions; calling it connects and activates the
 tools below (they are `deferred` until then, or until the user runs
-`/mailbox`):
+`/mailbox`). With `as`, an already-connected session logs in to ANOTHER
+name (multi-login: adds to the held set and switches the current identity)
+instead of reconnecting:
 
-- `mailbox_list [unreadOnly] [since] [limit] [cursor]` — list this session's
-  mail, newest first, paginated (default page 20, max 100); the reply carries
-  a `cursor` token to fetch older mails
-- `mailbox_read <mail> [session] [project]` — read a mail by triple
-- `mailbox_send <session> <subject> [body] [refs] [wake]` — send to a registered
-  session (online or offline)
-- `mailbox_reply <mail> <body> [wake]` — reply to a mail (auto recipient, refs,
-  and `Re:` subject)
+- `mailbox_list [unreadOnly] [since] [limit] [cursor] [as]` — list this
+  session's mail, newest first, paginated (default page 20, max 100); the
+  reply carries a `cursor` token to fetch older mails
+- `mailbox_read <mail> [session] [project] [as]` — read a mail by triple
+- `mailbox_send <session> <subject> [body] [refs] [wake] [as]` — send to a
+  registered session (online or offline)
+- `mailbox_reply <mail> <body> [wake] [as]` — reply to a mail (auto
+  recipient, refs, and `Re:` subject)
 - `mailbox_sessions [includeOffline]` — list sessions with name, tags, and
-  meta (your own session is marked `(you)`); offline mailboxes included on
-  request
+  meta (every held identity of yours is marked `(you)`); offline mailboxes
+  included on request
+
+The optional `as` selects the held identity for the operation (default:
+the current identity — the last successful login).
 
 ## Protocol
 
@@ -251,9 +276,19 @@ token; every reply also carries mailbox-wide `total` / `totalUnread`.
 
 ```
 npm install --ignore-scripts
-npm run check          # tsc --noEmit
+npm run check          # tsc --noEmit (everything, incl. the pi shell)
+npm run check:core     # the core chain under the FULL strict config
+                       # (see "Embedding the core" below) — what vendoring
+                       # hosts run against
 node --experimental-strip-types --no-warnings test/smoke.mjs
 cd mailboxd && go test ./...
+```
+
+Host-agnostic core tests (fake hosts + a real isolated daemon; multi
+controllers, multi-login, async deliver, binding-file parsing):
+
+```
+node --experimental-strip-types --no-warnings test/core-test.mjs
 ```
 
 The herdr wake and the notification injection have manual end-to-end demos
@@ -268,6 +303,109 @@ node --experimental-strip-types --no-warnings test/login-live-test.mjs
 
 Both build an isolated mailboxd from the current sources (own registry, go
 required) and never touch the running daemon.
+
+## Embedding the core (hosts other than pi)
+
+The plugin is a thin shell over a host-agnostic core: `src/index.ts` (the
+pi extension) is just one host; the core lives in `src/core/` and is
+loadable directly from Node — erasable TypeScript only (no enum /
+namespace / parameter properties), relative imports carry `.ts`
+extensions, and `package.json` `exports["./core"]` points at
+`src/core/index.ts`. Runtime dependencies are exactly `ws` + `typebox`
+(versions declared in package.json; additions are release-notes-worthy).
+
+**The contract**: `MAILBOX_CORE_API_VERSION` (semver). A host checks the
+MAJOR version at startup and refuses to enable on a mismatch; within a
+major version, plugin-internal changes (notification wording, tool
+behavior, wire details) are invisible to the host. Every release is
+tagged (`v1.0.0` onward); hosts pin a submodule or a tag.
+
+```ts
+import {
+  MailboxController, type MailboxHost,
+  MAILBOX_CORE_API_VERSION, coreApiMajor,
+  readLoginBinding, resolveLocalDaemon,
+} from "pi-mailbox/core";   // or a relative path into the submodule
+
+if (coreApiMajor() !== 1) throw new Error("incompatible mailbox core");
+
+// one controller per session; N controllers coexist in one process
+const controller = new MailboxController({
+  identity: { agent: "pi", sessionId, cwd },   // same derivation as the TUI
+                                              // (identity may be getters: it is read
+                                              //  live per call — but the host MUST
+                                              //  ensure it is resolvable before the
+                                              //  first core call; in pi, session_start
+                                              //  precedes everything)
+  loginStore: { readLogin, writeLogin, readRelease, writeRelease },
+  deliver: async (text) => { /* into the agent's input stream */ },
+  isBusy: () => boolean,
+  // optional: notify, setUnread(total, byName?), canDeliver, helloMeta,
+  //           onConnectionChanged, wake, findLiveSession, switchSession,
+  //           openUrl, sessionDir
+});
+
+await controller.login({ as: "worker" });   // multi-login: repeat to add names
+for (const def of controller.tools) /* register with your tool system */;
+await controller.executeCommand("list");     // /mailbox subcommands
+await controller.autoConnect();               // stored binding (all names)
+controller.stop();                            // the ONLY stop path
+```
+
+Host-facing surface:
+- `controller.tools` — the 7 tool definitions (names, descriptions,
+  schemas, output text identical to the plugin; `mailbox_list` / `_read` /
+  `_send` / `_reply` take an optional `as` for multi-login identity
+  selection).
+- `controller.executeCommand(arg)` / `completeCommand(prefix)` — the
+  `/mailbox` command, output via `host.notify`.
+- Event entry points: `onAgentStart` / `onAgentEnd` / `onAgentSettled` /
+  `onTurnEnd` / `onSessionNameChanged` — forward them from your agent
+  runtime; silence never disconnects (the controller stops only on
+  `stop()`).
+- `deliver` may be async — the notification pipeline awaits it and
+  retries later on failure (a host can open a session on demand).
+- `readLoginBinding(sessionFile)` — read a pi session file's full binding
+  (all held names + pending releases) without opening the session; use it
+  at service startup to find managed sessions and their names.
+- `MAILBOX_EXTENSION_ID` (`"pi-mailbox"`) — identify and EXCLUDE the
+  plugin extension when your host loads pi's installed extensions, so the
+  same identity is not logged in twice.
+
+The core chain (`src/core/**`, `src/client.ts`, `src/daemon.ts`,
+`src/protocol.ts`) passes tsc under the strictest vendoring config —
+`tsconfig.core.json` (`strict`, `noUncheckedIndexedAccess`,
+`noImplicitOverride`, `noFallthroughCasesInSwitch`, `verbatimModuleSyntax`,
+`erasableSyntaxOnly`, `allowImportingTsExtensions`, `isolatedModules`,
+`module/moduleResolution: nodenext`, `noEmit`); `npm run check:core`
+runs the same check.
+
+**Version coexistence**: a submodule-pinned host and a `pi update`d
+plugin may run different versions against the SAME daemon. The wire
+protocol (v2) is stable and bidirectionally compatible within a major
+version: the core only connects to an already-running daemon (probing the
+registry first) and never replaces a running one; it spawns a daemon only
+when the host asks explicitly (`controller.ensureDaemon()` — the pi shell
+wires it to `/mailbox start service` / `restart service` and nothing else)
+— using the binary resolved by `findMailboxdBinary()` relative to ITS OWN
+sources (i.e. the submodule's copy; override with `$PI_MAILBOXD`). Multi-login needs mailboxd >= v1.0.0; an older daemon
+simply keeps rejecting second logins with `session_bound` (single-login
+behavior, clean error paths).
+
+**Test isolation**: `PI_MAILBOXD_DIR` redirects the whole daemon state
+triple — registry (`mailboxd.json`, the port file), singleton lock
+(`mailboxd.leader`), and host identity (`mailbox-host-id`) — so hosts run
+a fully isolated mailboxd in a temp dir. The daemon listens on
+`127.0.0.1:0` (random port) by default and writes the actual port into
+the registry file; `--listen host:port` pins one, `--registry`/`--lock`
+override paths explicitly. `test/smoke.mjs` and `test/core-test.mjs` both
+run this way and never touch `~/.pi`.
+
+**Other platforms**: `mailboxd/` always carries the full Go source —
+a single static binary, no cgo. `cd mailboxd && go build` on any
+platform; cross-compile with `CGO_ENABLED=0 GOOS=<os> GOARCH=<arch> go
+build`. The Windows `mailboxd.exe` in-repo is a convenience only;
+`findMailboxdBinary()` picks `mailboxd`/`mailboxd.exe` per platform.
 
 ## mailboxd
 
