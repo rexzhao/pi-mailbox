@@ -161,12 +161,28 @@ func (d *Daemon) apiSessions(w http.ResponseWriter, r *http.Request) {
 	// exist on disk but are not registered in memory. Loading only builds
 	// the in-memory store from disk: no mailbox is created, nothing is
 	// registered. Remote mode never trusts client paths.
+	// When the project parameter is honored, the RESPONSE is also scoped
+	// to it: the caller named a project, so returning every other
+	// project's sessions is both surprising and a needless information
+	// exposure. No parameter = all projects (the web UI, aggregation).
+	// "project means what it says": scope whenever the project is KNOWN
+	// (in memory — with or without a root supplied); projectRoot only
+	// matters for the on-demand load of a project not yet in memory. An
+	// unknown project whose load failed must NOT turn into "no sessions"
+	// — the response falls back to unscoped rather than silently empty.
+	filterProject := ""
 	if !d.Remote {
-		if pid := r.URL.Query().Get("project"); pid != "" {
-			if root := r.URL.Query().Get("projectRoot"); root != "" && projectIDRe.MatchString(pid) {
+		if pid := r.URL.Query().Get("project"); pid != "" && projectIDRe.MatchString(pid) {
+			if root := r.URL.Query().Get("projectRoot"); root != "" {
 				if _, err := d.project(HelloMsg{Project: pid, ProjectRoot: root}); err != nil {
 					log.Printf("on-demand load of project %s: %v", pid, err)
 				}
+			}
+			d.mu.Lock()
+			_, known := d.projects[pid]
+			d.mu.Unlock()
+			if known {
+				filterProject = pid
 			}
 		}
 	}
@@ -180,6 +196,9 @@ func (d *Daemon) apiSessions(w http.ResponseWriter, r *http.Request) {
 
 	sessions := []SessionInfo{}
 	for _, p := range projects {
+		if filterProject != "" && p.ID != filterProject {
+			continue
+		}
 		onlineAgents := p.OnlineSnapshot()
 		ids := map[string]bool{}
 		for sid := range onlineAgents {
