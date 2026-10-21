@@ -34,8 +34,12 @@ below.
   mailbox** (`/mailbox login <name> [tags=a,b]` or `mailbox_connect` with
   `as`): the mailbox is then keyed by the name, inheriting its mails, tags,
   and meta wholesale. Named mailboxes are persistent accounts — only
-  removed explicitly. Login names are
-  3-32 chars `[a-z][a-z0-9_-]` (never a derived-id shape, `user` reserved).
+  removed explicitly. Login names are 1-32 chars `[A-Za-z][A-Za-z0-9_-]`
+  (never a derived-id shape, `user` reserved case-insensitively). Case is
+  DISPLAY-only: the canonical identity is lowercase (mailbox files,
+  registration, comparisons), the claimed spelling is kept for display
+  (the `_case` meta, the welcome's mailbox field), and every address use
+  — login, send, read, delete — is case-insensitive.
   A session may hold at most one name: the daemon tracks the reverse
   binding (`_holds` on the session's own record, O(1) at login) and rejects
   a second name with `session_bound`. The binding is released by
@@ -184,8 +188,10 @@ session only; a down daemon yields no suggestions.
 - Rename-to-login: renaming the pi session (pi's `/name`) to a name that
   is a VALID mailbox name, while the session has no mailbox identity yet
   (not connected, no stored binding), logs in to that mailbox — the same
-  effect as `/mailbox login <name>`. Display names that are not valid
-  mailbox names (uppercase, spaces, non-ASCII) never trigger it; a
+  effect as `/mailbox login <name>` (the claimed spelling becomes the
+  display case of the canonical lowercase name). Display names that are
+  not valid mailbox names (spaces, non-ASCII, digit-first) never trigger
+  it — case is a valid mailbox spelling; a
   rename never re-logins an identified session and never forces a
   takeover; the daemon must already be running (no spawn).
 - `/mailbox delete <name> [<name> ...]` — hard-delete mailboxes in this

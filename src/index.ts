@@ -293,9 +293,14 @@ function formatSessions(sessions: SessionInfo[], self?: { project: string; sessi
 	return sessions
 		.map((s) => {
 			const mark = s.online ? "*" : "-";
+			// self.session carries the CLAIMED spelling; the listing is
+			// canonical — fold for the comparison
 			const isSelf =
-				self !== undefined && s.session === self.session && (s.project === undefined || s.project === self.project);
-			const address = s.project ? `${s.session}@${s.project}` : s.session;
+				self !== undefined && s.session === self.session.toLowerCase() && (s.project === undefined || s.project === self.project);
+			// display the claimed spelling when the mailbox set one (case is
+			// display-only; the canonical id is lowercase)
+			const display = (s.meta ?? {})._case ?? s.session;
+			const address = s.project ? `${display}@${s.project}` : display;
 			const you = isSelf ? " (you)" : "";
 			const agent = s.agent ? `  ${s.agent}` : "";
 			const name = s.name ? `  name=${s.name}` : "";
@@ -487,7 +492,7 @@ export default function (pi: ExtensionAPI) {
 		if (name === undefined) return; // name cleared
 		if (conn?.connected) return; // already connected under an identity
 		if (readStoredLogin(ctx)) return; // has a login binding: renaming does not re-login
-		if (!validMailboxName(name)) return; // not mailbox-name-shaped: just a display name
+		if (!validMailboxName(name)) return; // not mailbox-name-shaped: just a display name (case IS a valid mailbox spelling now)
 		if (renameLoginInFlight) return; // a rename-login is still settling
 		renameLoginInFlight = true;
 		try {
@@ -754,8 +759,15 @@ export default function (pi: ExtensionAPI) {
 	]);
 
 	/** Client-side mirror of the daemon's name grammar (early UX; the daemon is the authority). */
+	/**
+	 * Mailbox-name grammar: 1-32 chars, letter first. Case is DISPLAY-only
+	 * (the daemon canonicalizes to lowercase); the derived-id shape and the
+	 * reserved ids are excluded case-insensitively.
+	 */
 	function validMailboxName(name: string): boolean {
-		return /^[a-z][a-z0-9_-]{2,31}$/.test(name) && !/^[0-9a-z]{10}$/.test(name) && name !== "user" && !WINDOWS_RESERVED.has(name);
+		if (!/^[A-Za-z][A-Za-z0-9_-]{0,31}$/.test(name)) return false;
+		const lower = name.toLowerCase();
+		return !/^[0-9a-z]{10}$/.test(lower) && lower !== "user" && !WINDOWS_RESERVED.has(lower);
 	}
 
 	// -----------------------------------------------------------------------
@@ -771,7 +783,8 @@ export default function (pi: ExtensionAPI) {
 	const FORCE_GATE_TTL_MS = 5 * 60 * 1000;
 
 	function gateAllowsForce(as: string): boolean {
-		return lastHeld !== null && lastHeld.name === as && Date.now() - lastHeld.at <= FORCE_GATE_TTL_MS;
+		// names are case-insensitive: compare canonically
+		return lastHeld !== null && lastHeld.name.toLowerCase() === as.toLowerCase() && Date.now() - lastHeld.at <= FORCE_GATE_TTL_MS;
 	}
 
 	/** Consume the gate permission (single use). */
@@ -1147,10 +1160,10 @@ export default function (pi: ExtensionAPI) {
 		const deletable = action === "delete";
 		const items = named
 			.filter((s) => (deletable ? !s.online : true))
-			.filter((s) => s.session.startsWith(typed))
+			.filter((s) => s.session.startsWith(typed) || ((s.meta ?? {})._case ?? "").startsWith(typed))
 			.map((s) => ({
 				value: s.session + " ",
-				label: s.session,
+				label: (s.meta ?? {})._case ?? s.session,
 				description: s.online ? "online" : "offline",
 			}));
 		return items.length > 0 ? items : null;
@@ -1340,7 +1353,9 @@ export default function (pi: ExtensionAPI) {
 						// log out explicitly first, then delete (the owner's
 						// decision: no implicit disconnect inside delete)
 						if (info.online) {
-							const own = conn?.connected && conn.mailboxId === name;
+							// conn.mailboxId carries the CLAIMED spelling; name is canonical --
+							// fold for the comparison
+							const own = conn?.connected && conn.mailboxId.toLowerCase() === name;
 							ctx.ui.notify(
 								own
 									? `mailbox: '${name}' is your own current login — run /mailbox logout first, then delete`
@@ -1380,7 +1395,9 @@ export default function (pi: ExtensionAPI) {
 							continue;
 						}
 						if (info.online) {
-							const own = conn?.connected && conn.mailboxId === name;
+							// conn.mailboxId carries the CLAIMED spelling; name is canonical --
+							// fold for the comparison
+							const own = conn?.connected && conn.mailboxId.toLowerCase() === name;
 							outcome.skipped.push({
 								name,
 								reason: own ? "own current login (logout first)" : "online",
@@ -1731,18 +1748,19 @@ ${formatMailList(mails)}${more}`,
 			"sessions, e.g. as='reviewer') with optional 'tags' overwrite; it is REQUIRED unless " +
 			"this session already logged in before (a stored binding auto-applies). A held name " +
 			"rejects with mailbox_in_use; a session may hold only one name (session_bound). " +
-			"Returns a status summary (mail counts, online clients, this session's address). " +
+			"Returns a status summary (mail counts, online clients, this session's address; the " +
+			"address carries the claimed spelling — the canonical id is lowercase, and every " +
+			"address use is case-insensitive). " +
 			"Mail from 'user' is your human operator; all other senders are peer agents.",
 		parameters: Type.Object({
 			as: Type.Optional(
 				Type.String({
-					minLength: 3,
+					minLength: 1,
 					maxLength: 32,
-					// case-tolerant: validation runs BEFORE execute's toLowerCase(),
-					// and "Reviewer" used to be accepted (and lowered); the
-					// lowercase grammar itself stays enforced by
-					// validMailboxName after normalisation
-					pattern: "^[A-Za-z][A-Za-z0-9_-]{2,31}$",
+					// case is display-only: the daemon canonicalizes the identity
+					// to lowercase, so "Reviewer" and "reviewer" are the same
+					// mailbox
+					pattern: "^[A-Za-z][A-Za-z0-9_-]{0,31}$",
 					description:
 						"Log in to this named mailbox instead of the derived session id; inherits its mails and tags " +
 						"(case-insensitive; names are lowercase). The schema encodes the grammar only: the runtime " +
@@ -1765,14 +1783,16 @@ ${formatMailList(mails)}${more}`,
 		// activation toggling never withdraws it
 		outputSchema: MailboxConnectOutputSchema,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			if (params.as !== undefined && !validMailboxName(params.as.toLowerCase())) {
+			if (params.as !== undefined && !validMailboxName(params.as)) {
 				throw new Error(
-					"mailbox: invalid name (3-32 chars, lowercase [a-z0-9_-], not a derived-id shape, 'user' reserved)",
+					"mailbox: invalid name (1-32 chars, letter first, [A-Za-z0-9_-], not a derived-id shape, 'user' reserved)",
 				);
 			}
+			// the claimed spelling is kept (display case); the daemon
+			// canonicalizes the identity to lowercase
 			const login =
 				params.as !== undefined
-					? { as: params.as.toLowerCase(), tags: params.tags, force: params.force === true }
+					? { as: params.as, tags: params.tags, force: params.force === true }
 					: undefined;
 			if (login?.force) {
 				// anti-abuse gate: force is only allowed right after a normal

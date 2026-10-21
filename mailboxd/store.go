@@ -25,9 +25,11 @@ import (
 
 var sessionIDRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
-// mailboxNameRe is the grammar for named mailboxes (login names): 3-32
-// chars, lowercase, starting with a letter, no dots (filename safety).
-var mailboxNameRe = regexp.MustCompile(`^[a-z][a-z0-9_-]{2,31}$`)
+// mailboxNameRe is the grammar for named mailboxes (login names): 1-32
+// chars, letter first, no dots (filename safety). Case is DISPLAY-only:
+// the canonical identity (store keys, registration, comparisons) is the
+// lowercased name; the claimed spelling rides the _case system meta.
+var mailboxNameRe = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]{0,31}$`)
 
 // derivedIDRe is the shape of client-derived session ids (10 base36 chars);
 // login names must not collide with it so addresses stay unambiguous.
@@ -44,15 +46,16 @@ var windowsReserved = map[string]bool{
 }
 
 // ValidateMailboxName checks a login name: grammar, no collision with the
-// derived-id shape, no reserved ids. Returns a user-facing reason.
+// derived-id shape, no reserved ids (case-insensitively — the canonical
+// identity is lowercase). Returns a user-facing reason.
 func ValidateMailboxName(name string) error {
 	if !mailboxNameRe.MatchString(name) {
-		return fmt.Errorf("name must match [a-z][a-z0-9_-]{2,31} (3-32 chars, lowercase)")
+		return fmt.Errorf("name must match [A-Za-z][A-Za-z0-9_-]{0,31} (1-32 chars, letter first)")
 	}
 	if derivedIDRe.MatchString(name) {
 		return fmt.Errorf("name must not be 10 lowercase alphanumerics (reserved for derived session ids)")
 	}
-	if name == webUserSession || windowsReserved[name] {
+	if lower := strings.ToLower(name); lower == webUserSession || windowsReserved[lower] {
 		return fmt.Errorf("name %q is reserved", name)
 	}
 	return nil
@@ -412,10 +415,10 @@ func (s *Store) HelloMerge(sessionID, agent, origin string, meta map[string]stri
 		metaSource["_origin"] = origin
 	}
 	for k, v := range meta {
-		// _named and _holds are server-owned: only the claim path may set
-		// them, so a client cannot self-exempt its mailbox from the
-		// lifecycle GC or forge a name binding
-		if k == "_named" || k == "_holds" {
+		// _named, _holds and _case are server-owned: only the claim path
+		// may set them, so a client cannot forge a name binding or the
+		// display case
+		if k == "_named" || k == "_holds" || k == "_case" {
 			continue
 		}
 		metaSource[k] = v
@@ -428,6 +431,9 @@ func (s *Store) HelloMerge(sessionID, agent, origin string, meta map[string]stri
 		// login semantics: identity overwrites beat the cookie-like merge
 		metaSource["name"] = claim.Name
 		metaSource["_named"] = "1"
+		// the claimed spelling is display-only; the canonical identity is
+		// lowercase. Last claim wins the display case.
+		metaSource["_case"] = claim.Name
 		if claim.Tags != "" {
 			metaSource["tags"] = claim.Tags
 		}
@@ -484,7 +490,10 @@ func (s *Store) HelloMerge(sessionID, agent, origin string, meta map[string]stri
 	// authoritative unset: stored system keys not kept by this hello.
 	// _holds is exempt: it is the session's name binding, managed only by
 	// the claim path (BindName/UnbindName) — a plain re-hello must not
-	// wash it away.
+	// wash it away. _case is claim-managed too, but it IS refreshed by
+	// every claim (the welcome's mailbox field matches), so it needs no
+	// exemption: an unset only happens if no claim occurs, which is
+	// impossible (nameless hellos are rejected).
 	sysKept["_holds"] = true
 	var unset []string
 	for k := range st.Meta {
@@ -669,6 +678,8 @@ func (s *Store) BindName(sessionID, origin, name string) error {
 	if err != nil {
 		return err
 	}
+	// _holds is a canonical (lowercase) binding: names are case-insensitive
+	name = strings.ToLower(name)
 	set := map[string]string{}
 	unset := []string{}
 	if name != "" {

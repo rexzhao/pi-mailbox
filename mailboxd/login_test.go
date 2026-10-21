@@ -163,8 +163,11 @@ func TestNamedMailboxLogin(t *testing.T) {
 		t.Fatalf("tags should be overwritten, got %v", meta3)
 	}
 
-	// 6. invalid names are rejected
-	for _, bad := range []string{"user", "ABC", "abcdefghij", "ab", "has.dot", "-lead"} {
+	// 6. invalid names are rejected (case is legal now — "ABC" is a
+	//    valid spelling of the mailbox "abc"; the grammar excludes
+	//    digit-first, too-short-after-trim... no: 1-char is legal too —
+	//    dots, leading hyphens, the derived shape, and reserved ids)
+	for _, bad := range []string{"user", "USER", "abcdefghij", "has.dot", "-lead", "1abc", "has space"} {
 		e := s.helloLogin(9, project, projectRoot, sessionDir, "shortcccc", "originC", "agent-c", bad, "")
 		if e["t"] != "error" || e["code"] != "bad_name" {
 			t.Fatalf("expected bad_name for %q, got %v", bad, e)

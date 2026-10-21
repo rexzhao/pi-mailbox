@@ -227,13 +227,15 @@ func (d *Daemon) apiSessions(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"sessions": sessions})
 }
 
-// parseSessionRef splits "<session>@<project>" (the external address form).
+// parseSessionRef splits "<session>@<project>" (the external address
+// form). The session part is folded to lowercase: addresses are
+// case-insensitive and the canonical identity is lowercase.
 func parseSessionRef(ref string) (session, project string, ok bool) {
 	at := strings.Index(ref, "@")
 	if at <= 0 || at == len(ref)-1 {
 		return "", "", false
 	}
-	return ref[:at], ref[at+1:], true
+	return strings.ToLower(ref[:at]), ref[at+1:], true
 }
 
 func (d *Daemon) apiMailbox(w http.ResponseWriter, r *http.Request) {

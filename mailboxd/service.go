@@ -232,7 +232,9 @@ func (c *conn) handleHello(rid int, data []byte) error {
 	// a second concurrent session (different origin) is rejected, while
 	// the same origin reconnecting replaces the old connection below
 	var claim *Claim
-	mailboxID := msg.As
+	// canonical identity: lowercase. The claimed spelling is display-only
+	// (it rides the _case meta and the welcome's mailbox field).
+	mailboxID := strings.ToLower(msg.As)
 	var proj *Project
 
 	// deferred release (model E): a logout that could not reach the daemon
@@ -252,7 +254,8 @@ func (c *conn) handleHello(rid int, data []byte) error {
 			c.send(ErrorReply{T: "error", Rid: &ridCopy, Code: "bad_project", Message: err.Error()})
 			return nil
 		}
-		if holds := proj.Store.HoldsOf(msg.Session); holds == msg.Release {
+		// release names are case-insensitive: compare canonically
+		if holds := proj.Store.HoldsOf(msg.Session); holds == strings.ToLower(msg.Release) {
 			if err := proj.Store.BindName(msg.Session, msg.Origin, ""); err != nil {
 				log.Printf("deferred release of %s from %s: %v", msg.Release, msg.Session, err)
 			} else {
@@ -280,7 +283,7 @@ func (c *conn) handleHello(rid int, data []byte) error {
 		// session's own derived record) makes this O(1). A stale marker
 		// (the name was taken over or deleted meanwhile) self-heals
 		// against the authoritative _origin.
-		if holds := proj.Store.HoldsOf(msg.Session); holds != "" && holds != msg.As {
+		if holds := proj.Store.HoldsOf(msg.Session); holds != "" && holds != mailboxID {
 			if proj.Store.HasMailbox(holds) && proj.Store.OriginOf(holds) == msg.Origin {
 				ridCopy := rid
 				c.send(ErrorReply{T: "error", Rid: &ridCopy, Code: "session_bound",
@@ -292,8 +295,8 @@ func (c *conn) handleHello(rid int, data []byte) error {
 			}
 		}
 		// online holder of the name that is not ours: needs a confirmed force
-		if online := proj.LookupOnline(msg.As); online != nil && online != c {
-			storedOrigin := proj.Store.OriginOf(msg.As)
+		if online := proj.LookupOnline(mailboxID); online != nil && online != c {
+			storedOrigin := proj.Store.OriginOf(mailboxID)
 			if msg.Origin == "" || storedOrigin == "" || msg.Origin != storedOrigin {
 				ridCopy := rid
 				c.send(ErrorReply{T: "error", Rid: &ridCopy, Code: "mailbox_in_use",
@@ -303,7 +306,7 @@ func (c *conn) handleHello(rid int, data []byte) error {
 			}
 			// same origin: a reconnect of the current holder; Register below
 			// replaces the stale connection
-		} else if !msg.Force && proj.Store.HasMailbox(msg.As) && proj.Store.OriginOf(msg.As) != msg.Origin {
+		} else if !msg.Force && proj.Store.HasMailbox(mailboxID) && proj.Store.OriginOf(mailboxID) != msg.Origin {
 			// offline holder of a name that is not ours: taking over needs
 			// an explicit, user-confirmed force (never silently)
 			ridCopy := rid
@@ -312,9 +315,8 @@ func (c *conn) handleHello(rid int, data []byte) error {
 			return nil
 		}
 		claim = &Claim{Name: msg.As, Tags: msg.Tags}
-		mailboxID = msg.As
 		if msg.Force {
-			if prevOrigin := proj.Store.OriginOf(msg.As); prevOrigin != "" && prevOrigin != msg.Origin {
+			if prevOrigin := proj.Store.OriginOf(mailboxID); prevOrigin != "" && prevOrigin != msg.Origin {
 				log.Printf("mailbox %s taken over by origin %s (previous holder %s)", msg.As, msg.Origin, prevOrigin)
 			}
 		}
@@ -371,10 +373,12 @@ func (c *conn) handleHello(rid int, data []byte) error {
 	}
 
 	welcome := WelcomeMsg{
-		T:               "welcome",
-		Rid:             rid,
+		T:   "welcome",
+		Rid: rid,
+		// the mailbox field carries the CLAIMED spelling (display case);
+		// the canonical identity is lowercase everywhere else
+		Mailbox:         msg.As,
 		Project:         msg.Project,
-		Mailbox:         mailboxID,
 		Released:        msg.Release != "",
 		InstanceID:      c.daemon.instanceID,
 		ProtocolVersion: ProtocolVersion,
@@ -580,6 +584,12 @@ func (c *conn) handleSend(rid int, data []byte) error {
 			fmt.Sprintf("target project %s is not served by this mailbox", msg.Target.Project))
 	}
 	targetProj := c.daemon.projectByID(msg.Target.Project)
+	// addresses are case-insensitive: fold the target to the canonical
+	// identity (and the refs with it, so the thread graph stays consistent)
+	msg.Target.Session = strings.ToLower(msg.Target.Session)
+	for i := range msg.Refs {
+		msg.Refs[i].Session = strings.ToLower(msg.Refs[i].Session)
+	}
 	// offline delivery: the target's mailbox must exist
 	if !targetProj.Store.HasMailbox(msg.Target.Session) {
 		return c.errorReply(rid, "no_mailbox",
@@ -782,6 +792,8 @@ func (c *conn) handleRead(rid int, data []byte) error {
 	if err := json.Unmarshal(data, &msg); err != nil {
 		return c.errorReply(rid, "bad_read", "unparsable read")
 	}
+	// addresses are case-insensitive: fold the mail ref to canonical
+	msg.Mail.Session = strings.ToLower(msg.Mail.Session)
 	if !c.daemon.hasProject(msg.Mail.Project) {
 		return c.errorReply(rid, "external_target",
 			fmt.Sprintf("mail %s belongs to another project", msg.Mail.Mail))
