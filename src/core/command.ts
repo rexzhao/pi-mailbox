@@ -563,8 +563,29 @@ export async function mailboxArgumentCompletions(
 	const typed = parts[1] ?? "";
 	if (parts.length > 2) return null;
 	if (action !== "login" && action !== "resume" && action !== "delete" && action !== "logout") return null;
-	// name completion: live query through the connected session only
-	// (never spawns; daemon down -> no suggestions)
+
+	// this session's OWN names (canonical): live connections plus anything
+	// still in the persisted binding
+	const ownNames = new Set(controller.heldNames.map((n) => n.toLowerCase()));
+	for (const n of controller.hostRef.loginStore.readLogin()?.names ?? []) ownNames.add(n.toLowerCase());
+
+	// logout: ONLY the session's own names are valid targets — never the
+	// whole project. Works disconnected too (a binding-only name still
+	// queues a deferred release).
+	if (action === "logout") {
+		const items = [...ownNames]
+			.filter((n) => n.startsWith(typed))
+			.sort()
+			.map((n) => ({
+				value: n + " ",
+				label: n,
+				description: n === controller.currentName ? "current identity" : "held",
+			}));
+		return items.length > 0 ? items : null;
+	}
+
+	// login / resume / delete: live query through the connected session
+	// only (never spawns; daemon down -> no suggestions)
 	if (!controller.connected) return null;
 	let sessions: SessionInfo[];
 	try {
@@ -577,7 +598,10 @@ export async function mailboxArgumentCompletions(
 	const named = sessions.filter((s) => validMailboxName(s.session));
 	const deletable = action === "delete";
 	const items = named
-		.filter((s) => (deletable ? !s.online : true))
+		// login/resume: own names are excluded from the SUGGESTIONS (re-login
+		// replaces, resume-own errors "already this session" — both remain
+		// valid to type, just not hinted); delete: offline holders only
+		.filter((s) => (deletable ? !s.online : !ownNames.has(s.session)))
 		.filter((s) => s.session.startsWith(typed) || ((s.meta ?? {})._case ?? "").startsWith(typed))
 		.map((s) => ({
 			value: s.session + " ",

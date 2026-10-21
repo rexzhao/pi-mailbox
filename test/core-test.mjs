@@ -154,6 +154,30 @@ try {
 	const self = list.structuredContent.sessions.filter((s) => s.session === "core-delta");
 	assert(self.length === 1 && self[0].online === true, "controller B sees its own identity online");
 
+	// 3b. name completion (the TUI input hints): logout lists ONLY the own
+	//     names, login/resume exclude them, delete lists offline names only
+	{
+		const offLog = { notify: [], connected: 0, disconnected: 0 };
+		const off = new MailboxConnection("local", projectDir, null, "core-off-sess", "core-off-agent", {
+			onNotify: (n) => offLog.notify.push(n),
+			onConnected: () => offLog.connected++,
+			onDisconnected: () => offLog.disconnected++,
+		}, { login: { as: "core-offline" } });
+		await off.start();
+		await off.stop(); // leaves a named mailbox that is registered but offline
+		let items = await ca.completeCommand("logout ");
+		let values = (items ?? []).map((i) => i.value);
+		assert(items !== null && values.includes("core-alpha ") && values.includes("core-beta ") && values.length === 2, `logout completion lists exactly the own held names (${values.join(",")})`);
+		assert(items.find((i) => i.value === "core-beta ").description === "current identity", "logout marks the current identity");
+		items = await ca.completeCommand("login ");
+		values = (items ?? []).map((i) => i.value);
+		assert(items !== null && !values.includes("core-alpha ") && !values.includes("core-beta "), `login completion excludes the own held names (${values.join(",")})`);
+		assert(values.includes("core-delta ") && items.find((i) => i.value === "core-delta ").description === "online", "login completion offers peers with online markers");
+		items = await ca.completeCommand("delete ");
+		values = (items ?? []).map((i) => i.value);
+		assert(items !== null && values.includes("core-offline ") && !values.includes("core-delta ") && !values.includes("core-alpha "), `delete completion lists offline names only (${values.join(",")})`);
+	}
+
 	// 4. multi-identity notification: one coalesced deliver, grouped by mailbox
 	b.state.busy = false; // idle: the 300ms debounce path
 	const peerLog = { notify: [], connected: 0, disconnected: 0 };

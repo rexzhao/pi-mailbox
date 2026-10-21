@@ -881,11 +881,18 @@ try {
 		`multi-word subcommand completes as one value: ${JSON.stringify(compl)}`,
 	);
 	assert(await mailboxCmd.getArgumentCompletions("zzz") === null, "no subcommand match -> null");
-	// login <name>: live name list through the connected session
+	// login <name>: live name list through the connected session. The
+	// session's OWN held name (extsmoke) is excluded from the suggestions
+	// (re-login replaces — valid to type, just not hinted); peers appear
+	// with online/offline markers.
 	compl = await mailboxCmd.getArgumentCompletions("login ");
 	assert(
-		compl && compl.some((i) => i.value === "extsmoke " && i.description === "online"),
-		`login name completion includes the online extsmoke: ${JSON.stringify((compl ?? []).slice(0, 3))}`,
+		compl && !compl.some((i) => i.value === "extsmoke "),
+		`login name completion excludes the own held name extsmoke: ${JSON.stringify((compl ?? []).slice(0, 3))}`,
+	);
+	assert(
+		(compl ?? []).some((i) => i.description === "offline"),
+		"login name completion still offers other named mailboxes",
 	);
 	assert(compl.every((i) => i.value !== "user "), "user is never offered as a login name");
 	// delete <name>: online holders are not deletable -> filtered out
