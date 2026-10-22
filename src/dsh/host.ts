@@ -26,8 +26,8 @@ export interface MailboxHostOptions {
 	notify(message: string, level: NotifyLevel): void;
 	/** Connection state changed: sync the tool set. */
 	onConnectionChanged(): void;
-	/** Unread total for this session changed (null = disconnected). */
-	onUnread(total: number | null): void;
+	/** Unread totals changed; byName carries one entry per connected identity. */
+	onUnread(total: number | null, byName?: Record<string, number> | null): void;
 	/** False while the session is archived: hold notifications until restored. */
 	canDeliver(): boolean;
 	/** Cold-resume an offline session (config.wakeOnMail); undefined disables wake. */
@@ -67,7 +67,7 @@ export function createMailboxHost(options: MailboxHostOptions): MailboxHost {
 		isBusy: () => agent.status === "running",
 		notify: options.notify,
 		onConnectionChanged: options.onConnectionChanged,
-		setUnread: (total) => options.onUnread(total),
+		setUnread: (total, byName) => options.onUnread(total, byName),
 		// registration-time system meta: the model route and, locally only,
 		// the machine identity (remote services never see host details)
 		helloMeta: ({ remote }) => {

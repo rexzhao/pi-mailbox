@@ -33,6 +33,25 @@ interface Notice {
 	level: NotifyLevel;
 }
 
+/** One held identity inside a session row (multi-login). */
+interface MailboxIdentityRow {
+	name: string;
+	address: string | null;
+	connected: boolean;
+	unread: number | null;
+}
+
+/** One session's mailbox row: the current identity plus every held identity. */
+interface MailboxRow {
+	sessionId: string;
+	name: string;
+	address: string | null;
+	connected: boolean;
+	unread: number | null;
+	archived: boolean;
+	identities: MailboxIdentityRow[];
+}
+
 interface Binding {
 	agent: DshAgent;
 	controller: MailboxController;
@@ -45,6 +64,8 @@ interface Binding {
 	capture: Notice[] | null;
 	/** Last unread total reported by the core; null until known. */
 	unread: number | null;
+	/** Per-identity unread for multi-login (canonical name -> unread). */
+	unreadByName: Record<string, number>;
 	/** The session is in the workspace archive set: never connected, never delivered. */
 	archived: boolean;
 	/** A reconcile transition is in flight for this binding. */
@@ -176,8 +197,9 @@ export class MailboxManager {
 					sourceKind: this.sourceKind,
 					notify: (message, level) => this.notify(binding, message, level),
 					onConnectionChanged: () => this.syncTools(binding),
-					onUnread: (total) => {
+					onUnread: (total, byName) => {
 						binding.unread = total;
+						binding.unreadByName = byName ?? {};
 					},
 					canDeliver: () => !binding.archived,
 					wake: this.wakeOnMail ? (origin) => this.wake(origin) : undefined,
@@ -191,6 +213,7 @@ export class MailboxManager {
 				connectedTools: controller.connected,
 				capture: null,
 				unread: null,
+				unreadByName: {},
 				archived: this.isArchived(sessionId),
 				archiveBusy: false,
 			};
@@ -407,59 +430,71 @@ export class MailboxManager {
 
 	/**
 	 * One row per known mailbox: live bindings plus sessions that have a stored
-	 * login binding but no agent right now, so closed sessions still show their
-	 * address and, through the daemon's read-only API, their unread count.
+	 * login binding but no agent right now. A row carries every identity the
+	 * session holds (multi-login), each with its own address, connection state,
+	 * and unread count.
 	 */
 	private async status(): Promise<{
 		generatedAt: string;
 		totalUnread: number;
-		mailboxes: Array<{
-			sessionId: string;
-			name: string;
-			address: string | null;
-			connected: boolean;
-			unread: number | null;
-			archived: boolean;
-		}>;
+		mailboxes: MailboxRow[];
 	}> {
-		const rows = new Map<
-			string,
-			{ sessionId: string; name: string; address: string | null; connected: boolean; unread: number | null; archived: boolean }
-		>();
+		const rows = new Map<string, MailboxRow>();
 		for (const binding of this.bindings.values()) {
 			const sessionId = binding.agent.session.id;
-			const name = binding.controller.currentName;
-			if (name === null) continue;
+			const current = binding.controller.currentName;
+			if (current === null) continue;
+			const identities: MailboxIdentityRow[] = binding.controller.heldIdentities.map(({ canonical, claimed }) => ({
+				name: claimed,
+				address: claimed === current ? binding.controller.address : null,
+				connected: binding.controller.isHeld(claimed),
+				unread: binding.unreadByName[canonical] ?? null,
+			}));
 			rows.set(sessionId, {
 				sessionId,
-				name,
+				name: current,
 				address: binding.controller.address,
 				connected: binding.controller.connected,
 				unread: binding.unread,
 				archived: binding.archived,
+				identities,
 			});
 		}
 		for (const file of this.storedBindingFiles()) {
 			const sessionId = file.slice(0, -".json".length);
 			if (rows.has(sessionId)) continue;
-			const name = this.storedBindingName(file);
-			if (name === undefined) continue;
+			const stored = this.storedBinding(file);
+			if (stored === undefined || stored.names.length === 0) continue;
+			const current = stored.current ?? stored.names[0];
 			rows.set(sessionId, {
 				sessionId,
-				name,
+				name: current,
 				address: null,
 				connected: false,
 				unread: null,
 				archived: this.isArchived(sessionId),
+				identities: stored.names.map((name) => ({ name, address: null, connected: false, unread: null })),
 			});
 		}
 		const infos = await this.daemonSessions();
 		const byName = new Map(infos.map((info) => [info.session, info]));
 		for (const row of rows.values()) {
-			const info = byName.get(row.name.toLowerCase());
-			if (info === undefined) continue;
-			if (info.online) row.connected = true;
-			if (row.unread === null || !info.online) row.unread = await this.unreadFor(info.project, info.session);
+			let total = 0;
+			let anyOnline = false;
+			for (const identity of row.identities) {
+				const info = byName.get(identity.name.toLowerCase());
+				if (info !== undefined) {
+					if (identity.address === null) identity.address = info.session + "@" + (info.project ?? "");
+					if (info.online) {
+						identity.connected = true;
+						anyOnline = true;
+					}
+					if (identity.unread === null || !info.online) identity.unread = await this.unreadFor(info.project, info.session);
+				}
+				total += identity.unread ?? 0;
+			}
+			if (row.connected || anyOnline) row.connected = true;
+			if (row.unread === null) row.unread = total;
 		}
 		const mailboxes = [...rows.values()];
 		return {
@@ -478,16 +513,24 @@ export class MailboxManager {
 		}
 	}
 
-	private storedBindingName(file: string): string | undefined {
+	/** All identities stored for one closed session (multi-login aware). */
+	private storedBinding(file: string): { current?: string; names: string[] } | undefined {
 		try {
 			const parsed = JSON.parse(readFileSync(join(this.stateDir, file), "utf8")) as {
 				login?: { current?: unknown; names?: unknown } | null;
 			};
-			const current = parsed.login?.current;
-			if (typeof current === "string" && current.length > 0) return current;
-			const names = parsed.login?.names;
-			if (Array.isArray(names) && typeof names[0] === "string") return names[0];
-			return undefined;
+			const login = parsed.login;
+			if (login === null || login === undefined) return undefined;
+			const names = Array.isArray(login.names)
+				? login.names.filter((name): name is string => typeof name === "string" && name.length > 0)
+				: [];
+			const current =
+				typeof login.current === "string" && login.current.length > 0 ? login.current : undefined;
+			if (names.length === 0 && current === undefined) return undefined;
+			return {
+				current,
+				names: names.length > 0 ? names : current === undefined ? [] : [current],
+			};
 		} catch {
 			return undefined;
 		}
