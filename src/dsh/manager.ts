@@ -42,6 +42,10 @@ interface Binding {
 	capture: Notice[] | null;
 	/** Last unread total reported by the core; null until known. */
 	unread: number | null;
+	/** The session is in the workspace archive set: never connected, never delivered. */
+	archived: boolean;
+	/** A reconcile transition is in flight for this binding. */
+	archiveBusy: boolean;
 }
 
 type LogLevel = "info" | "warn" | "error";
@@ -82,6 +86,7 @@ export class MailboxManager {
 	private readonly bindings = new Map<string, Binding>();
 	private readonly disposers: Array<() => void> = [];
 	private disposed = false;
+	private archiveTimer: NodeJS.Timeout | null = null;
 
 	constructor(ctx: DshContext, config: DshMailboxConfig = {}) {
 		this.ctx = ctx;
@@ -113,12 +118,24 @@ export class MailboxManager {
 		// The status route is optional: a host without an HTTP carrier (a
 		// headless CLI run) simply serves no bar data.
 		this.ctx.inject?.(["webServer"], (webCtx) => this.serveStatus(webCtx));
+		// Archived sessions must not stay connected: the daemon would deliver
+		// mail into a session whose steps the archive gate rejects, and the
+		// mail would never reach the model. The workspace registry has no
+		// change event, so reconcile the durable set on a timer.
+		if (this.service("workspaceRegistry") !== undefined) {
+			this.archiveTimer = setInterval(() => this.reconcileArchive(), 2000);
+			this.archiveTimer.unref();
+		}
 	}
 
 	/** Stop every controller and drop every registration. Idempotent. */
 	dispose(): void {
 		if (this.disposed) return;
 		this.disposed = true;
+		if (this.archiveTimer !== null) {
+			clearInterval(this.archiveTimer);
+			this.archiveTimer = null;
+		}
 		for (const dispose of this.disposers.splice(0)) dispose();
 		for (const sessionId of [...this.bindings.keys()]) {
 			const binding = this.bindings.get(sessionId);
@@ -157,6 +174,7 @@ export class MailboxManager {
 					onUnread: (total) => {
 						binding.unread = total;
 					},
+					canDeliver: () => !binding.archived,
 					wake: this.wakeOnMail ? (origin) => this.wake(origin) : undefined,
 				}),
 			);
@@ -168,6 +186,8 @@ export class MailboxManager {
 				connectedTools: controller.connected,
 				capture: null,
 				unread: null,
+				archived: this.isArchived(sessionId),
+				archiveBusy: false,
 			};
 		} catch (err) {
 			this.log("warn", `cannot attach mailbox to session ${sessionId}: ${describeError(err)}`);
@@ -181,7 +201,7 @@ export class MailboxManager {
 		}
 		this.syncTools(binding);
 
-		if (this.autoConnect) {
+		if (!binding.archived && this.autoConnect) {
 			void controller
 				.autoConnect()
 				.then(() => this.syncTools(binding))
@@ -266,6 +286,51 @@ export class MailboxManager {
 			return;
 		}
 		this.log(level === "error" ? "error" : level === "warning" ? "warn" : "info", message);
+	}
+
+	/** Keep every binding's connection in step with the durable archive set. */
+	private reconcileArchive(): void {
+		if (this.disposed) return;
+		const registry = this.service<{ archivedSessionIds?: readonly string[] }>("workspaceRegistry");
+		if (registry === undefined) return;
+		let archived: readonly string[];
+		try {
+			archived = registry.archivedSessionIds ?? [];
+		} catch {
+			return; // storage not ready: retry on the next tick
+		}
+		const set = new Set(archived);
+		for (const binding of this.bindings.values()) {
+			const want = set.has(binding.agent.session.id);
+			if (binding.archiveBusy || binding.archived === want) continue;
+			binding.archiveBusy = true;
+			void this.applyArchive(binding, want).finally(() => {
+				binding.archiveBusy = false;
+			});
+		}
+	}
+
+	/**
+	 * Disconnect an archived session from the mailbox (its mail then waits in
+	 * the daemon) and reconnect it once it is restored. Errors are logged and
+	 * retried by the next tick.
+	 */
+	private async applyArchive(binding: Binding, archived: boolean): Promise<void> {
+		const sessionId = binding.agent.session.id;
+		try {
+			if (archived) {
+				await binding.controller.disconnectAll();
+				binding.archived = true;
+				binding.unread = null;
+				this.log("info", `session ${sessionId} archived: mailbox disconnected`);
+			} else {
+				binding.archived = false;
+				await binding.controller.autoConnect();
+				this.log("info", `session ${sessionId} unarchived: mailbox reconnected`);
+			}
+		} catch (err) {
+			this.log("warn", `archive reconcile failed for ${sessionId}: ${describeError(err)}`);
+		}
 	}
 
 	/**

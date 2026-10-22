@@ -28,6 +28,8 @@ export interface MailboxHostOptions {
 	onConnectionChanged(): void;
 	/** Unread total for this session changed (null = disconnected). */
 	onUnread(total: number | null): void;
+	/** False while the session is archived: hold notifications until restored. */
+	canDeliver(): boolean;
 	/** Cold-resume an offline session (config.wakeOnMail); undefined disables wake. */
 	wake?(origin: string): Promise<DshWakeOutcome>;
 }
@@ -58,8 +60,10 @@ export function createMailboxHost(options: MailboxHostOptions): MailboxHost {
 		},
 		loginStore: options.store,
 		deliver: (text) => {
+			if (!options.canDeliver()) return; // archived: the mail waits in the daemon
 			agent.followup(mailboxMessage(text, options.sourceKind));
 		},
+		canDeliver: () => options.canDeliver(),
 		isBusy: () => agent.status === "running",
 		notify: options.notify,
 		onConnectionChanged: options.onConnectionChanged,
