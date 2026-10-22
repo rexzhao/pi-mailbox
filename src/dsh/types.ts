@@ -113,6 +113,15 @@ export interface DshContext {
 	};
 }
 
+/**
+ * Outcome of one wake attempt, mapped onto the core's WakeResult: `silent`
+ * means "no wake is possible here" (archived session, no resume service) and
+ * must not read as a failure to the sender.
+ */
+export type DshWakeOutcome =
+	| { ok: true }
+	| { ok: false; reason: string; silent?: boolean };
+
 /** The plugin's row config (cordis.patch.yml / dsh.bundle.yml). */
 export interface DshMailboxConfig {
 	/** Login-binding store directory; default `$DSH_HOME/storages/mailbox`. */

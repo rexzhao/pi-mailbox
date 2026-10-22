@@ -9,7 +9,7 @@
 import { randomUUID } from "node:crypto";
 import { hostname, platform } from "node:os";
 import type { MailboxHost, NotifyLevel, WakeResult } from "../core/index.ts";
-import type { DshAgent, DshUserMessage } from "./types.ts";
+import type { DshAgent, DshUserMessage, DshWakeOutcome } from "./types.ts";
 import type { FileLoginStore } from "./store.ts";
 
 /** Notice summary bound the DSH transcript uses for context rows. */
@@ -29,7 +29,7 @@ export interface MailboxHostOptions {
 	/** Unread total for this session changed (null = disconnected). */
 	onUnread(total: number | null): void;
 	/** Cold-resume an offline session (config.wakeOnMail); undefined disables wake. */
-	wake?(origin: string): Promise<boolean>;
+	wake?(origin: string): Promise<DshWakeOutcome>;
 }
 
 /** Build the identified user message DSH's followup() accepts. */
@@ -82,9 +82,11 @@ export function createMailboxHost(options: MailboxHostOptions): MailboxHost {
 		const wake = options.wake;
 		host.wake = async (target): Promise<WakeResult> => {
 			try {
-				return (await wake(target.origin))
-					? { ok: true, detail: `resumed session ${target.session}` }
-					: { ok: false, reason: "session could not be resumed" };
+				const outcome = await wake(target.origin);
+				if (outcome.ok) return { ok: true, detail: `resumed session ${target.session}` };
+				return outcome.silent === true
+					? { ok: false, reason: outcome.reason, silent: true }
+					: { ok: false, reason: outcome.reason };
 			} catch (err) {
 				return { ok: false, reason: err instanceof Error ? err.message : String(err) };
 			}

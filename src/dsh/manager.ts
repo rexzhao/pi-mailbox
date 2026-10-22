@@ -19,6 +19,7 @@ import type {
 	DshContext,
 	DshMailboxConfig,
 	DshSession,
+	DshWakeOutcome,
 } from "./types.ts";
 import { createMailboxHost } from "./host.ts";
 import { FileLoginStore } from "./store.ts";
@@ -273,24 +274,27 @@ export class MailboxManager {
 	 * every grouping surface and their mail waits for an explicit unarchive.
 	 * A session that is still live but disconnected only needs a reconnect.
 	 */
-	private async wake(origin: string): Promise<boolean> {
-		if (this.isArchived(origin)) return false;
+	private async wake(origin: string): Promise<DshWakeOutcome> {
+		// Archived is not a failure: there is simply no wake for this session.
+		if (this.isArchived(origin)) return { ok: false, reason: "session is archived", silent: true };
 		const local = this.bindings.get(origin);
 		if (local !== undefined) {
 			await local.controller.autoConnect();
-			return local.controller.connected;
+			return local.controller.connected
+				? { ok: true }
+				: { ok: false, reason: "the session did not reconnect" };
 		}
 		// ctx.get() is the inject-free read: the WakeTarget arrives from the daemon on
 		// a connection callback, where a declared-service property access is refused.
 		const sessions = this.service<{
 			resolveAgent(sessionId: string): Promise<{ agent?: DshAgent; error?: unknown }>;
 		}>("sessionController");
-		if (sessions === undefined) return false;
+		if (sessions === undefined) return { ok: false, reason: "no session controller", silent: true };
 		const resolved = await sessions.resolveAgent(origin);
 		if (resolved.agent === undefined) {
 			throw new Error(`cannot resume session ${origin}: ${describeError(resolved.error)}`);
 		}
-		return true;
+		return { ok: true };
 	}
 
 	/**
