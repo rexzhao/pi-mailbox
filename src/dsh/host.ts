@@ -32,6 +32,8 @@ export interface MailboxHostOptions {
 	canDeliver(): boolean;
 	/** Busy-time delivery window, or null to hold until the turn boundary. */
 	busyFlush: { delayMs: number; cooldownMs: number } | null;
+	/** Flush held notices at session step boundaries (coalesced into one steer). */
+	stepBoundary: boolean;
 	/** Cold-resume an offline session (config.wakeOnMail); undefined disables wake. */
 	wake?(origin: string): Promise<DshWakeOutcome>;
 }
@@ -69,7 +71,8 @@ export function createMailboxHost(options: MailboxHostOptions): MailboxHost {
 			else agent.followup(message);
 		},
 		canDeliver: () => options.canDeliver(),
-		busyFlushDelayMs: () => options.busyFlush?.delayMs ?? null,
+		flushAtStepBoundary: () => options.stepBoundary,
+		busyFlushDelayMs: () => (options.stepBoundary ? null : (options.busyFlush?.delayMs ?? null)),
 		busyFlushCooldownMs: () => options.busyFlush?.cooldownMs ?? 0,
 		isBusy: () => agent.status === "running",
 		notify: options.notify,

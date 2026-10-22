@@ -138,6 +138,8 @@ export interface DshMailboxConfig {
 	sourceKind?: string;
 	/** Deliver new-mail notices during a running turn instead of waiting for turn end. Default true. */
 	notifyWhileBusy?: boolean;
+	/** Coalesce at session step boundaries (one steer per boundary). Default true; false uses the timer window. */
+	notifyAtStepBoundary?: boolean;
 	/** While busy: coalesce arrivals for this long before notifying. Default 1500. */
 	notifyWindowMs?: number;
 	/** While busy: minimum gap between delivered notices. Default 10000. */

@@ -43,6 +43,10 @@ export const Config = z.object({
 		.boolean()
 		.default(true)
 		.description("Deliver new-mail notices during a running turn (at its next step) instead of waiting for turn end"),
+	notifyAtStepBoundary: z
+		.boolean()
+		.default(true)
+		.description("Coalesce held notices at each session step boundary (one steer); false falls back to the timer window"),
 	notifyWindowMs: z
 		.number()
 		.default(1500)

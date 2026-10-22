@@ -134,7 +134,7 @@ try {
 	const b = makeAgent("session-dsh-b", projectDir);
 	const sub = makeAgent("session-dsh-sub", projectDir, { origin: "subagent" });
 	const host = fakeContext([a, b, sub]);
-	const dispose = apply(host.ctx, { stateDir, notifyWindowMs: 200, notifyCooldownMs: 0 });
+	const dispose = apply(host.ctx, { stateDir, notifyAtStepBoundary: true });
 
 	assert(host.commands.has("mailbox"), "apply() registers the /mailbox command");
 	assert(a.tools.has("mailbox_connect"), "mailbox_connect is registered on the agent scope immediately");
@@ -168,15 +168,18 @@ try {
 	assert(delivered.content[0].text.includes("first-mail"), "the notification names the new subject");
 	assert(typeof delivered.id === "string" && delivered.id.length > 0, "the injected message has a fresh identity");
 
-	// busy: notices arrive EARLY (steer at the next step) and still coalesce
+	// busy: nothing is delivered mid-step; the STEP boundary coalesces everything
 	b.state.status = "running";
 	await send.execute({ address: "dsh-beta", subject: "second-mail", body: "x" }, {});
 	await send.execute({ address: "dsh-beta", subject: "third-mail", body: "y" }, {});
 	await sleep(800);
-	assert(b.state.followups.length === 2, "a running agent receives the coalesced notice early");
-	assert(b.state.steered === 1, "the early notice is delivered with steer");
+	assert(b.state.followups.length === 1, "a running agent holds notices until a step boundary");
+	host.emit("session/event", { id: "session-dsh-b" }, { type: "step/end" });
+	await waitFor(5000, () => b.state.followups.length === 2);
+	assert(b.state.followups.length === 2, "the step boundary delivers the held notices");
+	assert(b.state.steered === 1, "the step-boundary notice is delivered with steer");
 	const coalesced = b.state.followups[1].content[0].text;
-	assert(coalesced.includes("second-mail") && coalesced.includes("third-mail"), "arrivals inside the window are coalesced");
+	assert(coalesced.includes("second-mail") && coalesced.includes("third-mail"), "all arrivals in the step are coalesced into ONE notice");
 	host.emit("session/event", { id: "session-dsh-b" }, { type: "turn/end" });
 	await sleep(400);
 	assert(b.state.followups.length === 2, "the turn boundary does not duplicate a delivered notice");

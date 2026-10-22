@@ -103,6 +103,11 @@ export interface MailboxHost {
 	busyFlushDelayMs?(): number | null;
 	/** While busy: minimum gap between delivered notices (default 0). */
 	busyFlushCooldownMs?(): number;
+	/**
+	 * True when the host flushes held notices at step boundaries by calling
+	 * onStepBoundary(); while set, arrival does not schedule a busy timer.
+	 */
+	flushAtStepBoundary?(): boolean;
 	/** Notification gate (pi json mode is a pure event stream); default true. */
 	canDeliver?(): boolean;
 	/** Human-facing notices (/mailbox command output, warnings). */
@@ -296,6 +301,21 @@ export class MailboxController {
 
 	onAgentSettled(): void {
 		this.settle();
+	}
+
+	/**
+	 * Step boundary: the host calls this after each step settles. With the
+	 * flushAtStepBoundary policy, everything that arrived during the step is
+	 * coalesced into ONE notice and steered before the next model call.
+	 */
+	async onStepBoundary(): Promise<void> {
+		if (this.host.flushAtStepBoundary?.() !== true) return;
+		if (this.pendingUnread.size === 0) return;
+		if (!this.host.isBusy()) {
+			this.scheduleIdleFlush();
+			return;
+		}
+		await this.flushNotifications();
 	}
 
 	// turn boundary: steered messages are delivered right after turn_end
@@ -727,6 +747,7 @@ export class MailboxController {
 			this.scheduleIdleFlush();
 			return;
 		}
+		if (this.host.flushAtStepBoundary?.() === true) return; // the boundary will flush
 		const busyDelay = this.nextBusyDelay();
 		if (busyDelay !== null) this.scheduleFlush(busyDelay);
 	}
@@ -820,7 +841,7 @@ export class MailboxController {
 			if (this.pendingUnread.size > 0) {
 				if (!this.host.isBusy()) {
 					this.scheduleIdleFlush();
-				} else {
+				} else if (this.host.flushAtStepBoundary?.() !== true) {
 					const delay = this.nextBusyDelay();
 					if (delay !== null) this.scheduleFlush(delay);
 				}

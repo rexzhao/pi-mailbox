@@ -107,6 +107,7 @@ export class MailboxManager {
 	private readonly sourceKind: string;
 	private readonly wakeOnMail: boolean;
 	private readonly busyFlush: { delayMs: number; cooldownMs: number } | null;
+	private readonly stepBoundary: boolean;
 	private readonly logger: Logger | undefined;
 	private readonly bindings = new Map<string, Binding>();
 	private readonly disposers: Array<() => void> = [];
@@ -123,13 +124,14 @@ export class MailboxManager {
 		this.autoConnect = config.autoConnect ?? true;
 		this.sourceKind = config.sourceKind?.trim() || "mailbox";
 		this.wakeOnMail = config.wakeOnMail === true;
+		this.stepBoundary = config.notifyAtStepBoundary ?? true;
 		this.busyFlush =
-			(config.notifyWhileBusy ?? true)
-				? {
+			this.stepBoundary || !(config.notifyWhileBusy ?? true)
+				? null
+				: {
 						delayMs: Math.max(0, config.notifyWindowMs ?? 1500),
 						cooldownMs: Math.max(0, config.notifyCooldownMs ?? 10000),
-					}
-				: null;
+					};
 		this.logger = resolveLogger(ctx);
 	}
 
@@ -140,9 +142,15 @@ export class MailboxManager {
 			this.ctx.on("agent/created", ({ agent }) => this.adopt(agent)),
 			this.ctx.on("agent/disposed", ({ agent }) => this.release(agent)),
 			this.ctx.on("session/event", (session, event) => {
-				if (event.type !== "turn/end") return;
 				const binding = this.bindings.get(session.id);
 				if (binding === undefined) return;
+				if (event.type === "step/end") {
+					void binding.controller.onStepBoundary().catch((err) => {
+						this.log("warn", `step-boundary flush failed for ${session.id}: ${describeError(err)}`);
+					});
+					return;
+				}
+				if (event.type !== "turn/end") return;
 				void binding.controller.onTurnEnd().catch((err) => {
 					this.log("warn", `turn-end flush failed for ${session.id}: ${describeError(err)}`);
 				});
@@ -210,6 +218,7 @@ export class MailboxManager {
 						binding.unreadByName = byName ?? {};
 					},
 					busyFlush: this.busyFlush,
+					stepBoundary: this.stepBoundary,
 					canDeliver: () => !binding.archived,
 					wake: this.wakeOnMail ? (origin) => this.wake(origin) : undefined,
 				}),

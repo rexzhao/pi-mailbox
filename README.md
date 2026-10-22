@@ -457,17 +457,20 @@ fields render in the settings UI):
 | `autoConnect` | `true` | re-claim a stored binding when the session starts |
 | `wakeOnMail` | `false` | cold-resume an offline session via `ctx.sessionController.resolveAgent` and deliver |
 | `sourceKind` | `"mailbox"` | message source kind on delivered notices |
-| `notifyWhileBusy` | `true` | deliver new-mail notices during a running turn (steer at its next step) instead of waiting for turn end |
-| `notifyWindowMs` | `1500` | while busy: coalesce arrivals for this long before notifying |
-| `notifyCooldownMs` | `10000` | while busy: minimum gap between delivered notices |
+| `notifyWhileBusy` | `true` | deliver new-mail notices during a running turn instead of waiting for turn end |
+| `notifyAtStepBoundary` | `true` | coalesce held notices at each session step boundary and steer ONE message; `false` switches to the timer window below |
+| `notifyWindowMs` | `1500` | timer mode only: coalesce arrivals for this long while busy |
+| `notifyCooldownMs` | `10000` | timer mode only: minimum gap between busy-time notices |
 
 **How it maps.** `agent/created` adopts a live root agent;
 `agent/disposed` stops its controller (the binding survives). Mail is
-delivered as a plain user-role message with `source.kind` = `mailbox`:
-`agent.steer()` while the agent runs (the core flushes at the next step
-after a `notifyWindowMs` coalescing window and a `notifyCooldownMs` gap) and
-`agent.followup()` when it is idle (immediate next turn). The core still
-flushes whatever is pending at `turn/end`, so nothing is lost. Archived
+delivered as a plain user-role message with `source.kind` = `mailbox`.
+While the agent runs, the host reports each session `step/end` to the core,
+which coalesces everything that arrived during that step into ONE notice and
+steers it before the next model call (`notifyAtStepBoundary`, the pi
+equivalent of its per-turn-end steer). When idle, `agent.followup()` starts
+an immediate next turn; `turn/end` still flushes anything pending, so nothing
+is lost. Archived
 sessions are never connected and never delivered to. The tools are
 registered on `agent.ctx`, so they unwind with the agent and stay invisible
 to its neighbours; `mailbox_connect` is always visible and the deferred set
