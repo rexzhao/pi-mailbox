@@ -9,9 +9,12 @@
  * Nothing here is visible to the session itself: it sees ordinary tools and
  * ordinary user-role messages.
  */
+import { readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { DEFERRED_TOOL_NAMES, MailboxController, type MailboxToolDefinition, type NotifyLevel } from "../core/index.ts";
+import { mailboxTotalsViaApi } from "../daemon.ts";
+import type { SessionInfo } from "../protocol.ts";
 import type {
 	DshAgent,
 	DshCommandDefinition,
@@ -87,6 +90,8 @@ export class MailboxManager {
 	private readonly disposers: Array<() => void> = [];
 	private disposed = false;
 	private archiveTimer: NodeJS.Timeout | null = null;
+	/** Offline unread lookups, keyed "name@project"; avoids one HTTP call per poll. */
+	private readonly unreadCache = new Map<string, { unread: number; at: number }>();
 
 	constructor(ctx: DshContext, config: DshMailboxConfig = {}) {
 		this.ctx = ctx;
@@ -390,39 +395,127 @@ export class MailboxManager {
 		webServer.register({
 			kind: "exact",
 			path: "/dsh-mailbox/status",
-			handler: (_req, res) => {
+			handler: async (_req, res) => {
 				res.writeHead(200, {
 					"content-type": "application/json; charset=utf-8",
 					"cache-control": "no-store",
 				});
-				res.end(JSON.stringify(this.status()));
+				res.end(JSON.stringify(await this.status()));
 			},
 		});
 	}
 
-	private status(): {
+	/**
+	 * One row per known mailbox: live bindings plus sessions that have a stored
+	 * login binding but no agent right now, so closed sessions still show their
+	 * address and, through the daemon's read-only API, their unread count.
+	 */
+	private async status(): Promise<{
 		generatedAt: string;
 		totalUnread: number;
-		sessions: Array<{
+		mailboxes: Array<{
 			sessionId: string;
-			name: string | null;
+			name: string;
 			address: string | null;
 			connected: boolean;
 			unread: number | null;
+			archived: boolean;
 		}>;
-	} {
-		const sessions = [...this.bindings.values()].map((binding) => ({
-			sessionId: binding.agent.session.id,
-			name: binding.controller.currentName,
-			address: binding.controller.address,
-			connected: binding.controller.connected,
-			unread: binding.unread,
-		}));
+	}> {
+		const rows = new Map<
+			string,
+			{ sessionId: string; name: string; address: string | null; connected: boolean; unread: number | null; archived: boolean }
+		>();
+		for (const binding of this.bindings.values()) {
+			const sessionId = binding.agent.session.id;
+			const name = binding.controller.currentName;
+			if (name === null) continue;
+			rows.set(sessionId, {
+				sessionId,
+				name,
+				address: binding.controller.address,
+				connected: binding.controller.connected,
+				unread: binding.unread,
+				archived: binding.archived,
+			});
+		}
+		for (const file of this.storedBindingFiles()) {
+			const sessionId = file.slice(0, -".json".length);
+			if (rows.has(sessionId)) continue;
+			const name = this.storedBindingName(file);
+			if (name === undefined) continue;
+			rows.set(sessionId, {
+				sessionId,
+				name,
+				address: null,
+				connected: false,
+				unread: null,
+				archived: this.isArchived(sessionId),
+			});
+		}
+		const infos = await this.daemonSessions();
+		const byName = new Map(infos.map((info) => [info.session, info]));
+		for (const row of rows.values()) {
+			const info = byName.get(row.name.toLowerCase());
+			if (info === undefined) continue;
+			if (info.online) row.connected = true;
+			if (row.unread === null || !info.online) row.unread = await this.unreadFor(info.project, info.session);
+		}
+		const mailboxes = [...rows.values()];
 		return {
 			generatedAt: new Date().toISOString(),
-			totalUnread: sessions.reduce((total, session) => total + (session.unread ?? 0), 0),
-			sessions,
+			totalUnread: mailboxes.reduce((total, row) => total + (row.unread ?? 0), 0),
+			mailboxes,
 		};
+	}
+
+	/** Binding files are the only identity source for a closed session. */
+	private storedBindingFiles(): string[] {
+		try {
+			return readdirSync(this.stateDir).filter((file) => file.endsWith(".json"));
+		} catch {
+			return [];
+		}
+	}
+
+	private storedBindingName(file: string): string | undefined {
+		try {
+			const parsed = JSON.parse(readFileSync(join(this.stateDir, file), "utf8")) as {
+				login?: { current?: unknown; names?: unknown } | null;
+			};
+			const current = parsed.login?.current;
+			if (typeof current === "string" && current.length > 0) return current;
+			const names = parsed.login?.names;
+			if (Array.isArray(names) && typeof names[0] === "string") return names[0];
+			return undefined;
+		} catch {
+			return undefined;
+		}
+	}
+
+	/** Any connected controller can list every mailbox the daemon serves. */
+	private async daemonSessions(): Promise<SessionInfo[]> {
+		for (const binding of this.bindings.values()) {
+			if (!binding.controller.connected) continue;
+			try {
+				return await binding.controller.requireConnection().mailbox.sessions(true);
+			} catch {
+				// try the next connection
+			}
+		}
+		return [];
+	}
+
+	/** Unread for an offline mailbox, cached briefly: the bar polls every 3s. */
+	private async unreadFor(project: string | undefined, name: string): Promise<number | null> {
+		if (project === undefined) return null;
+		const key = name + "@" + project;
+		const cached = this.unreadCache.get(key);
+		if (cached !== undefined && Date.now() - cached.at < 5000) return cached.unread;
+		const totals = await mailboxTotalsViaApi(project, name);
+		if (totals === null) return cached?.unread ?? null;
+		this.unreadCache.set(key, { unread: totals.totalUnread, at: Date.now() });
+		return totals.totalUnread;
 	}
 
 	private command(): DshCommandDefinition {
