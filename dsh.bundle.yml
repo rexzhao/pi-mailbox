@@ -1,0 +1,11 @@
+# dsh-mailbox bundle layer: one inserted profile row naming the package.
+#
+# Installed with:  dsh plugin --profile <name> add link:<this directory>
+# A bare package name (not a file path) is required so the harness can find
+# this package's manifest: the host half resolves through `main`, and the
+# browser half is discovered through the `dsh.client` declaration.
+- insert:
+    - id: mailbox
+      name: pi-mailbox
+      config:
+        rootsOnly: true

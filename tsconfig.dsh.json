@@ -1,0 +1,11 @@
+{
+	"extends": "./tsconfig.json",
+	"compilerOptions": {
+		"noEmit": false,
+		"rootDir": "src",
+		"outDir": "dist",
+		"rewriteRelativeImportExtensions": true,
+		"sourceMap": false
+	},
+	"include": ["src/dsh", "src/core", "src/client.ts", "src/daemon.ts", "src/protocol.ts"]
+}

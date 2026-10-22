@@ -1,12 +1,13 @@
 # pi-mailbox
 
-A mailbox service and [pi](https://github.com/earendil-works/pi) extension for
-cross-session agent messaging within a project.
+A mailbox service, a [pi](https://github.com/earendil-works/pi) extension, and
+a [DeepSeek Harness](#deepseek-harness-dsh-plugin) plugin for cross-session
+agent messaging within a project.
 
 The service is `mailboxd`, a standalone Go daemon: one process serves every
 project that connects to it, holding a crash-safe flock for singleton
-election, and exiting after an idle period with no clients. The extension is
-a pure client that spawns the daemon on demand. See [mailboxd](#mailboxd)
+election, and exiting after an idle period with no clients. Both front ends
+are pure clients that spawn the daemon on demand. See [mailboxd](#mailboxd)
 below.
 
 ## How it works
@@ -280,6 +281,8 @@ npm run check          # tsc --noEmit (everything, incl. the pi shell)
 npm run check:core     # the core chain under the FULL strict config
                        # (see "Embedding the core" below) — what vendoring
                        # hosts run against
+npm run check:dsh      # the DSH host plugin
+npm run build          # emit dist/ (the DSH plugin ships compiled JS)
 node --experimental-strip-types --no-warnings test/smoke.mjs
 cd mailboxd && go test ./...
 ```
@@ -289,6 +292,12 @@ controllers, multi-login, async deliver, binding-file parsing):
 
 ```
 node --experimental-strip-types --no-warnings test/core-test.mjs
+```
+
+The DSH host (fake Cordis agents + the same isolated daemon):
+
+```
+node --experimental-strip-types --no-warnings test/dsh-test.mjs
 ```
 
 The herdr wake and the notification injection have manual end-to-end demos
@@ -406,6 +415,83 @@ a single static binary, no cgo. `cd mailboxd && go build` on any
 platform; cross-compile with `CGO_ENABLED=0 GOOS=<os> GOARCH=<arch> go
 build`. The Windows `mailboxd.exe` in-repo is a convenience only;
 `findMailboxdBinary()` picks `mailboxd`/`mailboxd.exe` per platform.
+
+## DeepSeek Harness (DSH) plugin
+
+The same core runs as a DSH host plugin (`src/dsh/`). It is the shape DSH
+makes natural and pi does not: the host process is long-lived and holds every
+agent, so **one** plugin instance manages a `MailboxController` per live root
+agent instead of one extension per session process. A session sees ordinary
+tools and an ordinary next-turn user message; it cannot tell this layer from
+the pi extension.
+
+**Build and install** (DSH compiles nothing, so the plugin ships as JS):
+
+```
+npm run build                     # tsc -> dist/dsh/index.js + the core
+dsh plugin --profile desktop add link:F:/work/pi-mailbox
+```
+
+`link:` keeps the profile pointing at this checkout (rebuild and reload to
+update). The desktop profile is owned by the app: quit DeepSeek Harness
+before changing it. A manual `~/.dsh/profiles/<name>/cordis.patch.yml`
+works too:
+
+```yaml
+- insert:
+    - id: mailbox
+      name: pi-mailbox          # the installed (or link:) package name
+      config:
+        rootsOnly: true
+```
+
+`package.json` carries the bundle declaration (`dsh.bundle.patch`) and the
+browser-half declaration (`dsh.client`), so `dsh plugin add` selects both
+automatically. Config (the plugin exports a Schemastery `Config`, so the same
+fields render in the settings UI):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `stateDir` | `$DSH_HOME/storages/mailbox` | login-binding files, one per session id |
+| `rootsOnly` | `true` | skip subagent sessions |
+| `autoConnect` | `true` | re-claim a stored binding when the session starts |
+| `wakeOnMail` | `false` | cold-resume an offline session via `ctx.sessionController.resolveAgent` and deliver |
+| `sourceKind` | `"mailbox"` | message source kind on delivered notices |
+
+**How it maps.** `agent/created` adopts a live root agent;
+`agent/disposed` stops its controller (the binding survives). Mail is
+delivered with `agent.followup()` as a plain user-role message with
+`source.kind` = `mailbox` — a next-turn prompt that wakes an idle agent,
+coalesced by the core at the session's `turn/end` event exactly like pi. The tools are registered on `agent.ctx`, so they
+unwind with the agent and stay invisible to its neighbours;
+`mailbox_connect` is always visible and the deferred set appears only while
+connected. Login bindings live in a per-session JSON file instead of pi
+session entries, so compaction, fork, and session-format changes cannot lose
+them. The project directory is pinned at adoption (the session's effective
+working directory, falling back to the header's original project).
+
+**Status bar.** The host half registers `GET /dsh-mailbox/status` (one row
+per managed session: address, connected, unread) and reports unread totals
+from the core through `setUnread`. The browser half (`lib/client.js`,
+discovered through `dsh.client`) registers a root-scoped `shell.bottom`
+occupant that polls that route and renders one chip per live mailbox — the
+DSH counterpart of pi's footer address/badge. It renders nothing when the
+route is absent (a headless host).
+
+**Parity gaps.** DSH has no server-side command argument completion, so
+`/mailbox login <name>` works but tab completion does not. `/mailbox view`
+prints the daemon URL instead of opening a browser, and `/mailbox resume`
+reports that this host has no session switching. Everything else — tool names,
+descriptions, outputs, notice text, login/multi-login semantics, the web UI
+and the daemon — is shared byte for byte, and a pi session and a DSH session
+in the same project can mail each other.
+
+**Test** the host without booting the harness (fake agents + a real isolated
+daemon):
+
+```
+node --experimental-strip-types --no-warnings test/dsh-test.mjs
+```
 
 ## mailboxd
 
