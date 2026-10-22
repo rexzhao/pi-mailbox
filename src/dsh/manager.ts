@@ -268,11 +268,18 @@ export class MailboxManager {
 	}
 
 	/**
-	 * Cold-resume an offline session so its controller can connect and the
-	 * unread backfill delivers the waiting mail. The resumed agent is adopted
-	 * through agent/created like any other.
+	 * Wake an offline session so it can connect and the unread backfill delivers
+	 * the waiting mail. Archived sessions are never woken: they are hidden from
+	 * every grouping surface and their mail waits for an explicit unarchive.
+	 * A session that is still live but disconnected only needs a reconnect.
 	 */
 	private async wake(origin: string): Promise<boolean> {
+		if (this.isArchived(origin)) return false;
+		const local = this.bindings.get(origin);
+		if (local !== undefined) {
+			await local.controller.autoConnect();
+			return local.controller.connected;
+		}
 		const sessions = this.ctx.sessionController;
 		if (sessions === undefined) return false;
 		const resolved = await sessions.resolveAgent(origin);
@@ -280,6 +287,25 @@ export class MailboxManager {
 			throw new Error(`cannot resume session ${origin}: ${describeError(resolved.error)}`);
 		}
 		return true;
+	}
+
+	/**
+	 * The workspace registry owns the durable archive set. A missing registry
+	 * (headless compositions without dsh-workspace) means there is no archive
+	 * concept; a registry that cannot be read counts as archived so an
+	 * unproven wake never disturbs a hidden session.
+	 */
+	private isArchived(sessionId: string): boolean {
+		const registry = this.ctx.get?.("workspaceRegistry") as
+			| { archivedSessionIds?: readonly string[] }
+			| undefined;
+		if (registry === undefined) return false;
+		try {
+			return registry.archivedSessionIds?.includes(sessionId) === true;
+		} catch (err) {
+			this.log("warn", `cannot read the archive set, not waking ${sessionId}: ${describeError(err)}`);
+			return true;
+		}
 	}
 
 	/**
