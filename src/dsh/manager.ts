@@ -280,7 +280,11 @@ export class MailboxManager {
 			await local.controller.autoConnect();
 			return local.controller.connected;
 		}
-		const sessions = this.ctx.sessionController;
+		// ctx.get() is the inject-free read: the WakeTarget arrives from the daemon on
+		// a connection callback, where a declared-service property access is refused.
+		const sessions = this.service<{
+			resolveAgent(sessionId: string): Promise<{ agent?: DshAgent; error?: unknown }>;
+		}>("sessionController");
 		if (sessions === undefined) return false;
 		const resolved = await sessions.resolveAgent(origin);
 		if (resolved.agent === undefined) {
@@ -296,9 +300,7 @@ export class MailboxManager {
 	 * unproven wake never disturbs a hidden session.
 	 */
 	private isArchived(sessionId: string): boolean {
-		const registry = this.ctx.get?.("workspaceRegistry") as
-			| { archivedSessionIds?: readonly string[] }
-			| undefined;
+		const registry = this.service<{ archivedSessionIds?: readonly string[] }>("workspaceRegistry");
 		if (registry === undefined) return false;
 		try {
 			return registry.archivedSessionIds?.includes(sessionId) === true;
@@ -382,6 +384,15 @@ export class MailboxManager {
 				return { kind: "success", text: text.length > 0 ? text : "mailbox: ok" };
 			},
 		};
+	}
+
+	/** Read an optional service without declaring it on the plugin inject list. */
+	private service<T>(name: string): T | undefined {
+		try {
+			return this.ctx.get?.(name) as T | undefined;
+		} catch {
+			return undefined;
+		}
 	}
 
 	private log(level: LogLevel, message: string): void {
