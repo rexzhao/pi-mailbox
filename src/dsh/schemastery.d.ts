@@ -10,6 +10,7 @@ declare module "@deepseek-ai/schemastery" {
 	interface SchemaFactory {
 		string(): Schema;
 		boolean(): Schema;
+		number(): Schema;
 		object(shape: Record<string, Schema>): Schema;
 	}
 	const z: SchemaFactory;

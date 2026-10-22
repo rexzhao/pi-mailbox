@@ -60,6 +60,8 @@ export interface DshAgent {
 	readonly options?: { provider?: string; model?: string };
 	/** Queue an ordinary next-turn prompt and wake the driver. */
 	followup(message: DshUserMessage): void;
+	/** Queue next-step input and wake the driver (delivered at the next step). */
+	steer(message: DshUserMessage): void;
 }
 
 export interface DshCommandInvocation {
@@ -134,4 +136,10 @@ export interface DshMailboxConfig {
 	wakeOnMail?: boolean;
 	/** Message source kind on delivered notices. Default "mailbox". */
 	sourceKind?: string;
+	/** Deliver new-mail notices during a running turn instead of waiting for turn end. Default true. */
+	notifyWhileBusy?: boolean;
+	/** While busy: coalesce arrivals for this long before notifying. Default 1500. */
+	notifyWindowMs?: number;
+	/** While busy: minimum gap between delivered notices. Default 10000. */
+	notifyCooldownMs?: number;
 }

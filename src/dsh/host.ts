@@ -30,6 +30,8 @@ export interface MailboxHostOptions {
 	onUnread(total: number | null, byName?: Record<string, number> | null): void;
 	/** False while the session is archived: hold notifications until restored. */
 	canDeliver(): boolean;
+	/** Busy-time delivery window, or null to hold until the turn boundary. */
+	busyFlush: { delayMs: number; cooldownMs: number } | null;
 	/** Cold-resume an offline session (config.wakeOnMail); undefined disables wake. */
 	wake?(origin: string): Promise<DshWakeOutcome>;
 }
@@ -61,9 +63,14 @@ export function createMailboxHost(options: MailboxHostOptions): MailboxHost {
 		loginStore: options.store,
 		deliver: (text) => {
 			if (!options.canDeliver()) return; // archived: the mail waits in the daemon
-			agent.followup(mailboxMessage(text, options.sourceKind));
+			const message = mailboxMessage(text, options.sourceKind);
+			// Running: land at the NEXT STEP (early notice). Idle: next turn.
+			if (agent.status === "running") agent.steer(message);
+			else agent.followup(message);
 		},
 		canDeliver: () => options.canDeliver(),
+		busyFlushDelayMs: () => options.busyFlush?.delayMs ?? null,
+		busyFlushCooldownMs: () => options.busyFlush?.cooldownMs ?? 0,
 		isBusy: () => agent.status === "running",
 		notify: options.notify,
 		onConnectionChanged: options.onConnectionChanged,

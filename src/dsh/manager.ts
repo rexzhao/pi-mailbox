@@ -106,6 +106,7 @@ export class MailboxManager {
 	private readonly autoConnect: boolean;
 	private readonly sourceKind: string;
 	private readonly wakeOnMail: boolean;
+	private readonly busyFlush: { delayMs: number; cooldownMs: number } | null;
 	private readonly logger: Logger | undefined;
 	private readonly bindings = new Map<string, Binding>();
 	private readonly disposers: Array<() => void> = [];
@@ -122,6 +123,13 @@ export class MailboxManager {
 		this.autoConnect = config.autoConnect ?? true;
 		this.sourceKind = config.sourceKind?.trim() || "mailbox";
 		this.wakeOnMail = config.wakeOnMail === true;
+		this.busyFlush =
+			(config.notifyWhileBusy ?? true)
+				? {
+						delayMs: Math.max(0, config.notifyWindowMs ?? 1500),
+						cooldownMs: Math.max(0, config.notifyCooldownMs ?? 10000),
+					}
+				: null;
 		this.logger = resolveLogger(ctx);
 	}
 
@@ -201,6 +209,7 @@ export class MailboxManager {
 						binding.unread = total;
 						binding.unreadByName = byName ?? {};
 					},
+					busyFlush: this.busyFlush,
 					canDeliver: () => !binding.archived,
 					wake: this.wakeOnMail ? (origin) => this.wake(origin) : undefined,
 				}),

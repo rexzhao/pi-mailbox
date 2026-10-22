@@ -39,6 +39,18 @@ export const Config = z.object({
 		.string()
 		.default("mailbox")
 		.description("Message source kind used on delivered mail notices"),
+	notifyWhileBusy: z
+		.boolean()
+		.default(true)
+		.description("Deliver new-mail notices during a running turn (at its next step) instead of waiting for turn end"),
+	notifyWindowMs: z
+		.number()
+		.default(1500)
+		.description("While busy: coalesce arriving mail for this many ms before notifying"),
+	notifyCooldownMs: z
+		.number()
+		.default(10000)
+		.description("While busy: minimum gap between delivered notices"),
 });
 
 export function apply(ctx: DshContext, config: DshMailboxConfig = {}): () => void {

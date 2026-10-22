@@ -94,6 +94,15 @@ export interface MailboxHost {
 	deliver(text: string): void | Promise<void>;
 	/** True while the agent is running (holds notifications until a turn boundary). */
 	isBusy(): boolean;
+	/**
+	 * While busy: deliver held notices after this debounce instead of waiting
+	 * for the turn boundary. null/undefined keeps the historical hold-until-
+	 * turn-end behavior; the host is responsible for making such a delivery
+	 * land at a step boundary (pi: steer, DSH: agent.steer).
+	 */
+	busyFlushDelayMs?(): number | null;
+	/** While busy: minimum gap between delivered notices (default 0). */
+	busyFlushCooldownMs?(): number;
 	/** Notification gate (pi json mode is a pure event stream); default true. */
 	canDeliver?(): boolean;
 	/** Human-facing notices (/mailbox command output, warnings). */
@@ -147,6 +156,8 @@ export class MailboxController {
 	private readonly unreadByConn = new Map<string, number>();
 	private flushing = false;
 	private flushTimer: NodeJS.Timeout | null = null;
+	/** When the last composed notice was handed to the host (busy cooldown). */
+	private lastDeliveredAt = 0;
 	/** Mail ids already included in a notification (bounded). */
 	private announced = new Set<string>();
 
@@ -712,7 +723,12 @@ export class MailboxController {
 		this.pushUnread();
 		if (!this.canDeliver()) return;
 		this.pendingUnread.set(name, unread);
-		if (!this.host.isBusy()) this.scheduleIdleFlush();
+		if (!this.host.isBusy()) {
+			this.scheduleIdleFlush();
+			return;
+		}
+		const busyDelay = this.nextBusyDelay();
+		if (busyDelay !== null) this.scheduleFlush(busyDelay);
 	}
 
 	private canDeliver(): boolean {
@@ -720,17 +736,33 @@ export class MailboxController {
 	}
 
 	private scheduleIdleFlush(): void {
-		if (!this.canDeliver() || this.flushTimer !== null) return;
 		// short debounce: bursts of notifies while idle become one message
+		this.scheduleFlush(300);
+	}
+
+	private scheduleFlush(delayMs: number): void {
+		if (!this.canDeliver() || this.flushTimer !== null) return;
 		this.flushTimer = setTimeout(() => {
 			this.flushTimer = null;
 			void this.flushNotifications();
-		}, 300);
+		}, Math.max(0, delayMs));
+	}
+
+	/** Busy-time flush delay, or null to hold until the turn boundary. */
+	private nextBusyDelay(): number | null {
+		const window = this.host.busyFlushDelayMs?.();
+		if (window === undefined || window === null) return null;
+		const cooldown = this.host.busyFlushCooldownMs?.() ?? 0;
+		return Math.max(0, Math.max(window, cooldown - (Date.now() - this.lastDeliveredAt)));
 	}
 
 	async flushNotifications(): Promise<void> {
 		if (this.flushing || !this.canDeliver()) return;
 		if (this.pendingUnread.size === 0) return;
+		if (this.flushTimer !== null) {
+			clearTimeout(this.flushTimer);
+			this.flushTimer = null;
+		}
 		this.flushing = true;
 		try {
 			const pending = new Map(this.pendingUnread);
@@ -771,6 +803,9 @@ export class MailboxController {
 			// deliver (opening a session on demand) is awaited here
 			try {
 				await this.host.deliver(this.composeNotification(sections));
+				// Only busy-time deliveries start the cooldown: an idle notice is its
+				// own turn and must not delay the next in-turn notice.
+				if (this.host.isBusy()) this.lastDeliveredAt = Date.now();
 				for (const s of sections) for (const m of s.fresh) this.announced.add(m.id);
 				if (this.announced.size > 200) this.announced = new Set([...this.announced].slice(-200));
 			} catch {
@@ -781,8 +816,15 @@ export class MailboxController {
 		} finally {
 			this.flushing = false;
 			// a notify that arrived while this flush was in flight must not be
-			// lost: re-arm the idle path (the busy path flushes at turn_end)
-			if (this.pendingUnread.size > 0 && !this.host.isBusy()) this.scheduleIdleFlush();
+			// lost: re-arm by the same policy that governs new arrivals
+			if (this.pendingUnread.size > 0) {
+				if (!this.host.isBusy()) {
+					this.scheduleIdleFlush();
+				} else {
+					const delay = this.nextBusyDelay();
+					if (delay !== null) this.scheduleFlush(delay);
+				}
+			}
 		}
 	}
 

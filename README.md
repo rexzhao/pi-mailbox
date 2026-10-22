@@ -457,31 +457,40 @@ fields render in the settings UI):
 | `autoConnect` | `true` | re-claim a stored binding when the session starts |
 | `wakeOnMail` | `false` | cold-resume an offline session via `ctx.sessionController.resolveAgent` and deliver |
 | `sourceKind` | `"mailbox"` | message source kind on delivered notices |
+| `notifyWhileBusy` | `true` | deliver new-mail notices during a running turn (steer at its next step) instead of waiting for turn end |
+| `notifyWindowMs` | `1500` | while busy: coalesce arrivals for this long before notifying |
+| `notifyCooldownMs` | `10000` | while busy: minimum gap between delivered notices |
 
 **How it maps.** `agent/created` adopts a live root agent;
 `agent/disposed` stops its controller (the binding survives). Mail is
-delivered with `agent.followup()` as a plain user-role message with
-`source.kind` = `mailbox` — a next-turn prompt that wakes an idle agent,
-coalesced by the core at the session's `turn/end` event exactly like pi. The tools are registered on `agent.ctx`, so they
-unwind with the agent and stay invisible to its neighbours;
-`mailbox_connect` is always visible and the deferred set appears only while
-connected. Login bindings live in a per-session JSON file instead of pi
-session entries, so compaction, fork, and session-format changes cannot lose
-them. The project directory is pinned at adoption (the session's effective
-working directory, falling back to the header's original project).
+delivered as a plain user-role message with `source.kind` = `mailbox`:
+`agent.steer()` while the agent runs (the core flushes at the next step
+after a `notifyWindowMs` coalescing window and a `notifyCooldownMs` gap) and
+`agent.followup()` when it is idle (immediate next turn). The core still
+flushes whatever is pending at `turn/end`, so nothing is lost. Archived
+sessions are never connected and never delivered to. The tools are
+registered on `agent.ctx`, so they unwind with the agent and stay invisible
+to its neighbours; `mailbox_connect` is always visible and the deferred set
+appears only while connected. Login bindings live in a per-session JSON file
+instead of pi session entries, so compaction, fork, and session-format
+changes cannot lose them. The project directory is pinned at adoption (the
+session's effective working directory, falling back to the header's original
+project).
 
-**Status bar.** The host half registers `GET /dsh-mailbox/status` (one row
-per managed session: address, connected, unread) and reports unread totals
-from the core through `setUnread`. The browser half (`lib/client.js`,
-discovered through `dsh.client`) registers a root-scoped `shell.bottom`
-occupant that polls that route and renders one chip per live mailbox — the
-DSH counterpart of pi's footer address/badge. It renders nothing when the
-route is absent (a headless host).
+**Surfaces.** The host half registers `GET /dsh-mailbox/status` with one row
+per known mailbox (live or closed-with-binding): the current identity plus an
+`identities[]` array carrying every held identity with its own address,
+connection state, and unread. The browser half (`lib/client.js`, discovered
+through `dsh.client`) renders a composer-dock pill (after the context meter),
+a sidebar row `📧` marker, a sidebar hover card, and a `/mailbox` popup that
+lists actions plus login names — the DSH counterpart of pi's footer
+address/badge, now multi-login aware.
 
-**Parity gaps.** DSH has no server-side command argument completion, so
-`/mailbox login <name>` works but tab completion does not. `/mailbox view`
-prints the daemon URL instead of opening a browser, and `/mailbox resume`
-reports that this host has no session switching. Everything else — tool names,
+**Parity gaps.** DSH has no server-side command argument completion; the
+browser half instead decorates bare `/mailbox` with a searchable action/login
+popup (typed arguments still execute directly). `/mailbox view` prints the
+daemon URL instead of opening a browser, and `/mailbox resume` reports that
+this host has no session switching. Everything else — tool names,
 descriptions, outputs, notice text, login/multi-login semantics, the web UI
 and the daemon — is shared byte for byte, and a pi session and a DSH session
 in the same project can mail each other.
