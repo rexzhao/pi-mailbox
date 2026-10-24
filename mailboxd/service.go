@@ -934,10 +934,13 @@ func refsOrNil(refs []MailRef) []MailRef {
 }
 
 // ---- channel bindings ------------------------------------------------------
+//
+// The WS handlers are thin wrappers: the operation logic lives in
+// bindingAddOp/bindingUpdateOp/bindingDeleteOp (bindings.go) and is shared
+// verbatim with the HTTP admin endpoints (api.go) — one set of rules,
+// two entry points.
 
-// handleBindingAdd creates a binding: validate channel + targets, claim the
-// targets atomically (all-or-nothing), persist, start the channel instance.
-// The caller's project is the owner; targets must belong to it.
+// handleBindingAdd creates a binding: see bindingAddOp.
 func (c *conn) handleBindingAdd(rid int, data []byte) error {
 	proj, err := c.requireRegistered()
 	if err != nil {
@@ -947,57 +950,18 @@ func (c *conn) handleBindingAdd(rid int, data []byte) error {
 	if err := json.Unmarshal(data, &msg); err != nil {
 		return c.errorReply(rid, "bad_binding", "unparsable binding_add")
 	}
-	ct, ok := channelTypes[msg.Channel]
-	if !ok {
-		var supported []string
-		for t := range channelTypes {
-			supported = append(supported, t)
-		}
-		sort.Strings(supported)
-		return c.errorReply(rid, "unsupported_channel",
-			fmt.Sprintf("unknown channel %q; supported: %s", msg.Channel, strings.Join(supported, ", ")))
-	}
-	if err := ct.ValidateConfig(msg.Config); err != nil {
-		return c.errorReply(rid, "invalid_config", err.Error())
-	}
-	specs, canonicals, err := foldTargets(msg.Targets)
+	b, err := c.daemon.bindingAddOp(proj, msg.Channel, msg.Config, msg.Targets, msg.Force)
 	if err != nil {
 		if ce, ok := err.(*claimError); ok {
 			return c.errorReply(rid, ce.code, ce.message)
 		}
 		return err
 	}
-	bindingID := newBindingID()
-	if err := c.daemon.claimTargets(proj, bindingID, specs, msg.Force); err != nil {
-		if ce, ok := err.(*claimError); ok {
-			return c.errorReply(rid, ce.code, ce.message)
-		}
-		return err
-	}
-	b := &Binding{
-		ID:        bindingID,
-		Owner:     proj.ID,
-		OwnerRoot: proj.RootPath,
-		Channel:   msg.Channel,
-		Config:    append(json.RawMessage(nil), msg.Config...),
-		Targets:   canonicals,
-		Enabled:   true,
-		CreatedAt: time.Now().UTC().Format(timeStampLayout),
-	}
-	if err := c.daemon.bindings.Put(b); err != nil {
-		// roll the claims back so a failed persist does not strand origins
-		c.daemon.releaseTargets(proj, bindingID, canonicals)
-		return err
-	}
-	c.daemon.startBindingInstance(b)
 	c.send(BindingReply{T: "binding", Rid: rid, Binding: bindingInfoViews([]*Binding{b})[0]})
 	return nil
 }
 
-// handleBindingUpdate: config/targets/enabled. Ownership rule: only the
-// owner project's sessions may modify. Target changes release removed
-// targets and claim added ones (force as needed); the instance is restarted
-// so it picks up the new snapshot (Start re-runs the catch-up scan).
+// handleBindingUpdate: see bindingUpdateOp.
 func (c *conn) handleBindingUpdate(rid int, data []byte) error {
 	proj, err := c.requireRegistered()
 	if err != nil {
@@ -1007,127 +971,18 @@ func (c *conn) handleBindingUpdate(rid int, data []byte) error {
 	if err := json.Unmarshal(data, &msg); err != nil {
 		return c.errorReply(rid, "bad_binding", "unparsable binding_update")
 	}
-	b := c.daemon.bindings.Get(msg.ID)
-	if b == nil {
-		return c.errorReply(rid, "not_found", fmt.Sprintf("no such binding %s", msg.ID))
-	}
-	if b.Owner != proj.ID {
-		return c.errorReply(rid, "not_owner", "binding belongs to another project")
-	}
-	if msg.Config != nil {
-		ct, ok := channelTypes[b.Channel]
-		if !ok {
-			return c.errorReply(rid, "unsupported_channel", fmt.Sprintf("unknown channel %q", b.Channel))
+	b, err := c.daemon.bindingUpdateOp(proj, msg.ID, msg.Config, msg.Targets, msg.Enabled, msg.Force)
+	if err != nil {
+		if ce, ok := err.(*claimError); ok {
+			return c.errorReply(rid, ce.code, ce.message)
 		}
-		if err := ct.ValidateConfig(msg.Config); err != nil {
-			return c.errorReply(rid, "invalid_config", err.Error())
-		}
-	}
-	var addSpecs []targetSpec
-	var addCanonicals []string
-	if msg.Targets != nil {
-		specs, canonicals, err := foldTargets(msg.Targets)
-		if err != nil {
-			if ce, ok := err.(*claimError); ok {
-				return c.errorReply(rid, ce.code, ce.message)
-			}
-			return err
-		}
-		// diff: removed targets get released, added get claimed
-		oldSet := map[string]bool{}
-		for _, t := range b.Targets {
-			oldSet[t] = true
-		}
-		newSet := map[string]bool{}
-		for _, t := range canonicals {
-			newSet[t] = true
-		}
-		var removed []string
-		for _, t := range b.Targets {
-			if !newSet[t] {
-				removed = append(removed, t)
-			}
-		}
-		for i, t := range canonicals {
-			// a target not held before, or one that was LOST (a session took
-			// it over): (re-)claim it
-			if !oldSet[t] || containsName(b.Lost, t) {
-				addSpecs = append(addSpecs, specs[i])
-				addCanonicals = append(addCanonicals, t)
-			}
-		}
-		// releasing + claiming happens after validation, all before persist
-		if len(removed) > 0 {
-			c.daemon.releaseTargets(proj, b.ID, removed)
-		}
-		if len(addSpecs) > 0 {
-			if err := c.daemon.claimTargets(proj, b.ID, addSpecs, msg.Force); err != nil {
-				// roll back the releases so the update fails atomically
-				if len(removed) > 0 {
-					c.daemon.claimTargets(proj, b.ID, specsForCanonicals(specs, removed), true)
-				}
-				if ce, ok := err.(*claimError); ok {
-					return c.errorReply(rid, ce.code, ce.message)
-				}
-				return err
-			}
-			// re-claimed targets are no longer lost
-			var keptLost []string
-			for _, l := range b.Lost {
-				if !containsName(addCanonicals, l) {
-					keptLost = append(keptLost, l)
-				}
-			}
-			b.Lost = keptLost
-		}
-		b.Targets = canonicals
-		// removed targets drop out of Lost too
-		var lost []string
-		for _, l := range b.Lost {
-			if newSet[l] {
-				lost = append(lost, l)
-			}
-		}
-		b.Lost = lost
-	}
-	// enabling: (re)claim every current target; disabling: release all
-	if msg.Enabled != nil && *msg.Enabled != b.Enabled {
-		if *msg.Enabled {
-			var specs []targetSpec
-			for _, t := range b.Targets {
-				specs = append(specs, targetSpec{canonical: t, claimed: t})
-			}
-			if len(specs) > 0 {
-				if err := c.daemon.claimTargets(proj, b.ID, specs, msg.Force); err != nil {
-					if ce, ok := err.(*claimError); ok {
-						return c.errorReply(rid, ce.code, ce.message)
-					}
-					return err
-				}
-			}
-			b.Lost = nil
-		} else {
-			c.daemon.releaseTargets(proj, b.ID, b.Targets)
-		}
-		b.Enabled = *msg.Enabled
-	}
-	if msg.Config != nil {
-		b.Config = append(json.RawMessage(nil), msg.Config...)
-	}
-	if err := c.daemon.bindings.Put(b); err != nil {
 		return err
-	}
-	// restart the instance (Stop flushes state; Start re-runs catch-up)
-	c.daemon.stopBindingInstance(b.ID)
-	if b.Enabled {
-		c.daemon.startBindingInstance(b)
 	}
 	c.send(BindingReply{T: "binding", Rid: rid, Binding: bindingInfoViews([]*Binding{b})[0]})
 	return nil
 }
 
-// handleBindingDelete releases every target, stops the instance, drops the
-// record. Only the owner project's sessions may delete.
+// handleBindingDelete: see bindingDeleteOp.
 func (c *conn) handleBindingDelete(rid int, data []byte) error {
 	proj, err := c.requireRegistered()
 	if err != nil {
@@ -1137,18 +992,11 @@ func (c *conn) handleBindingDelete(rid int, data []byte) error {
 	if err := json.Unmarshal(data, &msg); err != nil {
 		return c.errorReply(rid, "bad_binding", "unparsable binding_delete")
 	}
-	b := c.daemon.bindings.Get(msg.ID)
-	if b == nil {
-		return c.errorReply(rid, "not_found", fmt.Sprintf("no such binding %s", msg.ID))
-	}
-	if b.Owner != proj.ID {
-		return c.errorReply(rid, "not_owner", "binding belongs to another project")
-	}
-	if len(b.Targets) > 0 {
-		c.daemon.releaseTargets(proj, b.ID, b.Targets)
-	}
-	c.daemon.stopBindingInstance(b.ID)
-	if err := c.daemon.bindings.Delete(b.ID); err != nil {
+	b, err := c.daemon.bindingDeleteOp(proj, msg.ID)
+	if err != nil {
+		if ce, ok := err.(*claimError); ok {
+			return c.errorReply(rid, ce.code, ce.message)
+		}
 		return err
 	}
 	c.send(BindingReply{T: "binding", Rid: rid, Binding: bindingInfoViews([]*Binding{b})[0]})
@@ -1165,8 +1013,6 @@ func (c *conn) handleBindings(rid int) error {
 	return nil
 }
 
-// specsForCanonicals rebuilds claim specs from canonical names (rollback
-// helper: the claimed spelling of a canonical name is itself).
 func specsForCanonicals(all []targetSpec, canonicals []string) []targetSpec {
 	var out []targetSpec
 	for _, cn := range canonicals {

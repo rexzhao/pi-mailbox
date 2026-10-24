@@ -746,6 +746,189 @@ func foldTargets(targets []string) ([]targetSpec, []string, error) {
 	return specs, canonicals, nil
 }
 
+// ---------------------------------------------------------------------------
+// binding operations (the single implementation shared by the WS protocol
+// handlers and the HTTP admin endpoints — one set of rules, two entries)
+// ---------------------------------------------------------------------------
+
+// bindingAddOp creates a binding: validate channel + targets, claim the
+// targets atomically (all-or-nothing), persist, start the channel instance.
+// The owner is proj; targets must belong to it.
+func (d *Daemon) bindingAddOp(proj *Project, channel string, config json.RawMessage, targets []string, force bool) (*Binding, error) {
+	ct, ok := channelTypes[channel]
+	if !ok {
+		var supported []string
+		for t := range channelTypes {
+			supported = append(supported, t)
+		}
+		sort.Strings(supported)
+		return nil, &claimError{code: "unsupported_channel",
+			message: fmt.Sprintf("unknown channel %q; supported: %s", channel, strings.Join(supported, ", "))}
+	}
+	if err := ct.ValidateConfig(config); err != nil {
+		return nil, &claimError{code: "invalid_config", message: err.Error()}
+	}
+	specs, canonicals, err := foldTargets(targets)
+	if err != nil {
+		return nil, err // claimError for coded cases
+	}
+	bindingID := newBindingID()
+	if err := d.claimTargets(proj, bindingID, specs, force); err != nil {
+		return nil, err
+	}
+	b := &Binding{
+		ID:        bindingID,
+		Owner:     proj.ID,
+		OwnerRoot: proj.RootPath,
+		Channel:   channel,
+		Config:    append(json.RawMessage(nil), config...),
+		Targets:   canonicals,
+		Enabled:   true,
+		CreatedAt: time.Now().UTC().Format(timeStampLayout),
+	}
+	if err := d.bindings.Put(b); err != nil {
+		// roll the claims back so a failed persist does not strand origins
+		d.releaseTargets(proj, bindingID, canonicals)
+		return nil, err
+	}
+	d.startBindingInstance(b)
+	return b, nil
+}
+
+// bindingUpdateOp: config/targets/enabled. Ownership rule: only the owner
+// project may modify. Target changes release removed targets and claim
+// added ones (force as needed); the instance is restarted so it picks up
+// the new snapshot (Start re-runs the catch-up scan).
+func (d *Daemon) bindingUpdateOp(proj *Project, id string, config json.RawMessage, targets []string, enabled *bool, force bool) (*Binding, error) {
+	b := d.bindings.Get(id)
+	if b == nil {
+		return nil, &claimError{code: "not_found", message: fmt.Sprintf("no such binding %s", id)}
+	}
+	if b.Owner != proj.ID {
+		return nil, &claimError{code: "not_owner", message: "binding belongs to another project"}
+	}
+	if config != nil {
+		ct, ok := channelTypes[b.Channel]
+		if !ok {
+			return nil, &claimError{code: "unsupported_channel", message: fmt.Sprintf("unknown channel %q", b.Channel)}
+		}
+		if err := ct.ValidateConfig(config); err != nil {
+			return nil, &claimError{code: "invalid_config", message: err.Error()}
+		}
+	}
+	var addSpecs []targetSpec
+	var addCanonicals []string
+	if targets != nil {
+		specs, canonicals, err := foldTargets(targets)
+		if err != nil {
+			return nil, err
+		}
+		// diff: removed targets get released, added get claimed
+		oldSet := map[string]bool{}
+		for _, t := range b.Targets {
+			oldSet[t] = true
+		}
+		newSet := map[string]bool{}
+		for _, t := range canonicals {
+			newSet[t] = true
+		}
+		var removed []string
+		for _, t := range b.Targets {
+			if !newSet[t] {
+				removed = append(removed, t)
+			}
+		}
+		for i, t := range canonicals {
+			// a target not held before, or one that was LOST (a session took
+			// it over): (re-)claim it
+			if !oldSet[t] || containsName(b.Lost, t) {
+				addSpecs = append(addSpecs, specs[i])
+				addCanonicals = append(addCanonicals, t)
+			}
+		}
+		// releasing + claiming happens after validation, all before persist
+		if len(removed) > 0 {
+			d.releaseTargets(proj, b.ID, removed)
+		}
+		if len(addSpecs) > 0 {
+			if err := d.claimTargets(proj, b.ID, addSpecs, force); err != nil {
+				// roll back the releases so the update fails atomically
+				if len(removed) > 0 {
+					d.claimTargets(proj, b.ID, specsForCanonicals(specs, removed), true)
+				}
+				return nil, err
+			}
+			// re-claimed targets are no longer lost
+			var keptLost []string
+			for _, l := range b.Lost {
+				if !containsName(addCanonicals, l) {
+					keptLost = append(keptLost, l)
+				}
+			}
+			b.Lost = keptLost
+		}
+		b.Targets = canonicals
+		// removed targets drop out of Lost too
+		var lost []string
+		for _, l := range b.Lost {
+			if newSet[l] {
+				lost = append(lost, l)
+			}
+		}
+		b.Lost = lost
+	}
+	// enabling: (re)claim every current target; disabling: release all
+	if enabled != nil && *enabled != b.Enabled {
+		if *enabled {
+			var specs []targetSpec
+			for _, t := range b.Targets {
+				specs = append(specs, targetSpec{canonical: t, claimed: t})
+			}
+			if len(specs) > 0 {
+				if err := d.claimTargets(proj, b.ID, specs, force); err != nil {
+					return nil, err
+				}
+			}
+			b.Lost = nil
+		} else {
+			d.releaseTargets(proj, b.ID, b.Targets)
+		}
+		b.Enabled = *enabled
+	}
+	if config != nil {
+		b.Config = append(json.RawMessage(nil), config...)
+	}
+	if err := d.bindings.Put(b); err != nil {
+		return nil, err
+	}
+	// restart the instance (Stop flushes state; Start re-runs catch-up)
+	d.stopBindingInstance(b.ID)
+	if b.Enabled {
+		d.startBindingInstance(b)
+	}
+	return b, nil
+}
+
+// bindingDeleteOp releases every target, stops the instance, drops the
+// record. Only the owner project may delete.
+func (d *Daemon) bindingDeleteOp(proj *Project, id string) (*Binding, error) {
+	b := d.bindings.Get(id)
+	if b == nil {
+		return nil, &claimError{code: "not_found", message: fmt.Sprintf("no such binding %s", id)}
+	}
+	if b.Owner != proj.ID {
+		return nil, &claimError{code: "not_owner", message: "binding belongs to another project"}
+	}
+	if len(b.Targets) > 0 {
+		d.releaseTargets(proj, b.ID, b.Targets)
+	}
+	d.stopBindingInstance(b.ID)
+	if err := d.bindings.Delete(b.ID); err != nil {
+		return nil, err
+	}
+	return b, nil
+}
+
 // newBindingID returns a channel-agnostic binding id ("b" + 10 base36).
 func newBindingID() string { return "b" + newShortID() }
 

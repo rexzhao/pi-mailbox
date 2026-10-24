@@ -22,6 +22,7 @@ import (
 	"embed"
 	"encoding/json"
 	"errors"
+	"io"
 	"io/fs"
 	"log"
 	"net"
@@ -87,10 +88,14 @@ func (d *Daemon) authorize(w http.ResponseWriter, r *http.Request) bool {
 }
 
 func (d *Daemon) serveAPI(w http.ResponseWriter, r *http.Request) {
-	// the API is read-only with a single exception: the web UI's own sends
+	// the API is read-only with narrow exceptions: the web UI's own
+	// sends/deletes, and the binding admin endpoints (same rules as the WS
+	// protocol, another entry point)
 	if r.Method != http.MethodGet &&
-		!(r.Method == http.MethodPost && (r.URL.Path == "/api/send" || r.URL.Path == "/api/delete")) {
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "GET only (POST /api/send, /api/delete excepted)"})
+		!(r.Method == http.MethodPost && (r.URL.Path == "/api/send" || r.URL.Path == "/api/delete" ||
+			r.URL.Path == "/api/bindings" || r.URL.Path == "/api/binding-add" ||
+			r.URL.Path == "/api/binding-update" || r.URL.Path == "/api/binding-delete")) {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "GET only (POST /api/send, /api/delete, /api/binding-* excepted)"})
 		return
 	}
 	// cross-site requests: an Origin that disagrees with the Host is rejected
@@ -118,9 +123,149 @@ func (d *Daemon) serveAPI(w http.ResponseWriter, r *http.Request) {
 		d.apiSend(w, r)
 	case r.URL.Path == "/api/delete":
 		d.apiDelete(w, r)
+	case r.URL.Path == "/api/bindings" && r.Method == http.MethodPost:
+		d.apiBindingsList(w, r)
+	case r.URL.Path == "/api/binding-add" && r.Method == http.MethodPost:
+		d.apiBindingAdd(w, r)
+	case r.URL.Path == "/api/binding-update" && r.Method == http.MethodPost:
+		d.apiBindingUpdate(w, r)
+	case r.URL.Path == "/api/binding-delete" && r.Method == http.MethodPost:
+		d.apiBindingDelete(w, r)
+	case strings.HasPrefix(r.URL.Path, "/api/binding"):
+		// the admin endpoints exist, but not for this method (e.g. GET)
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST only"})
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
 	}
+}
+
+// ---- binding admin endpoints -------------------------------------------------
+//
+// The same operations as the WS protocol's binding_* messages, through the
+// same shared ops (bindingAddOp/...): management is entry-point agnostic.
+// Auth follows the web API model (Bearer token when the daemon has one,
+// loopback + Host allowlist otherwise); the "caller is the project" proof
+// is the request's project id plus, in local mode, its project root — the
+// same material a hello carries.
+
+// bindingAdminRequest is the shared body shape of the four endpoints.
+type bindingAdminRequest struct {
+	Project     string          `json:"project"`
+	ProjectRoot string          `json:"projectRoot,omitempty"`
+	Channel     string          `json:"channel,omitempty"`
+	Config      json.RawMessage `json:"config,omitempty"`
+	Targets     []string        `json:"targets,omitempty"`
+	ID          string          `json:"id,omitempty"`
+	Enabled     *bool           `json:"enabled,omitempty"`
+	Force       bool            `json:"force,omitempty"`
+}
+
+// decodeBindingAdmin parses the request body.
+func decodeBindingAdmin(w http.ResponseWriter, r *http.Request) (*bindingAdminRequest, bool) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad_request", "message": "unreadable body"})
+		return nil, false
+	}
+	var req bindingAdminRequest
+	if json.Unmarshal(body, &req) != nil || req.Project == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad_request", "message": "project is required"})
+		return nil, false
+	}
+	return &req, true
+}
+
+// resolveAdminProject materializes the request's project (same rules as a
+// hello: absolute root required in local mode; remote uses the data dir).
+func (d *Daemon) resolveAdminProject(w http.ResponseWriter, req *bindingAdminRequest) (*Project, bool) {
+	proj, err := d.project(HelloMsg{Project: req.Project, ProjectRoot: req.ProjectRoot})
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad_project", "message": err.Error()})
+		return nil, false
+	}
+	return proj, true
+}
+
+// writeBindingOpError maps the shared ops' coded errors to HTTP responses.
+func writeBindingOpError(w http.ResponseWriter, err error) {
+	ce, ok := err.(*claimError)
+	if !ok {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal", "message": err.Error()})
+		return
+	}
+	status := http.StatusBadRequest
+	switch ce.code {
+	case "mailbox_in_use", "name_held":
+		status = http.StatusConflict
+	case "not_found":
+		status = http.StatusNotFound
+	case "not_owner":
+		status = http.StatusForbidden
+	}
+	writeJSON(w, status, map[string]string{"error": ce.code, "message": ce.message})
+}
+
+func (d *Daemon) apiBindingsList(w http.ResponseWriter, r *http.Request) {
+	req, ok := decodeBindingAdmin(w, r)
+	if !ok {
+		return
+	}
+	proj, ok := d.resolveAdminProject(w, req)
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"bindings": bindingInfoViews(d.bindings.ForOwner(proj.ID))})
+}
+
+func (d *Daemon) apiBindingAdd(w http.ResponseWriter, r *http.Request) {
+	req, ok := decodeBindingAdmin(w, r)
+	if !ok {
+		return
+	}
+	proj, ok := d.resolveAdminProject(w, req)
+	if !ok {
+		return
+	}
+	b, err := d.bindingAddOp(proj, req.Channel, req.Config, req.Targets, req.Force)
+	if err != nil {
+		writeBindingOpError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"binding": bindingInfoViews([]*Binding{b})[0]})
+}
+
+func (d *Daemon) apiBindingUpdate(w http.ResponseWriter, r *http.Request) {
+	req, ok := decodeBindingAdmin(w, r)
+	if !ok {
+		return
+	}
+	proj, ok := d.resolveAdminProject(w, req)
+	if !ok {
+		return
+	}
+	b, err := d.bindingUpdateOp(proj, req.ID, req.Config, req.Targets, req.Enabled, req.Force)
+	if err != nil {
+		writeBindingOpError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"binding": bindingInfoViews([]*Binding{b})[0]})
+}
+
+func (d *Daemon) apiBindingDelete(w http.ResponseWriter, r *http.Request) {
+	req, ok := decodeBindingAdmin(w, r)
+	if !ok {
+		return
+	}
+	proj, ok := d.resolveAdminProject(w, req)
+	if !ok {
+		return
+	}
+	b, err := d.bindingDeleteOp(proj, req.ID)
+	if err != nil {
+		writeBindingOpError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"binding": bindingInfoViews([]*Binding{b})[0]})
 }
 
 func (d *Daemon) apiInfo(w http.ResponseWriter, _ *http.Request) {

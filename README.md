@@ -347,6 +347,44 @@ counters ride the binding's `describe` line in listings.
 Features gate on the daemon's advertised `caps` (old daemons yield a clean
 error, not a silent no-op).
 
+### Managing from the command line
+
+`mailboxd binding list|add|update|delete` drives the same operations over
+the daemon's HTTP admin endpoints (`/api/bindings`, `/api/binding-add`,
+`/api/binding-update`, `/api/binding-delete`) — the entry point differs,
+the rules do not: ownership, `--force`, atomic failure and redaction all
+run through the same code as the WS protocol (and the `/mailbox` command).
+
+```sh
+# list this project's bindings (redacted views)
+mailboxd binding list                       # project derived from the cwd
+mailboxd binding list --project <id>        # explicit project
+
+# add: secrets come from files or environment variables — NEVER from argv
+mailboxd binding add --targets botbox,bot2
+    --url https://bot.example/hook --secret-file ~/bot-secret.txt
+mailboxd binding add --targets botbox
+    --url https://bot.example/hook --secret-env BOT_WEBHOOK_SECRET
+mailboxd binding add --targets botbox --config-file webhook.json
+
+# update / delete
+mailboxd binding update --id b0abc123def --enabled off
+mailboxd binding update --id b0abc123def --targets botbox,bot3 --force
+mailboxd binding delete --id b0abc123def
+```
+
+- `--project` defaults to the id derived from `--project-root` (default:
+  the cwd) — the same derivation a session in that directory uses;
+- there is deliberately **no flag that takes a secret or header value**
+  (`--secret`, `--header K=V` do not exist): values must not land in argv,
+  `ps` output, or shell history. `--secret-file` / `--secret-env` take a
+  path / a variable NAME; custom headers live in `--config-file` (the
+  whole channel config as JSON — protect it, e.g. `chmod 600`);
+- the daemon is rediscovered from the registry file on every call (local
+  ports are ephemeral by design); `--registry` / `--host` / `--token` /
+  `--token-file` reach non-default daemons;
+- a daemon too old to know the endpoints yields a clean error message.
+
 ### Adding a channel type
 
 Channels are a strategy interface (`mailboxd/bindings.go`); the binding

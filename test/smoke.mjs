@@ -1017,6 +1017,57 @@ try {
 		}
 	}
 
+	// 15. the mailboxd binding CLI over the admin API (same daemon, same
+	//     rules; secrets only from files, never from argv)
+	{
+		const { deriveProjectId } = await import("../src/daemon.ts");
+		const projectId = await deriveProjectId(projectDir); // same derivation the CLI defaults to
+		const cli = (args) => spawnSync(daemonBin, args, { encoding: "utf8", timeout: 30000 });
+		const common = ["--registry", join(home, "mailboxd.json"), "--project", projectId, "--project-root", projectDir];
+
+		// list (empty)
+		let r = cli(["binding", "list", ...common]);
+		assert(r.status === 0 && r.stdout.includes("no channel bindings"), `CLI list (empty): ${r.stdout}${r.stderr}`);
+
+		// secret in a file (0600-ish); config assembled from --url + file
+		const secretFile = join(projectDir, "bot-secret.txt");
+		writeFileSync(secretFile, "clisecret99\n");
+		r = cli(["binding", "add", ...common, "--channel", "webhook", "--targets", "cli-box", "--url", "https://bot.example/hook", "--secret-file", secretFile]);
+		assert(r.status === 0 && /binding b[0-9a-z]{10} created/.test(r.stdout), `CLI add: ${r.stdout}${r.stderr}`);
+		const bid = (r.stdout.match(/binding (b[0-9a-z]{10}) created/) ?? [])[1];
+		assert(bid !== undefined, "CLI add prints the binding id");
+		assert(!r.stdout.includes("clisecret99") && !r.stderr.includes("clisecret99"), "CLI add output never echoes the secret");
+
+		// list shows it, redacted
+		r = cli(["binding", "list", ...common]);
+		assert(r.status === 0 && r.stdout.includes(bid) && r.stdout.includes("cli-box"), `CLI list: ${r.stdout}`);
+		assert(!r.stdout.includes("clisecret99"), "CLI list is redacted");
+
+		// argv discipline: there is no --secret VALUE flag
+		r = cli(["binding", "add", ...common, "--channel", "webhook", "--targets", "cli-box2", "--url", "https://bot.example/h", "--secret", "leakme"]);
+		assert(r.status !== 0 && /flag provided but not defined|--secret/.test(r.stderr + r.stdout), "a --secret VALUE flag does not exist");
+
+		// --url without a secret source: clean refusal naming the design
+		r = cli(["binding", "add", ...common, "--channel", "webhook", "--targets", "cli-box2", "--url", "https://bot.example/h"]);
+		assert(r.status !== 0 && /no --secret flag by design/.test(r.stderr), `bare --url refused: ${r.stderr}`);
+
+		// rule parity through the CLI: an online-held name -> mailbox_in_use
+		const logCli = { notify: [], connected: 0, disconnected: 0 };
+		const wc = new MailboxConnection("local", projectDir, null, "sessCLI", "agent-cli", events(logCli), { login: { as: "cli-held" } });
+		await wc.start();
+		r = cli(["binding", "add", ...common, "--channel", "webhook", "--targets", "cli-held", "--url", "https://bot.example/h", "--secret-file", secretFile, "--force"]);
+		assert(r.status === 1 && r.stderr.includes("mailbox_in_use"), `CLI force on an online holder is refused: ${r.stderr}`);
+		await wc.stop();
+
+		// update + delete round-trip
+		r = cli(["binding", "update", ...common, "--id", bid, "--enabled", "off"]);
+		assert(r.status === 0 && r.stdout.includes("disabled"), `CLI update: ${r.stdout}${r.stderr}`);
+		r = cli(["binding", "delete", ...common, "--id", bid]);
+		assert(r.status === 0 && r.stdout.includes("deleted"), `CLI delete: ${r.stdout}${r.stderr}`);
+		r = cli(["binding", "list", ...common]);
+		assert(r.status === 0 && r.stdout.includes("no channel bindings"), "CLI list empty after delete");
+	}
+
 	// success: drop this run's daemon log (kept on failure for diagnosis)
 	rmSync(daemonLog, { force: true });
 } finally {

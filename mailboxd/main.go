@@ -55,6 +55,8 @@ func main() {
 			asJSON := fs.Bool("json", false, "print machine-readable JSON instead of the URL")
 			fs.Parse(os.Args[2:])
 			os.Exit(viewDaemon(os.Stdout, commonRegistry, *host, commonToken, *tokenFile, *openIt, *asJSON))
+		case "binding":
+			os.Exit(runBindingCommand(os.Args[2:]))
 		case "version":
 			fmt.Println("mailboxd", ProtocolVersion)
 			return
@@ -398,6 +400,7 @@ func printUsage() {
 	fmt.Println("  mailboxd stop [options]       stop the running daemon")
 	fmt.Println("  mailboxd view [options]       print the web UI address of the running daemon")
 	fmt.Println("  mailboxd version              print the version")
+	fmt.Println("  mailboxd binding <sub>        manage channel bindings (list/add/update/delete)")
 	fmt.Println()
 	fmt.Println("Daemon flags:")
 	fmt.Println("  --listen <addr>           listen address (default 127.0.0.1:0; non-loopback enables remote mode)")
