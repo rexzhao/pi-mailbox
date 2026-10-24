@@ -13,6 +13,7 @@ import {
 	PROTOCOL_VERSION,
 	isServerMsg,
 	type AgentRef,
+	type BindingInfo,
 	type ClientMsg,
 	type InboxFilter,
 	type MailRecord,
@@ -53,6 +54,12 @@ export class MailboxClient {
 	project: string | null = null;
 	/** This session's full meta as of the last successful registration (from the welcome reply). */
 	sessionMeta: Record<string, string> | null = null;
+	/** Additive daemon capabilities from the welcome (null on old daemons that send none). */
+	caps: string[] | null = null;
+	/** True when the daemon advertised a capability. */
+	hasCap(cap: string): boolean {
+		return this.caps?.includes(cap) ?? false;
+	}
 	/** True when the welcome acked a hello-carried release (released === true). */
 	releaseAcked = false;
 	/** Set when closed on purpose; suppresses reconnect handling in the caller. */
@@ -177,7 +184,7 @@ export class MailboxClient {
 	}
 
 	private handshake(): Promise<void> {
-		return this.request<{ project: string; mailbox?: string; released?: boolean; meta?: Record<string, string>; protocolVersion?: number }>({
+		return this.request<{ project: string; mailbox?: string; released?: boolean; caps?: string[]; meta?: Record<string, string>; protocolVersion?: number }>({
 			t: "hello",
 			rid: this.nextRid++,
 			...this.hello,
@@ -208,6 +215,7 @@ export class MailboxClient {
 				}
 				this.project = reply.project;
 				this.sessionMeta = reply.meta ?? null;
+				this.caps = reply.caps ?? null;
 				this.releaseAcked = reply.released === true;
 			},
 			(err) => {
@@ -302,6 +310,46 @@ export class MailboxClient {
 				}
 			}
 		});
+	}
+
+	// ---- channel bindings ----
+
+	bindingAdd(opts: { channel: string; config?: unknown; targets: string[]; force?: boolean }): Promise<BindingInfo> {
+		return this.request<{ binding: BindingInfo }>({
+			t: "binding_add",
+			rid: this.nextRid++,
+			channel: opts.channel,
+			config: opts.config,
+			targets: opts.targets,
+			force: opts.force,
+		}).then((reply) => reply.binding);
+	}
+
+	bindingUpdate(opts: { id: string; config?: unknown; targets?: string[]; enabled?: boolean; force?: boolean }): Promise<BindingInfo> {
+		return this.request<{ binding: BindingInfo }>({
+			t: "binding_update",
+			rid: this.nextRid++,
+			id: opts.id,
+			config: opts.config,
+			targets: opts.targets,
+			enabled: opts.enabled,
+			force: opts.force,
+		}).then((reply) => reply.binding);
+	}
+
+	bindingDelete(id: string): Promise<BindingInfo> {
+		return this.request<{ binding: BindingInfo }>({
+			t: "binding_delete",
+			rid: this.nextRid++,
+			id,
+		}).then((reply) => reply.binding);
+	}
+
+	bindings(): Promise<BindingInfo[]> {
+		return this.request<{ bindings: BindingInfo[] }>({
+			t: "bindings",
+			rid: this.nextRid++,
+		}).then((reply) => reply.bindings ?? []);
 	}
 }
 

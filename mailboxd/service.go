@@ -194,6 +194,14 @@ func (c *conn) handleMessage(t string, rid int, data []byte) error {
 		return c.handleRead(rid, data)
 	case "shutdown":
 		return c.handleShutdown(rid, data)
+	case "binding_add":
+		return c.handleBindingAdd(rid, data)
+	case "binding_update":
+		return c.handleBindingUpdate(rid, data)
+	case "binding_delete":
+		return c.handleBindingDelete(rid, data)
+	case "bindings":
+		return c.handleBindings(rid)
 	default:
 		ridCopy := rid
 		c.send(ErrorReply{T: "error", Rid: &ridCopy, Code: "bad_msg", Message: "unknown message type"})
@@ -283,21 +291,36 @@ func (c *conn) handleHello(rid int, data []byte) error {
 		}
 	}
 
-	{
-		if err := ValidateMailboxName(msg.As); err != nil {
+	// named-mailbox login: validate the name, then enforce exclusivity
+	if err := ValidateMailboxName(msg.As); err != nil {
+		ridCopy := rid
+		c.send(ErrorReply{T: "error", Rid: &ridCopy, Code: "bad_name", Message: err.Error()})
+		return nil
+	}
+	if proj == nil {
+		var err error
+		proj, err = c.daemon.project(msg)
+		if err != nil {
 			ridCopy := rid
-			c.send(ErrorReply{T: "error", Rid: &ridCopy, Code: "bad_name", Message: err.Error()})
+			c.send(ErrorReply{T: "error", Rid: &ridCopy, Code: "bad_project", Message: err.Error()})
 			return nil
 		}
-		if proj == nil {
-			var err error
-			proj, err = c.daemon.project(msg)
-			if err != nil {
-				ridCopy := rid
-				c.send(ErrorReply{T: "error", Rid: &ridCopy, Code: "bad_project", Message: err.Error()})
-				return nil
-			}
-		}
+	}
+
+	// reserved session id check (before any claim side effects)
+	if msg.Session == webUserSession {
+		ridCopy := rid
+		c.send(ErrorReply{T: "error", Rid: &ridCopy, Code: "bad_hello", Message: "session id 'user' is reserved for the web UI"})
+		return nil
+	}
+
+	// --- claim section: serialized against binding target claims so
+	// check-then-claim stays atomic per project (claimMu) ---
+	var welcomeMeta map[string]string
+	var lostBinding, lostMailbox string
+	proceed, err := func() (bool, error) {
+		proj.claimMu.Lock()
+		defer proj.claimMu.Unlock()
 		// multi-name login: a session may hold several names at once
 		// (each name still exclusively held by exactly one session). The
 		// reverse marker (_holds on the session's own derived record) is a
@@ -324,76 +347,79 @@ func (c *conn) handleHello(rid int, data []byte) error {
 				c.send(ErrorReply{T: "error", Rid: &ridCopy, Code: "mailbox_in_use",
 					Message: "mailbox is held by an online session; force cannot take it over. Ask that session to run /mailbox logout"})
 				c.close()
-				return nil
+				return false, nil
 			}
 			// same origin: a reconnect of the current holder; Register below
 			// replaces the stale connection
-		} else if !msg.Force && proj.Store.HasMailbox(mailboxID) && proj.Store.OriginOf(mailboxID) != msg.Origin {
+		} else if origin := proj.Store.OriginOf(mailboxID); !msg.Force && origin != "" && origin != msg.Origin {
 			// offline holder of a name that is not ours: taking over needs
-			// an explicit, user-confirmed force (never silently)
+			// an explicit, user-confirmed force (never silently). A cleared
+			// origin (released by a binding delete/disable) means free.
 			ridCopy := rid
 			c.send(ErrorReply{T: "error", Rid: &ridCopy, Code: "name_held",
-				Message: fmt.Sprintf("mailbox '%s' is held by another session (offline); ask the user whether to take it over, and if they confirm retry with force", msg.As)})
-			return nil
+				Message: fmt.Sprintf("mailbox '%s' is held by %s; ask the user whether to take it over, and if they confirm retry with force",
+					msg.As, holderDescription(proj.Store.OriginOf(mailboxID)))})
+			return false, nil
+		}
+		prevOrigin := proj.Store.OriginOf(mailboxID)
+		if msg.Force && prevOrigin != "" && prevOrigin != msg.Origin {
+			log.Printf("mailbox %s taken over by origin %s (previous holder %s)", msg.As, msg.Origin, prevOrigin)
 		}
 		claim = &Claim{Name: msg.As, Tags: msg.Tags}
-		if msg.Force {
-			if prevOrigin := proj.Store.OriginOf(mailboxID); prevOrigin != "" && prevOrigin != msg.Origin {
-				log.Printf("mailbox %s taken over by origin %s (previous holder %s)", msg.As, msg.Origin, prevOrigin)
+
+		// same ws re-helloing as a different session: drop the old registration
+		if c.project != nil && c.session != "" && c.session != mailboxID {
+			c.project.Unregister(c.session, c)
+		}
+		c.project = proj
+		c.session = mailboxID
+		c.agent = msg.Agent
+		if old := proj.Register(mailboxID, c); old != nil && old != c {
+			// same session reconnected elsewhere: replace the old connection,
+			// signalling the kick so the loser stands down instead of fighting
+			old.closeReplaced()
+		}
+
+		// the derived record of a named login (the _holds marker below) is
+		// ephemeral: in-memory only, never written to disk â unnamed mailboxes
+		// are rejected, so nothing unnamed ever lands anywhere
+		proj.Store.MarkEphemeral(msg.Session)
+		// the named mailbox's file is what makes offline delivery work
+		if err := proj.Store.EnsureSession(mailboxID); err != nil {
+			log.Printf("ensure session %s: %v", mailboxID, err)
+		}
+
+		// registration-time meta merge happens atomically inside the store
+		var err error
+		welcomeMeta, err = proj.Store.HelloMerge(mailboxID, msg.Agent, msg.Origin, msg.Meta, claim)
+		if err != nil {
+			return false, err
+		}
+		// named login: maintain the reverse marker on the session's own
+		// derived record (session -> its held names), the counterpart of _origin
+		if claim != nil {
+			if err := proj.Store.AddHold(msg.Session, msg.Origin, claim.Name); err != nil {
+				return false, err
 			}
 		}
-	}
-	if msg.Session == webUserSession {
-		ridCopy := rid
-		c.send(ErrorReply{T: "error", Rid: &ridCopy, Code: "bad_hello", Message: "session id 'user' is reserved for the web UI"})
-		return nil
-	}
-
-	if proj == nil {
-		var err error
-		proj, err = c.daemon.project(msg)
-		if err != nil {
-			ridCopy := rid
-			c.send(ErrorReply{T: "error", Rid: &ridCopy, Code: "bad_project", Message: err.Error()})
-			return nil
+		// a session claim over a channel-held mailbox displaces the binding:
+		// sessions always win over channels (with force); the target is
+		// marked lost and does not auto-recover
+		if bid := bindingIDOfOrigin(prevOrigin); bid != "" && prevOrigin != msg.Origin {
+			lostBinding = bid
+			lostMailbox = mailboxID
 		}
-	}
-
-	// same ws re-helloing as a different session: drop the old registration
-	if c.project != nil && c.session != "" && c.session != mailboxID {
-		c.project.Unregister(c.session, c)
-	}
-	c.project = proj
-	c.session = mailboxID
-	c.agent = msg.Agent
-	if old := proj.Register(mailboxID, c); old != nil && old != c {
-		// same session reconnected elsewhere: replace the old connection,
-		// signalling the kick so the loser stands down instead of fighting
-		old.closeReplaced()
-	}
-
-	// the derived record of a named login (the _holds marker below) is
-	// ephemeral: in-memory only, never written to disk — unnamed mailboxes
-	// are rejected, so nothing unnamed ever lands anywhere
-	proj.Store.MarkEphemeral(msg.Session)
-	// the named mailbox's file is what makes offline delivery work
-	if err := proj.Store.EnsureSession(mailboxID); err != nil {
-		log.Printf("ensure session %s: %v", mailboxID, err)
-	}
-
-	// registration-time meta merge happens atomically inside the store
-	welcomeMeta, err := proj.Store.HelloMerge(mailboxID, msg.Agent, msg.Origin, msg.Meta, claim)
+		return true, nil
+	}()
 	if err != nil {
 		return err
 	}
-	// named login: maintain the reverse marker on the session's own
-	// derived record (session -> its held names), the counterpart of _origin
-	if claim != nil {
-		if err := proj.Store.AddHold(msg.Session, msg.Origin, claim.Name); err != nil {
-			return err
-		}
+	if !proceed {
+		return nil
 	}
-
+	if lostBinding != "" {
+		c.daemon.bindingOwnerLost(proj, lostBinding, lostMailbox)
+	}
 	welcome := WelcomeMsg{
 		T:   "welcome",
 		Rid: rid,
@@ -404,6 +430,7 @@ func (c *conn) handleHello(rid int, data []byte) error {
 		Released:        msg.Release != "",
 		InstanceID:      c.daemon.instanceID,
 		ProtocolVersion: ProtocolVersion,
+		Caps:            c.daemon.daemonCaps(),
 		Meta:            welcomeMeta,
 	}
 	c.send(welcome)
@@ -643,7 +670,20 @@ func (c *conn) handleSend(rid int, data []byte) error {
 			tc.send(NotifyMsg{T: "notify", Unread: unread})
 		}
 	}
+	// channel-owned mailbox: hand the arrival to the owning channel
+	// instance (webhooks and friends are independent consumers)
+	c.daemon.notifyBindingChannels(targetProj, msg.Target.Session, mail.ID)
 	return nil
+}
+
+// holderDescription renders a human-facing description of a stored _origin
+// holder: a channel binding ("a channel binding (<id>)") or a session
+// ("another session (offline)").
+func holderDescription(origin string) string {
+	if bid := bindingIDOfOrigin(origin); bid != "" {
+		return fmt.Sprintf("a channel binding (%s)", bid)
+	}
+	return "another session (offline)"
 }
 
 func (p *Project) lookupOnline(sessionID string) *conn {
@@ -891,4 +931,246 @@ func refsOrNil(refs []MailRef) []MailRef {
 		return []MailRef{}
 	}
 	return refs
+}
+
+// ---- channel bindings ------------------------------------------------------
+
+// handleBindingAdd creates a binding: validate channel + targets, claim the
+// targets atomically (all-or-nothing), persist, start the channel instance.
+// The caller's project is the owner; targets must belong to it.
+func (c *conn) handleBindingAdd(rid int, data []byte) error {
+	proj, err := c.requireRegistered()
+	if err != nil {
+		return c.errorReply(rid, "not_registered", err.Error())
+	}
+	var msg BindingAddMsg
+	if err := json.Unmarshal(data, &msg); err != nil {
+		return c.errorReply(rid, "bad_binding", "unparsable binding_add")
+	}
+	ct, ok := channelTypes[msg.Channel]
+	if !ok {
+		var supported []string
+		for t := range channelTypes {
+			supported = append(supported, t)
+		}
+		sort.Strings(supported)
+		return c.errorReply(rid, "unsupported_channel",
+			fmt.Sprintf("unknown channel %q; supported: %s", msg.Channel, strings.Join(supported, ", ")))
+	}
+	if err := ct.ValidateConfig(msg.Config); err != nil {
+		return c.errorReply(rid, "invalid_config", err.Error())
+	}
+	specs, canonicals, err := foldTargets(msg.Targets)
+	if err != nil {
+		if ce, ok := err.(*claimError); ok {
+			return c.errorReply(rid, ce.code, ce.message)
+		}
+		return err
+	}
+	bindingID := newBindingID()
+	if err := c.daemon.claimTargets(proj, bindingID, specs, msg.Force); err != nil {
+		if ce, ok := err.(*claimError); ok {
+			return c.errorReply(rid, ce.code, ce.message)
+		}
+		return err
+	}
+	b := &Binding{
+		ID:        bindingID,
+		Owner:     proj.ID,
+		OwnerRoot: proj.RootPath,
+		Channel:   msg.Channel,
+		Config:    append(json.RawMessage(nil), msg.Config...),
+		Targets:   canonicals,
+		Enabled:   true,
+		CreatedAt: time.Now().UTC().Format(timeStampLayout),
+	}
+	if err := c.daemon.bindings.Put(b); err != nil {
+		// roll the claims back so a failed persist does not strand origins
+		c.daemon.releaseTargets(proj, bindingID, canonicals)
+		return err
+	}
+	c.daemon.startBindingInstance(b)
+	c.send(BindingReply{T: "binding", Rid: rid, Binding: bindingInfoViews([]*Binding{b})[0]})
+	return nil
+}
+
+// handleBindingUpdate: config/targets/enabled. Ownership rule: only the
+// owner project's sessions may modify. Target changes release removed
+// targets and claim added ones (force as needed); the instance is restarted
+// so it picks up the new snapshot (Start re-runs the catch-up scan).
+func (c *conn) handleBindingUpdate(rid int, data []byte) error {
+	proj, err := c.requireRegistered()
+	if err != nil {
+		return c.errorReply(rid, "not_registered", err.Error())
+	}
+	var msg BindingUpdateMsg
+	if err := json.Unmarshal(data, &msg); err != nil {
+		return c.errorReply(rid, "bad_binding", "unparsable binding_update")
+	}
+	b := c.daemon.bindings.Get(msg.ID)
+	if b == nil {
+		return c.errorReply(rid, "not_found", fmt.Sprintf("no such binding %s", msg.ID))
+	}
+	if b.Owner != proj.ID {
+		return c.errorReply(rid, "not_owner", "binding belongs to another project")
+	}
+	if msg.Config != nil {
+		ct, ok := channelTypes[b.Channel]
+		if !ok {
+			return c.errorReply(rid, "unsupported_channel", fmt.Sprintf("unknown channel %q", b.Channel))
+		}
+		if err := ct.ValidateConfig(msg.Config); err != nil {
+			return c.errorReply(rid, "invalid_config", err.Error())
+		}
+	}
+	var addSpecs []targetSpec
+	var addCanonicals []string
+	if msg.Targets != nil {
+		specs, canonicals, err := foldTargets(msg.Targets)
+		if err != nil {
+			if ce, ok := err.(*claimError); ok {
+				return c.errorReply(rid, ce.code, ce.message)
+			}
+			return err
+		}
+		// diff: removed targets get released, added get claimed
+		oldSet := map[string]bool{}
+		for _, t := range b.Targets {
+			oldSet[t] = true
+		}
+		newSet := map[string]bool{}
+		for _, t := range canonicals {
+			newSet[t] = true
+		}
+		var removed []string
+		for _, t := range b.Targets {
+			if !newSet[t] {
+				removed = append(removed, t)
+			}
+		}
+		for i, t := range canonicals {
+			// a target not held before, or one that was LOST (a session took
+			// it over): (re-)claim it
+			if !oldSet[t] || containsName(b.Lost, t) {
+				addSpecs = append(addSpecs, specs[i])
+				addCanonicals = append(addCanonicals, t)
+			}
+		}
+		// releasing + claiming happens after validation, all before persist
+		if len(removed) > 0 {
+			c.daemon.releaseTargets(proj, b.ID, removed)
+		}
+		if len(addSpecs) > 0 {
+			if err := c.daemon.claimTargets(proj, b.ID, addSpecs, msg.Force); err != nil {
+				// roll back the releases so the update fails atomically
+				if len(removed) > 0 {
+					c.daemon.claimTargets(proj, b.ID, specsForCanonicals(specs, removed), true)
+				}
+				if ce, ok := err.(*claimError); ok {
+					return c.errorReply(rid, ce.code, ce.message)
+				}
+				return err
+			}
+			// re-claimed targets are no longer lost
+			var keptLost []string
+			for _, l := range b.Lost {
+				if !containsName(addCanonicals, l) {
+					keptLost = append(keptLost, l)
+				}
+			}
+			b.Lost = keptLost
+		}
+		b.Targets = canonicals
+		// removed targets drop out of Lost too
+		var lost []string
+		for _, l := range b.Lost {
+			if newSet[l] {
+				lost = append(lost, l)
+			}
+		}
+		b.Lost = lost
+	}
+	// enabling: (re)claim every current target; disabling: release all
+	if msg.Enabled != nil && *msg.Enabled != b.Enabled {
+		if *msg.Enabled {
+			var specs []targetSpec
+			for _, t := range b.Targets {
+				specs = append(specs, targetSpec{canonical: t, claimed: t})
+			}
+			if len(specs) > 0 {
+				if err := c.daemon.claimTargets(proj, b.ID, specs, msg.Force); err != nil {
+					if ce, ok := err.(*claimError); ok {
+						return c.errorReply(rid, ce.code, ce.message)
+					}
+					return err
+				}
+			}
+			b.Lost = nil
+		} else {
+			c.daemon.releaseTargets(proj, b.ID, b.Targets)
+		}
+		b.Enabled = *msg.Enabled
+	}
+	if msg.Config != nil {
+		b.Config = append(json.RawMessage(nil), msg.Config...)
+	}
+	if err := c.daemon.bindings.Put(b); err != nil {
+		return err
+	}
+	// restart the instance (Stop flushes state; Start re-runs catch-up)
+	c.daemon.stopBindingInstance(b.ID)
+	if b.Enabled {
+		c.daemon.startBindingInstance(b)
+	}
+	c.send(BindingReply{T: "binding", Rid: rid, Binding: bindingInfoViews([]*Binding{b})[0]})
+	return nil
+}
+
+// handleBindingDelete releases every target, stops the instance, drops the
+// record. Only the owner project's sessions may delete.
+func (c *conn) handleBindingDelete(rid int, data []byte) error {
+	proj, err := c.requireRegistered()
+	if err != nil {
+		return c.errorReply(rid, "not_registered", err.Error())
+	}
+	var msg BindingDeleteMsg
+	if err := json.Unmarshal(data, &msg); err != nil {
+		return c.errorReply(rid, "bad_binding", "unparsable binding_delete")
+	}
+	b := c.daemon.bindings.Get(msg.ID)
+	if b == nil {
+		return c.errorReply(rid, "not_found", fmt.Sprintf("no such binding %s", msg.ID))
+	}
+	if b.Owner != proj.ID {
+		return c.errorReply(rid, "not_owner", "binding belongs to another project")
+	}
+	if len(b.Targets) > 0 {
+		c.daemon.releaseTargets(proj, b.ID, b.Targets)
+	}
+	c.daemon.stopBindingInstance(b.ID)
+	if err := c.daemon.bindings.Delete(b.ID); err != nil {
+		return err
+	}
+	c.send(BindingReply{T: "binding", Rid: rid, Binding: bindingInfoViews([]*Binding{b})[0]})
+	return nil
+}
+
+// handleBindings lists the caller's project's bindings (redacted views).
+func (c *conn) handleBindings(rid int) error {
+	proj, err := c.requireRegistered()
+	if err != nil {
+		return c.errorReply(rid, "not_registered", err.Error())
+	}
+	c.send(BindingsReply{T: "bindings", Rid: rid, Bindings: bindingInfoViews(c.daemon.bindings.ForOwner(proj.ID))})
+	return nil
+}
+
+// specsForCanonicals rebuilds claim specs from canonical names (rollback
+// helper: the claimed spelling of a canonical name is itself).
+func specsForCanonicals(all []targetSpec, canonicals []string) []targetSpec {
+	var out []targetSpec
+	for _, cn := range canonicals {
+		out = append(out, targetSpec{canonical: cn, claimed: cn})
+	}
+	return out
 }

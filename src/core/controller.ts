@@ -31,7 +31,7 @@ import {
 	mailboxTotalsViaApi,
 	resolveLocalDaemon,
 } from "../daemon.ts";
-import type { MailRecord } from "../protocol.ts";
+import type { BindingInfo, MailRecord } from "../protocol.ts";
 import type { LoginBinding } from "./login-binding.ts";
 import { httpBase } from "./format.ts";
 import { validMailboxName } from "./names.ts";
@@ -976,6 +976,42 @@ export class MailboxController {
 
 	async statusSummary(c: MailboxConnection): Promise<string> {
 		return this.renderStatus(await this.connectionStatus(c));
+	}
+
+	// -- channel bindings ---------------------------------------------------------
+
+	/** True when any connected daemon advertised the "bindings" capability. */
+	get supportsBindings(): boolean {
+		for (const c of this.connections.values()) {
+			if (c.connected && c.mailbox.hasCap("bindings")) return true;
+		}
+		return false;
+	}
+
+	/** Channel types the daemon advertised ("channel:webhook" -> "webhook"); empty when unsupported. */
+	supportedChannels(): string[] {
+		for (const c of this.connections.values()) {
+			if (!c.connected) continue;
+			const caps = c.mailbox.caps ?? [];
+			return caps.filter((x) => x.startsWith("channel:")).map((x) => x.slice("channel:".length));
+		}
+		return [];
+	}
+
+	bindingAdd(opts: { channel: string; config?: unknown; targets: string[]; force?: boolean }): Promise<BindingInfo> {
+		return this.requireConnection().mailbox.bindingAdd(opts);
+	}
+
+	bindingList(): Promise<BindingInfo[]> {
+		return this.requireConnection().mailbox.bindings();
+	}
+
+	bindingUpdate(opts: { id: string; config?: unknown; targets?: string[]; enabled?: boolean; force?: boolean }): Promise<BindingInfo> {
+		return this.requireConnection().mailbox.bindingUpdate(opts);
+	}
+
+	bindingDelete(id: string): Promise<BindingInfo> {
+		return this.requireConnection().mailbox.bindingDelete(id);
 	}
 
 	// -- tools & command ----------------------------------------------------------

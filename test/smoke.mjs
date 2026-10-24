@@ -26,6 +26,9 @@ if (!existsSync(daemonBin)) {
 const home = mkdtempSync(join(tmpdir(), "pi-mailboxd-home-"));
 process.env.PI_MAILBOXD_DIR = home;
 process.env.PI_MAILBOXD = daemonBin;
+// fast webhook pacing (D/M/backoff in ms) so the binding sections can
+// observe POSTs without the production 10s/45s waits
+process.env.PI_MAILBOXD_WEBHOOK_FAST = "1";
 // daemon log for diagnosability (kept across runs; small): spawn-related
 // flakes used to be undiagnosable because the detached daemon's stderr
 // was discarded
@@ -930,6 +933,89 @@ try {
 	await infoChanged({ type: "session_info_changed", name: "Not A Valid Name" }, cmdCtx(recordedEntries));
 	await new Promise((r) => setTimeout(r, 600));
 	assert(!cmdNotifies.some((n) => /logged in/.test(n.msg)), "invalid name does not log in");
+
+	// 14. channel bindings: caps + CRUD + webhook delivery to a local bot
+	{
+		// fresh connection (the earlier ones were stopped by their sections)
+		const logW = { notify: [], connected: 0, disconnected: 0 };
+		const w = new MailboxConnection("local", projectDir, null, "sessW", "agent-w", events(logW), {
+			login: { as: "smoke-bindmgr" },
+		});
+		await w.start();
+		assert(w.mailbox.hasCap("bindings"), "welcome advertises the bindings capability");
+		assert((w.mailbox.caps ?? []).some((c) => c === "channel:webhook"), "caps list the webhook channel");
+		const http = await import("node:http");
+		const crypto = await import("node:crypto");
+		const requests = [];
+		const bot = http.createServer((req, res) => {
+			let body = "";
+			req.on("data", (d) => (body += d));
+			req.on("end", () => {
+				requests.push({ headers: req.headers, body });
+				// first attempt fails: the retry must keep the same deliveryId
+				if (requests.length === 1) {
+					res.writeHead(500);
+					res.end();
+				} else {
+					res.writeHead(200);
+					res.end();
+				}
+			});
+		});
+		await new Promise((r) => bot.listen(0, "127.0.0.1", r));
+		const botPort = bot.address().port;
+		const botCfg = { url: `http://127.0.0.1:${botPort}/hook`, secret: "smokesecret", headers: { "X-Bot-Key": "bkey" } };
+		try {
+			// add: bind smoke-bot (a fresh name) to the webhook
+			const binfo = await w.mailbox.bindingAdd({ channel: "webhook", config: botCfg, targets: ["smoke-bot"] });
+			assert(binfo.id !== "" && binfo.enabled && binfo.targets[0] === "smoke-bot", "binding_add creates an enabled binding");
+
+			// arbitration: a name held ONLINE (this very connection) is
+			// refused even with force
+			let refused = false;
+			try {
+				await w.mailbox.bindingAdd({ channel: "webhook", config: botCfg, targets: ["smoke-bindmgr"], force: true });
+			} catch (e) {
+				refused = e.code === "mailbox_in_use";
+			}
+			assert(refused, "binding a name held online is refused (mailbox_in_use)");
+
+			// mail to the bound mailbox -> POST (attempt 1 fails, retry lands)
+			await w.mailbox.sendMail({ project: w.mailbox.project, session: "smoke-bot" }, "bot mail", "body text", []);
+			let got2 = null;
+			for (let i = 0; i < 100 && !got2; i++) {
+				await new Promise((r) => setTimeout(r, 50));
+				if (requests.length >= 2) got2 = requests[1];
+			}
+			assert(got2 !== null, "webhook POST retried after a 500");
+			const p = JSON.parse(got2.body);
+			assert(p.event === "mail.batch" && p.mailbox === `smoke-bot@${w.mailbox.project}` && p.mailCount === 1, "webhook payload shape (event/mailbox/mailCount)");
+			assert(p.mails[0].subject === "bot mail" && p.mails[0].snippet === "body text", "summary carries subject + snippet (no full body)");
+			assert(p.mails[0].body === undefined, "payload never carries the full body");
+			const ts = got2.headers["x-mailbox-timestamp"];
+			const sig = got2.headers["x-mailbox-signature"];
+			const expectSig = crypto.createHmac("sha256", "smokesecret").update(ts + "." + got2.body).digest("hex");
+			assert(sig === expectSig, "HMAC signature verifies against the raw body");
+			assert(got2.headers["x-bot-key"] === "bkey", "static header rides along");
+			const p1 = JSON.parse(requests[0].body);
+			assert(p1.deliveryId === p.deliveryId, "deliveryId stable across retries");
+
+			// list: this project's bindings, redacted
+			const list = await w.mailbox.bindings();
+			assert(list.length === 1 && list[0].id === binfo.id, "bindings list returns the binding");
+			assert(!JSON.stringify(list).includes("smokesecret"), "bindings list never echoes the secret");
+
+			// disable + delete
+			const up = await w.mailbox.bindingUpdate({ id: binfo.id, enabled: false });
+			assert(up.enabled === false, "binding disabled");
+			const del = await w.mailbox.bindingDelete(binfo.id);
+			assert(del.id === binfo.id, "binding deleted");
+			assert((await w.mailbox.bindings()).length === 0, "list empty after delete");
+		} finally {
+			await new Promise((r) => bot.close(r));
+			await w.stop();
+		}
+	}
 
 	// success: drop this run's daemon log (kept on failure for diagnosis)
 	rmSync(daemonLog, { force: true });

@@ -193,6 +193,13 @@ type Daemon struct {
 	conns     map[*conn]struct{}  // all authenticated connections
 	idleSince time.Time           // zero when clients are connected
 
+	// channel bindings (webhook and friends): daemon-level registry plus
+	// the live channel instances, one per enabled binding
+	bindingsPath     string
+	bindings         *BindingRegistry
+	channelsMu       sync.Mutex
+	channelInstances map[string]ChannelInstance
+
 	flk    *flock.Flock
 	cancel context.CancelFunc
 }
@@ -204,6 +211,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.host, _ = os.Hostname()
 	d.projects = make(map[string]*Project)
 	d.conns = make(map[*conn]struct{})
+	d.channelInstances = make(map[string]ChannelInstance)
 
 	// singleton election: crash-safe because the OS releases the flock when
 	// the process dies
@@ -235,6 +243,22 @@ func (d *Daemon) Run(ctx context.Context) error {
 		return fmt.Errorf("write registry: %w", err)
 	}
 
+	// channel bindings: default location beside the registry/lock files
+	// (isolated in tests via RegistryPath/LockPath under a temp dir);
+	// remote mode keeps them with the project data
+	if d.bindingsPath == "" {
+		if d.Remote {
+			d.bindingsPath = filepath.Join(d.DataDir, "bindings.jsonl")
+		} else {
+			d.bindingsPath = filepath.Join(filepath.Dir(d.LockPath), "mailboxd-bindings.jsonl")
+		}
+	}
+	d.bindings = NewBindingRegistry(d.bindingsPath)
+	if err := d.bindings.Load(); err != nil {
+		log.Printf("bindings journal: %v", err)
+	}
+	d.startChannels()
+
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	d.cancel = cancel
@@ -257,6 +281,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	case <-ctx.Done():
 	}
 	log.Printf("shutting down")
+	d.stopChannels()
+	log.Printf("channels stopped")
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	serr := httpSrv.Shutdown(shutdownCtx)
 	shutdownCancel()
@@ -302,6 +328,11 @@ func (d *Daemon) idleWatcher(ctx context.Context, cancel context.CancelFunc) {
 		case <-ticker.C:
 			d.mu.Lock()
 			idle := len(d.conns) == 0
+			// enabled channel bindings are consumers too: the daemon must
+			// not idle-exit while any webhook (or future channel) is armed
+			if idle && d.anyEnabledBindings() {
+				idle = false
+			}
 			if idle && d.idleSince.IsZero() {
 				d.idleSince = time.Now()
 			} else if !idle {

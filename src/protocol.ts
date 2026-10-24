@@ -128,7 +128,56 @@ export interface ReadMsg {
 	mail: MailRef;
 }
 
-export type ClientMsg = HelloMsg | PingMsg | SessionsMsg | MetaMsg | SendMsg | InboxMsg | ReadMsg;
+/** Create a channel binding (this project owns it; targets are its mailboxes). */
+export interface BindingAddMsg {
+	t: "binding_add";
+	rid: number;
+	/** Channel type (e.g. "webhook"); must be one the daemon advertises in caps. */
+	channel: string;
+	/** Channel-defined config blob; opaque to the core (passthrough). */
+	config?: unknown;
+	/** Mailbox names in this project the channel claims. */
+	targets: string[];
+	/** Take over targets held by offline sessions (user-confirmed). */
+	force?: boolean;
+}
+
+export interface BindingUpdateMsg {
+	t: "binding_update";
+	rid: number;
+	id: string;
+	/** Omitted = keep. */
+	config?: unknown;
+	/** Omitted = keep. */
+	targets?: string[];
+	/** Omitted = keep. */
+	enabled?: boolean;
+	force?: boolean;
+}
+
+export interface BindingDeleteMsg {
+	t: "binding_delete";
+	rid: number;
+	id: string;
+}
+
+export interface BindingsMsg {
+	t: "bindings";
+	rid: number;
+}
+
+export type ClientMsg =
+	| HelloMsg
+	| PingMsg
+	| SessionsMsg
+	| MetaMsg
+	| SendMsg
+	| InboxMsg
+	| ReadMsg
+	| BindingAddMsg
+	| BindingUpdateMsg
+	| BindingDeleteMsg
+	| BindingsMsg;
 
 // ---------------------------------------------------------------------------
 // server -> client
@@ -144,6 +193,8 @@ export interface WelcomeMsg {
 	released?: boolean;
 	instanceId: string;
 	protocolVersion?: number;
+	/** Additive daemon capabilities (e.g. "bindings", "channel:webhook"); gate features on these. */
+	caps?: string[];
 	/** This session's full meta after the registration merge. */
 	meta?: Record<string, string>;
 }
@@ -220,6 +271,30 @@ export interface ErrorReply {
 export interface NotifyMsg {
 	t: "notify";
 	unread: number;
+}
+
+/** A channel binding's redacted wire view (no config echo; `describe` is channel-defined and secret-free). */
+export type BindingInfo = {
+	id: string;
+	owner: string;
+	channel: string;
+	targets: string[];
+	lost?: string[];
+	enabled: boolean;
+	createdAt?: string;
+	describe?: string;
+};
+
+export interface BindingsReply {
+	t: "bindings";
+	rid: number;
+	bindings: BindingInfo[];
+}
+
+export interface BindingReply {
+	t: "binding";
+	rid: number;
+	binding: BindingInfo;
 }
 
 // ---------------------------------------------------------------------------
@@ -318,6 +393,21 @@ export const MailboxProjectsOutputSchema = Type.Object({
 	projects: Type.Array(ProjectInfoSchema),
 });
 
+export const BindingInfoSchema = Type.Object({
+	id: Type.String(),
+	owner: Type.String(),
+	channel: Type.String(),
+	targets: Type.Array(Type.String()),
+	lost: Type.Optional(Type.Array(Type.String())),
+	enabled: Type.Boolean(),
+	createdAt: Type.Optional(Type.String()),
+	describe: Type.Optional(Type.String()),
+});
+
+export const MailboxBindingsOutputSchema = Type.Object({
+	bindings: Type.Array(BindingInfoSchema),
+});
+
 /** Mail counts for status summaries (connect results). */
 export const MailCountsSchema = Type.Object({
 	total: Type.Integer(),
@@ -347,6 +437,8 @@ const _mailRecordGuardA: MailRecord = null as unknown as Static<typeof MailRecor
 const _mailRecordGuardB: Static<typeof MailRecordSchema> = null as unknown as MailRecord;
 const _sessionInfoGuardA: SessionInfo = null as unknown as Static<typeof SessionInfoSchema>;
 const _sessionInfoGuardB: Static<typeof SessionInfoSchema> = null as unknown as SessionInfo;
+const _bindingInfoGuardA: BindingInfo = null as unknown as Static<typeof BindingInfoSchema>;
+const _bindingInfoGuardB: Static<typeof BindingInfoSchema> = null as unknown as BindingInfo;
 void _agentRefGuardA;
 void _agentRefGuardB;
 void _mailRefGuardA;
@@ -355,6 +447,8 @@ void _mailRecordGuardA;
 void _mailRecordGuardB;
 void _sessionInfoGuardA;
 void _sessionInfoGuardB;
+void _bindingInfoGuardA;
+void _bindingInfoGuardB;
 
 export type ServerMsg =
 	| WelcomeMsg
@@ -364,6 +458,8 @@ export type ServerMsg =
 	| SentReply
 	| InboxReply
 	| MailReply
+	| BindingsReply
+	| BindingReply
 	| ErrorReply
 	| NotifyMsg;
 

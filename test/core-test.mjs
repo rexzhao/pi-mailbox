@@ -21,6 +21,8 @@ if (!existsSync(daemonBin)) {
 const home = mkdtempSync(join(tmpdir(), "pi-mailbox-core-home-"));
 process.env.PI_MAILBOXD_DIR = home;
 process.env.PI_MAILBOXD = daemonBin;
+// fast webhook pacing so the binding section observes POSTs quickly
+process.env.PI_MAILBOXD_WEBHOOK_FAST = "1";
 const projectDir = mkdtempSync(join(tmpdir(), "pi-mailbox-core-project-"));
 mkdirSync(join(projectDir, ".pi"), { recursive: true });
 
@@ -94,7 +96,7 @@ const poll = async (deadlineMs, fn) => {
 
 try {
 	// 0. version contract
-	assert(MAILBOX_CORE_API_VERSION === "1.0.0", `MAILBOX_CORE_API_VERSION is 1.0.0 (${MAILBOX_CORE_API_VERSION})`);
+	assert(MAILBOX_CORE_API_VERSION === "1.1.0", `MAILBOX_CORE_API_VERSION is 1.1.0 (${MAILBOX_CORE_API_VERSION})`);
 	assert(coreApiMajor() === 1, "coreApiMajor() === 1");
 	assert(MAILBOX_EXTENSION_ID === "pi-mailbox", "MAILBOX_EXTENSION_ID exported");
 
@@ -124,7 +126,7 @@ try {
 
 	// 2. per-identity tools: send as core-alpha while current is core-beta
 	const tools = Object.fromEntries(ca.tools.map((t) => [t.name, t]));
-	assert(ca.tools.length === 7, "7 tool definitions exported");
+	assert(ca.tools.length === 8, "8 tool definitions exported (7 + mailbox_bindings)");
 	const sendTool = tools["mailbox_send"];
 	assert(sendTool.parameters.properties.as !== undefined, "mailbox_send exposes the as parameter");
 	const sent = await sendTool.execute("t1", { address: "core-beta", subject: "cross-self", body: "x", as: "core-alpha" });
@@ -307,6 +309,93 @@ try {
 		assert(read.releases.join(",") === "first", "readLoginBinding returns pending releases");
 		const missing = readLoginBinding(join(sf, "nope.jsonl"));
 		assert(missing.login === null && missing.releases.length === 0, "a missing session file reads as no binding");
+	}
+
+	// 7b. channel bindings: caps gate, tool CRUD, /mailbox binding command,
+	//     arbitration errors, and an end-to-end webhook round to a local bot
+	{
+		const h7 = fakeHost({ sessionId: "core-sess-binding" });
+		const c7 = new MailboxController(h7.host);
+		await c7.login({ as: "core-cmd" });
+		assert(c7.supportsBindings, "controller sees the bindings capability (caps)");
+		assert(c7.supportedChannels().includes("webhook"), "supportedChannels derives from caps");
+		const http = await import("node:http");
+		const crypto = await import("node:crypto");
+		const requests = [];
+		const bot = http.createServer((req, res) => {
+			let body = "";
+			req.on("data", (d) => (body += d));
+			req.on("end", () => {
+				requests.push({ headers: req.headers, body });
+				res.writeHead(200);
+				res.end();
+			});
+		});
+		await new Promise((r) => bot.listen(0, "127.0.0.1", r));
+		const botPort = bot.address().port;
+		try {
+			// tool: add (config is a JSON STRING — channel-defined passthrough)
+			const bindTool = Object.fromEntries(c7.tools.map((t) => [t.name, t]))["mailbox_bindings"];
+			assert(bindTool !== undefined, "mailbox_bindings tool exported");
+			const added = await bindTool.execute("tb1", {
+				action: "add",
+				channel: "webhook",
+				config: JSON.stringify({ url: `http://127.0.0.1:${botPort}/hook`, secret: "coresecret", headers: { "X-Bot-Key": "bkey" } }),
+				targets: ["core-botbox"],
+			});
+			const bid = added.content[0].text.split(" ")[1];
+			assert(/^b[0-9a-z]{10}$/.test(bid), `add returns the binding id (${bid})`);
+
+			// arbitration: an online-held name is refused with mailbox_in_use
+			let refused = false;
+			try {
+				await bindTool.execute("tb2", { action: "add", channel: "webhook", config: JSON.stringify({ url: `http://127.0.0.1:${botPort}/hook`, secret: "coresecret" }), targets: ["core-delta"], force: true });
+			} catch (e) {
+				refused = /mailbox_in_use/.test(String(e.message));
+			}
+			assert(refused, "binding a name held online is refused (mailbox_in_use)");
+
+			// end-to-end: mail to the bound mailbox -> signed summary POST
+			await peer.mailbox.sendMail({ project: peer.mailbox.project, session: "core-botbox" }, "for the bot", "snip me", []);
+			const req1 = await poll(5000, () => requests[0]);
+			assert(req1 !== undefined, "webhook POST arrived");
+			const p = JSON.parse(req1.body);
+			assert(p.event === "mail.batch" && p.mailbox === `core-botbox@${peer.mailbox.project}` && p.mailCount === 1, "payload shape (event/mailbox/mailCount)");
+			assert(p.mails[0].snippet === "snip me" && p.mails[0].body === undefined, "summary carries a snippet, never the full body");
+			assert(typeof p.unreadCount === "number" && p.unreadCount >= 1, "payload carries unreadCount for reconciliation");
+			const ts = req1.headers["x-mailbox-timestamp"];
+			const sig = req1.headers["x-mailbox-signature"];
+			const expectSig = crypto.createHmac("sha256", "coresecret").update(ts + "." + req1.body).digest("hex");
+			assert(sig === expectSig && req1.headers["x-bot-key"] === "bkey", "HMAC signature + static header verify");
+
+			// tool: list (redacted) + command round-trip
+			const listed = await bindTool.execute("tb3", { action: "list" });
+			assert(listed.structuredContent.bindings.some((b) => b.id === bid), "list (tool) returns the binding");
+			assert(!JSON.stringify(listed).includes("coresecret"), "list output never echoes the secret");
+			await c7.executeCommand("binding list");
+			assert(h7.state.notifies.some((n) => n.msg.includes(bid) && n.msg.includes("core-botbox")), "/mailbox binding list shows the binding");
+			// completion: binding subcommands + ids
+			let items = await c7.completeCommand("binding ");
+			assert((items ?? []).some((i) => i.value === "binding list "), "binding completion offers subcommands");
+			items = await c7.completeCommand("binding update ");
+			assert((items ?? []).some((i) => i.value === `binding update ${bid} `), `binding update completes ids (${bid})`);
+			// command: update (disable) + delete
+			await c7.executeCommand(`binding update ${bid} --enabled off`);
+			assert(h7.state.notifies.some((n) => n.msg.includes("disabled")), "/mailbox binding update disables");
+			// disabled releases the target: claim without force succeeds
+			const h8 = fakeHost({ sessionId: "core-sess-claim" });
+			const c8 = new MailboxController(h8.host);
+			await c8.login({ as: "core-botbox" });
+			assert(c8.connected, "a disabled binding releases its target (claimable without force)");
+			await c8.stop();
+			// command: delete
+			await c7.executeCommand(`binding delete ${bid}`);
+			assert(h7.state.notifies.some((n) => n.msg.includes("deleted")), "/mailbox binding delete removes it");
+			assert((await c7.bindingList()).length === 0, "list empty after delete");
+			await c7.stop();
+		} finally {
+			await new Promise((r) => bot.close(r));
+		}
 	}
 
 	// 8. daemon isolation: everything lived under the temp PI_MAILBOXD_DIR

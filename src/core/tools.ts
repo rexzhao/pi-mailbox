@@ -10,12 +10,14 @@ import { type Static, Type } from "typebox";
 import type { MailboxConnection } from "../client.ts";
 import { connectLocalDaemonIfRunning, fetchProjectsViaApi, fetchSessionsViaApi } from "../daemon.ts";
 import {
+	MailboxBindingsOutputSchema,
 	MailboxConnectOutputSchema,
 	MailboxListOutputSchema,
 	MailboxProjectsOutputSchema,
 	MailboxReadOutputSchema,
 	MailboxSentOutputSchema,
 	MailboxSessionsOutputSchema,
+	type BindingInfo,
 	type ProjectInfo,
 } from "../protocol.ts";
 import type { MailboxController } from "./controller.ts";
@@ -42,6 +44,7 @@ export const DEFERRED_TOOL_NAMES = [
 	"mailbox_reply",
 	"mailbox_sessions",
 	"mailbox_projects",
+	"mailbox_bindings",
 ] as const;
 
 /** Shared `as` parameter (multi-login identity selection). */
@@ -455,5 +458,129 @@ export function buildToolDefinitions(controller: MailboxController): MailboxTool
 				};
 			},
 		},
+		{
+			name: "mailbox_bindings",
+			label: "Mailbox bindings",
+			namespace: MAILBOX_NAMESPACE,
+			description:
+				"Manage this project's channel bindings: a binding ties mailboxes of this project " +
+				"to a delivery channel (currently 'webhook'), which then acts as an independent " +
+				"consumer of those mailboxes — mail arriving at a bound mailbox is delivered to the " +
+				"channel (e.g. POSTed to a webhook URL) instead of waiting for a session. One mailbox " +
+				"has one owner: a binding claims its targets; a session can always take a mailbox back " +
+				"with a confirmed force login (the binding's target is then 'lost' until explicitly " +
+				"re-claimed); bindings never displace online sessions. Actions: list / add / update / " +
+				"delete. The channel config is channel-defined JSON (passed through to the daemon) — " +
+				"for the 'webhook' channel: {url, secret, headers?, sign?} where url must be https " +
+				"(http only for loopback/private targets), secret >= 8 chars, headers is an optional " +
+				"map of static auth headers, sign (default true) toggles the X-Mailbox-Timestamp / " +
+				"X-Mailbox-Signature HMAC-SHA256 pair. The webhook payload carries mail summaries " +
+				"(id, from, subject, 200-char snippet) — never full bodies; the receiver reads back " +
+				"via the daemon's read-only HTTP API. Errors: mailbox_in_use (target held online), " +
+				"name_held (target held offline; retry with force after user confirmation), " +
+				"invalid_config, unsupported_channel.",
+			parameters: Type.Object({
+				action: Type.String({
+					description: "One of: list (this project's bindings, redacted), add, update, delete",
+				}),
+				channel: Type.Optional(
+					Type.String({ description: "Channel type (add only); e.g. 'webhook'. See the daemon's caps for supported types" }),
+				),
+				config: Type.Optional(
+					Type.String({
+						description:
+							"Channel-defined config as a JSON string (add; update replaces it). For webhook: " +
+							'{"url":"https://...","secret":"...","headers":{...},"sign":true}',
+					}),
+				),
+				targets: Type.Optional(
+					Type.Array(Type.String(), {
+						description: "Mailbox names in this project the channel claims (add; update replaces the set)",
+					}),
+				),
+				id: Type.Optional(Type.String({ description: "Binding id (update / delete)" })),
+				enabled: Type.Optional(Type.Boolean({ description: "Enable or disable (update); disabling releases all targets" })),
+				force: Type.Optional(
+					Type.Boolean({
+						description: "Take over targets held by offline sessions (add / update). Only after user confirmation",
+					}),
+				),
+			}),
+			exposure: "deferred",
+			outputSchema: MailboxBindingsOutputSchema,
+			async execute(_toolCallId, params): Promise<MailboxToolResult> {
+				if (!controller.supportsBindings) {
+					throw new Error(
+						"mailbox: the daemon does not support channel bindings (old daemon? restart it with a current build)",
+					);
+				}
+				const action = String(params.action);
+				if (action === "list") {
+					const bindings = await controller.bindingList();
+					const text =
+						bindings.length === 0
+							? "no channel bindings in this project"
+							: bindings.map(formatBinding).join("\n");
+						return {
+							content: [{ type: "text", text }],
+							details: { bindings },
+							structuredContent: asStructured({ bindings } satisfies Static<typeof MailboxBindingsOutputSchema>),
+						};
+				}
+				if (action === "add") {
+					const channel = String(params.channel ?? "webhook");
+					const config = params.config === undefined ? undefined : parseBindingConfig(params.config);
+					const targets = params.targets;
+					if (!Array.isArray(targets) || targets.length === 0) {
+						throw new Error("mailbox: add requires targets (mailbox names in this project)");
+					}
+					const b = await controller.bindingAdd({
+						channel,
+						config,
+						targets: targets.map(String),
+						force: params.force === true,
+					});
+					return { content: [{ type: "text", text: `binding ${b.id} created: ${formatBinding(b)}` }] };
+				}
+				if (action === "update") {
+					const id = params.id;
+					if (typeof id !== "string" || id === "") throw new Error("mailbox: update requires id");
+					const b = await controller.bindingUpdate({
+						id,
+						config: params.config === undefined ? undefined : parseBindingConfig(params.config),
+						targets: Array.isArray(params.targets) ? params.targets.map(String) : undefined,
+						enabled: typeof params.enabled === "boolean" ? params.enabled : undefined,
+						force: params.force === true,
+					});
+					return { content: [{ type: "text", text: `binding ${b.id} updated: ${formatBinding(b)}` }] };
+				}
+				if (action === "delete") {
+					const id = params.id;
+					if (typeof id !== "string" || id === "") throw new Error("mailbox: delete requires id");
+					const b = await controller.bindingDelete(id);
+					return { content: [{ type: "text", text: `binding ${b.id} deleted (targets released)` }] };
+				}
+				throw new Error(`mailbox: unknown action '${action}' (list / add / update / delete)`);
+			},
+		},
 	];
+}
+
+/** Render one binding line for tool/command output. */
+function formatBinding(b: BindingInfo): string {
+	const state = b.enabled ? (b.lost && b.lost.length > 0 ? "enabled, targets lost" : "enabled") : "disabled";
+	const targets = b.targets.join(", ");
+	const lost = b.lost && b.lost.length > 0 ? ` [lost: ${b.lost.join(", ")}]` : "";
+	const desc = b.describe ? ` — ${b.describe}` : "";
+	return `${b.id} ${b.channel} -> ${targets}${lost} (${state})${desc}`;
+}
+
+/** Parse a channel config JSON string (tool input); throws with context. */
+function parseBindingConfig(raw: unknown): unknown {
+	if (typeof raw !== "string") throw new Error("mailbox: config must be a JSON string");
+	try {
+		return JSON.parse(raw);
+	} catch (err) {
+		throw new Error(`mailbox: config is not valid JSON: ${err instanceof Error ? err.message : String(err)}`);
+	}
 }

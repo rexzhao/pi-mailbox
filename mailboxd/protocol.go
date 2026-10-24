@@ -122,6 +122,38 @@ type ShutdownAck struct {
 	Rid int    `json:"rid"`
 }
 
+// ---- channel bindings (additive; clients gate on welcome caps) ----
+
+type BindingAddMsg struct {
+	T       string          `json:"t"`
+	Rid     int             `json:"rid"`
+	Channel string          `json:"channel"`          // channel type, e.g. "webhook"
+	Config  json.RawMessage `json:"config,omitempty"` // channel-defined; opaque to the daemon core
+	Targets []string        `json:"targets"`          // mailbox names in the caller's project
+	Force   bool            `json:"force,omitempty"`  // take over targets held by offline sessions
+}
+
+type BindingUpdateMsg struct {
+	T       string          `json:"t"`
+	Rid     int             `json:"rid"`
+	ID      string          `json:"id"`
+	Config  json.RawMessage `json:"config,omitempty"`  // omitted = keep
+	Targets []string        `json:"targets,omitempty"` // omitted = keep
+	Enabled *bool           `json:"enabled,omitempty"` // omitted = keep
+	Force   bool            `json:"force,omitempty"`
+}
+
+type BindingDeleteMsg struct {
+	T   string `json:"t"`
+	Rid int    `json:"rid"`
+	ID  string `json:"id"`
+}
+
+type BindingsMsg struct {
+	T   string `json:"t"`
+	Rid int    `json:"rid"`
+}
+
 // ---- server -> client ----
 
 type PongMsg struct {
@@ -143,10 +175,13 @@ type WelcomeMsg struct {
 	// Released is true when the hello carried a release field and the
 	// daemon processed it (applied or no-op). Any welcome means the
 	// release was delivered; the client clears its pending flag.
-	Released        bool              `json:"released,omitempty"`
-	InstanceID      string            `json:"instanceId"`
-	ProtocolVersion int               `json:"protocolVersion"`
-	Meta            map[string]string `json:"meta,omitempty"`
+	Released        bool   `json:"released,omitempty"`
+	InstanceID      string `json:"instanceId"`
+	ProtocolVersion int    `json:"protocolVersion"`
+	// Caps advertises additive daemon capabilities (e.g. "bindings",
+	// "channel:webhook"); old clients ignore it, new clients gate features.
+	Caps []string          `json:"caps,omitempty"`
+	Meta map[string]string `json:"meta,omitempty"`
 }
 
 type SessionInfo struct {
@@ -216,6 +251,18 @@ type ErrorReply struct {
 type NotifyMsg struct {
 	T      string `json:"t"`
 	Unread int    `json:"unread"`
+}
+
+type BindingsReply struct {
+	T        string            `json:"t"`
+	Rid      int               `json:"rid"`
+	Bindings []bindingInfoView `json:"bindings"`
+}
+
+type BindingReply struct {
+	T       string          `json:"t"`
+	Rid     int             `json:"rid"`
+	Binding bindingInfoView `json:"binding"`
 }
 
 func encodeMsg(v interface{}) []byte {

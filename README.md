@@ -239,6 +239,8 @@ session only; a down daemon yields no suggestions.
   until its idle timeout, or `mailboxd --stop`)
 - `/mailbox restart service` — disconnect and reconnect
 - `/mailbox status` — connection status
+- `/mailbox binding list|add|update|delete` — manage channel bindings
+  (webhook delivery; see the Channel bindings section)
 
 ## Agent tools
 
@@ -264,6 +266,105 @@ instead of reconnecting:
 
 The optional `as` selects the held identity for the operation (default:
 the current identity — the last successful login).
+
+## Channel bindings (webhook)
+
+A **binding** ties mailboxes of one project (the owner — the project whose
+session created it) to a **delivery channel**. This release ships one
+channel: `webhook`, which POSTs a summary to an HTTPS endpoint whenever
+mail arrives at a bound mailbox — e.g. a bot that reacts to mail without
+holding a WebSocket session or polling.
+
+**Ownership model — one mailbox, one owner.** A binding claims its targets
+exactly like a session claims a name (through the same `_origin` marker,
+spelled `channel:<bindingId>`), so the familiar rules apply:
+
+- a binding never displaces an ONLINE session (`mailbox_in_use`);
+- a binding may force-take a name held by an offline session (`--force`, after
+  user confirmation);
+- a session may ALWAYS take a mailbox back from a channel with a confirmed
+  force login — the binding's target is then marked **lost** and does not
+  auto-recover (re-claim explicitly via an update with `--force`);
+- deleting or disabling a binding releases its targets (the mailbox file and
+  mails stay; the name becomes free).
+
+While a channel owns a mailbox there is no session-side online push for it
+(one owner); receivers read mail back through the daemon's read-only HTTP
+API without holding ownership. Targets must belong to the binding's own
+project; a second project that wants the same webhook creates its own
+binding with the same URL+secret.
+
+**Webhook config** (channel-defined JSON, opaque to the core):
+
+```json
+{ "url": "https://bot.example/hook", "secret": "...",
+  "headers": { "X-Bot-Key": "..." }, "sign": true }
+```
+
+- `url` must be `https://`; plain `http://` is allowed only for
+  loopback/private targets (SSRF rule, re-checked before every POST)
+- `secret` (>= 8 chars) is stored daemon-side with restrictive permissions
+  and NEVER echoed back: listings show a redacted, channel-defined summary
+  only
+- `headers` are optional static auth headers (protocol headers like
+  `Content-Type` and `X-Mailbox-*` cannot be overridden)
+- `sign` (default true) adds `X-Mailbox-Timestamp` + `X-Mailbox-Signature:
+  hex(HMAC-SHA256(secret, timestamp + "." + rawBody))` — verify and
+  replay-window the timestamp on the receiving side
+
+**Payload** (one POST per mailbox batch, `Content-Type: application/json`):
+
+```json
+{ "event": "mail.batch", "version": 1,
+  "bindingId": "b...", "deliveryId": "dlv...",
+  "mailbox": "botbox@projectid", "mailCount": 2,
+  "earliest": "…", "latest": "…",
+  "mails": [ { "id": "…", "from": "dev@projectid", "subject": "…",
+               "snippet": "first 200 chars…", "receivedAt": "…" } ],
+  "truncated": false, "unreadCount": 3 }
+```
+
+Summaries only — never full bodies. `deliveryId` is stable across retries
+of one batch (idempotency key; a new batch gets a new id). `mails` lists at
+most the 20 newest mails (`truncated` marks cuts; `mailCount` is the
+authoritative total). `unreadCount` enables reconciliation.
+
+**Delivery semantics** (all channel-side; the binding layer only reports
+arrivals): a 10 s delay window coalesces a wave; at least 45 s between
+calls per binding; one attempt times out after 10 s and retries at
+30 s / 2 m / 10 m / 30 m; a batch that exhausts its budget is dropped and
+recorded (**circuit-abandon is not a permanent disable** — the next mail
+starts a fresh round). A per-mailbox watermark persisted with the binding
+powers the startup catch-up: after a daemon restart, everything past the
+watermark is re-delivered, so restarts lose nothing already confirmed.
+Overall the guarantee is at-least-once; receivers dedupe by `deliveryId`
+and reconcile via `unreadCount` / the read API. Recent failures and
+counters ride the binding's `describe` line in listings.
+
+**Management**: the `mailbox_bindings` tool (actions `list`/`add`/`update`/
+`delete`; `config` is a JSON string) and `/mailbox binding list|add|update|delete`
+(e.g. `/mailbox binding add webhook botbox,bot2 {"url":…,"secret":…}`).
+Features gate on the daemon's advertised `caps` (old daemons yield a clean
+error, not a silent no-op).
+
+### Adding a channel type
+
+Channels are a strategy interface (`mailboxd/bindings.go`); the binding
+layer (records, ownership arbitration, arrival dispatch, persistence) is
+channel-agnostic. To add one:
+
+1. implement the `ChannelType` + `ChannelInstance` interfaces (config
+   validation, redacted `Describe`, and your delivery semantics — payload,
+   pacing, retry, catch-up are all yours to define);
+2. register the factory in `channelTypes`;
+3. the capability list ("channel:<type>") and `unsupported_channel` errors
+   follow automatically;
+4. unit-test with `httptest`-style fakes (see `webhook_test.go`);
+5. document the config and payload here.
+
+The acceptance bar: a second channel requires ZERO changes to the binding
+layer, protocol structure, or the TS core (config is passthrough; the
+Go test suite includes a fake channel proving this).
 
 ## Protocol
 

@@ -19,6 +19,9 @@ type Project struct {
 
 	mu     sync.Mutex
 	online map[string]*conn // session id -> registered connection
+	// claimMu serializes mailbox ownership claims (session hellos and
+	// binding target claims) so check-then-claim stays atomic per project.
+	claimMu sync.Mutex
 }
 
 // errSessionOnline is returned by DeleteMailboxIfOffline.

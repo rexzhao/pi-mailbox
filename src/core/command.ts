@@ -214,6 +214,11 @@ export async function executeMailboxCommand(controller: MailboxController, rawAr
 		return;
 	}
 
+	if (arg === "binding" || arg.startsWith("binding ")) {
+		await executeBindingCommand(controller, arg.slice("binding".length).trim());
+		return;
+	}
+
 	if (arg === "list client" || arg === "list client all") {
 		try {
 			const includeOffline = arg === "list client all";
@@ -527,6 +532,119 @@ ${formatMailList(mails)}${more}`,
  * spawns). "delete <name>": offline names only (online holders cannot
  * be deleted). Everything else: null (no suggestions).
  */
+/** /mailbox binding <sub> — channel binding management (CRUD). */
+async function executeBindingCommand(controller: MailboxController, rest: string): Promise<void> {
+	if (!rest || rest === "list") {
+		try {
+			requireBindings(controller);
+			const bindings = await controller.bindingList();
+			out(
+				controller,
+				bindings.length === 0
+					? "mailbox: no channel bindings in this project"
+					: bindings.map((b) => `${b.id} ${b.channel} -> ${b.targets.join(", ")}${b.lost?.length ? ` [lost: ${b.lost.join(", ")}]` : ""} (${b.enabled ? "enabled" : "disabled"})${b.describe ? ` — ${b.describe}` : ""}`).join("\n"),
+				"info",
+			);
+		} catch (err) {
+			out(controller, `mailbox: ${errMsg(err)}`, "error");
+		}
+		return;
+	}
+	const parts = rest.split(/\s+/);
+	const sub = parts[0];
+	try {
+		requireBindings(controller);
+		if (sub === "add") {
+			// binding add <channel> <targets a,b,...> <config json (rest of line)>
+			if (parts.length < 4) {
+				out(controller, 'Usage: /mailbox binding add <channel> <targets a,b,...> <config-json> [--force]\nExample: /mailbox binding add webhook qclaw,grok2 {"url":"https://bot.example/hook","secret":"..."}', "warning");
+				return;
+			}
+			const channel = parts[1]!;
+			const force = parts.includes("--force");
+			const bodyParts = parts.slice(2).filter((p) => p !== "--force");
+			const targets = (bodyParts[0] ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+			const configRaw = bodyParts.slice(1).join(" ");
+			if (targets.length === 0 || !configRaw) {
+				out(controller, "mailbox: add needs targets and a config JSON (see /mailbox binding add usage)", "warning");
+				return;
+			}
+			let config: unknown;
+			try {
+				config = JSON.parse(configRaw);
+			} catch (err) {
+				out(controller, `mailbox: config is not valid JSON: ${errMsg(err)}`, "error");
+				return;
+			}
+			const b = await controller.bindingAdd({ channel, config, targets, force });
+			out(controller, `mailbox: binding ${b.id} created (${b.channel} -> ${b.targets.join(", ")})`, "info");
+			return;
+		}
+		if (sub === "update") {
+			// binding update <id> [--config <json rest>] [--targets a,b] [--enabled on|off] [--force]
+			const id = parts[1];
+			if (!id) {
+				out(controller, "Usage: /mailbox binding update <id> [--config <json>] [--targets a,b,...] [--enabled on|off] [--force]", "warning");
+				return;
+			}
+			let config: unknown;
+			let targets: string[] | undefined;
+			let enabled: boolean | undefined;
+			let force = false;
+			for (let i = 2; i < parts.length; i++) {
+				const flag = parts[i];
+				if (flag === "--force") {
+					force = true;
+				} else if (flag === "--config") {
+					config = JSON.parse(parts.slice(i + 1).join(" "));
+					i = parts.length;
+				} else if (flag === "--targets") {
+					targets = (parts[i + 1] ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+					i++;
+				} else if (flag === "--enabled") {
+					const v = parts[i + 1];
+					if (v !== "on" && v !== "off") {
+						out(controller, "mailbox: --enabled takes 'on' or 'off'", "error");
+						return;
+					}
+					enabled = v === "on";
+					i++;
+				} else {
+					out(controller, `mailbox: unknown flag '${flag}'`, "error");
+					return;
+				}
+			}
+			if (config === undefined && targets === undefined && enabled === undefined && !force) {
+				out(controller, "mailbox: nothing to update (--config / --targets / --enabled / --force)", "warning");
+				return;
+			}
+			const b = await controller.bindingUpdate({ id, config, targets, enabled, force });
+			out(controller, `mailbox: binding ${b.id} updated (${b.enabled ? "enabled" : "disabled"}, targets: ${b.targets.join(", ")}${b.lost?.length ? `, lost: ${b.lost.join(", ")}` : ""})`, "info");
+			return;
+		}
+		if (sub === "delete") {
+			const id = parts[1];
+			if (!id) {
+				out(controller, "Usage: /mailbox binding delete <id>", "warning");
+				return;
+			}
+			const b = await controller.bindingDelete(id);
+			out(controller, `mailbox: binding ${b.id} deleted (targets released)`, "info");
+			return;
+		}
+		out(controller, `mailbox: unknown binding subcommand '${sub}' (list / add / update / delete)`, "error");
+	} catch (err) {
+		out(controller, `mailbox: ${errMsg(err)}`, "error");
+	}
+}
+
+/** Gate binding commands on the daemon capability, with a helpful error. */
+function requireBindings(controller: MailboxController): void {
+	if (!controller.supportsBindings) {
+		throw new Error("the daemon does not support channel bindings (old daemon? restart it with a current build)");
+	}
+}
+
 export async function mailboxArgumentCompletions(
 	controller: MailboxController,
 	argumentPrefix: string,
@@ -550,6 +668,7 @@ export async function mailboxArgumentCompletions(
 		["unset", "unset k", "remove meta values"],
 		["read", "read <mail-ref>", "read one mail"],
 		["more", "more <cursor>", "next page of mail"],
+		["binding", "binding <sub>", "manage channel bindings (webhook delivery)"],
 	];
 	const parts = argumentPrefix.trimStart().split(/\s+/);
 	if (parts.length === 1) {
@@ -561,6 +680,56 @@ export async function mailboxArgumentCompletions(
 	}
 	const action = parts[0];
 	const typed = parts[1] ?? "";
+
+	// /mailbox binding [sub] [arg] — subcommands, channel names (add),
+	// binding ids (update/delete); the id/channel queries are live and
+	// connected-only. NOTE: "binding " splits to ["binding", ""], and
+	// "binding add " to three parts — this branch must run BEFORE the
+	// generic parts.length > 2 bail-out below.
+	if (action === "binding") {
+		if (parts.length === 1) return null; // covered by the top-level subcommand list
+		const sub = typed;
+		if (parts.length === 2) {
+			const subs: Array<[string, string, string]> = [
+				["list", "list", "list this project's channel bindings"],
+				["add", "add <channel> <targets> <config-json>", "create a binding (claims its targets)"],
+				["update", "update <id> [--flags]", "update config / targets / enabled"],
+				["delete", "delete <id>", "delete a binding (releases targets)"],
+			];
+			const items = subs
+				.filter(([value]) => value.startsWith(sub))
+				.map(([value, label, desc]) => ({ value: `binding ${value} `, label, description: desc }));
+			return items.length > 0 ? items : null;
+		}
+		if (parts.length === 3 && (sub === "add" || sub === "update" || sub === "delete")) {
+			if (!controller.connected) return null;
+			const argTyped = parts[2] ?? "";
+			if (sub === "add") {
+				// channel names from the daemon's advertised caps
+				const items = controller
+					.supportedChannels()
+					.filter((c) => c.startsWith(argTyped))
+					.map((c) => ({ value: `binding add ${c} `, label: c, description: "channel type" }));
+				return items.length > 0 ? items : null;
+			}
+			let bindings: Awaited<ReturnType<MailboxController["bindingList"]>>;
+			try {
+				bindings = await controller.bindingList();
+			} catch {
+				return null; // transient daemon hiccup: no suggestions
+			}
+			const items = bindings
+				.filter((b) => b.id.startsWith(argTyped))
+				.map((b) => ({
+					value: `binding ${sub} ${b.id} `,
+					label: b.id,
+					description: `${b.channel} -> ${b.targets.join(",")}${b.enabled ? "" : " (disabled)"}`,
+				}));
+			return items.length > 0 ? items : null;
+		}
+		return null;
+	}
+
 	if (parts.length > 2) return null;
 	if (action !== "login" && action !== "resume" && action !== "delete" && action !== "logout") return null;
 
