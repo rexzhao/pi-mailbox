@@ -41,7 +41,15 @@ const waitFor = async (deadlineMs, fn) => {
 };
 
 const { resolveLocalDaemon } = await import("../src/core/index.ts");
-const { apply } = await import("../src/dsh/index.ts");
+// DSH_TEST_ENTRY=dist runs the same suite against the BUILT bundle
+// (dist/dsh/index.js, typebox inlined) — the artifact DSH actually loads
+const entry = process.env.DSH_TEST_ENTRY === "dist" ? "../dist/dsh/index.js" : "../src/dsh/index.ts";
+const { apply } = await import(entry);
+if (process.env.DSH_TEST_ENTRY === "dist") {
+	const bundle = readFileSync(join(import.meta.dirname, "..", "dist", "dsh", "index.js"), "utf8");
+	assert(!/from\s+"typebox"|require\s*\(\s*"typebox"\)/.test(bundle), "the bundle inlines typebox (no external import)");
+	console.log("ok: dist mode — testing the built bundle");
+}
 
 // ---------------------------------------------------------------------------
 // fakes: the DSH surface the plugin actually touches

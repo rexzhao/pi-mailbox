@@ -421,10 +421,23 @@ npm run check:core     # the core chain under the FULL strict config
                        # (see "Embedding the core" below) — what vendoring
                        # hosts run against
 npm run check:dsh      # the DSH host plugin
-npm run build          # emit dist/ (the DSH plugin ships compiled JS)
+npm run build          # esbuild-bundle dist/dsh/index.js (the DSH plugin)
 node --experimental-strip-types --no-warnings test/smoke.mjs
+DSH_TEST_ENTRY=dist node --experimental-strip-types --no-warnings test/dsh-test.mjs
+                       # the same DSH suite against the built bundle
 cd mailboxd && go test ./...
 ```
+
+**typebox is dual-host, so the manifest splits it**: pi supplies typebox
+to extensions and maps the import to its own instance, so it must be
+declared `peerDependencies: "*"` (pi suppresses peer installation for its
+packages — a physical copy would bypass the module mapping and duplicate
+the runtime). DSH does NOT supply typebox and its plugin installer runs
+pnpm with `autoInstallPeers: false`, so the DSH artifact cannot rely on
+it being installed — the build therefore BUNDLES typebox into
+`dist/dsh/index.js` (the only externals are `ws`,
+`@deepseek-ai/schemastery`, and node builtins). The repo pins the tested
+version in devDependencies for tsc and tests.
 
 Host-agnostic core tests (fake hosts + a real isolated daemon; multi
 controllers, multi-login, async deliver, binding-file parsing):
