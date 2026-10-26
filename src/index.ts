@@ -446,7 +446,14 @@ export default function (pi: ExtensionAPI) {
 		controller.onAgentEnd();
 	};
 	pi.on("agent_end", settle);
-	pi.on("agent_settled", settle);
+	pi.on("agent_settled", (event) => {
+		busy = false;
+		// the FINAL boundary: the core also arms the residual-unread
+		// reminder here (unread mail + nothing queued after a settled run
+		// means the agent finished without reading it). Aborted runs pass
+		// the flag so the reminder stands down (the badge carries it).
+		controller.onAgentSettled({ aborted: (event as { aborted?: boolean } | undefined)?.aborted === true });
+	});
 	// turn boundary: the core flushes held notifications here. The handler
 	// RETURNS the flush promise (never `void` it): pi awaits event handlers,
 	// so the agent loop stays inside its turn_end emit until the notice is

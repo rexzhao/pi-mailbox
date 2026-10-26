@@ -327,8 +327,16 @@ export class MailboxController {
 		this.settle();
 	}
 
-	onAgentSettled(): void {
+	onAgentSettled(opts?: { aborted?: boolean }): void {
 		this.settle();
+		// Residual-unread reminder: the run has fully wound down with mail
+		// still unread and nothing queued that would bring it back to the
+		// agent (no pending notice, no steer riding a next turn) — the
+		// agent finished (or stalled) without reading, often a
+		// subject-line-only "done". Aborted runs skip it (the user
+		// interrupted; the badge carries it), and so does anything the
+		// arrival pipeline still owns.
+		if (opts?.aborted !== true && this.pendingUnread.size === 0) this.scheduleResidualReminder();
 	}
 
 	/**
@@ -362,11 +370,108 @@ export class MailboxController {
 		if (this.pendingUnread.size > 0) await this.flushNotifications();
 	}
 
+	// -- residual-unread reminder --------------------------------------------
+
+	/** Reminders delivered for one unchanged unread set; the badge carries it after this many. */
+	private static readonly UNREAD_REMINDER_CAP = 2;
+	/** Mail ids listed by the last delivered reminder (the budget key). */
+	private unreadReminderIds = "";
+	/** Reminders already delivered for the current unread set. */
+	private unreadReminderCount = 0;
+	private reminderTimer: NodeJS.Timeout | null = null;
+
+	/**
+	 * Schedule the residual-unread check after a settled run: unread mail
+	 * with nothing queued means no turn will ever surface it, so one
+	 * explicit reminder follows — the agent is told to read the CONTENTS
+	 * (mailbox_list + mailbox_read), not to judge by the subject line.
+	 * Bounded per unchanged unread set: after the cap the unread badge is
+	 * the only nag. The short debounce mirrors the idle flush: a burst of
+	 * settles (retry/continuation wind-down) becomes one check.
+	 */
+	private scheduleResidualReminder(): void {
+		if (!this.canDeliver() || this.reminderTimer !== null) return;
+		this.reminderTimer = setTimeout(() => {
+			this.reminderTimer = null;
+			void this.remindUnread();
+		}, 300);
+	}
+
+	private async remindUnread(): Promise<void> {
+		if (this.pendingUnread.size > 0) return; // the arrival pipeline owns delivery
+		if (!this.canDeliver() || !this.anyConnected()) return;
+		if (this.host.isBusy()) return; // a run is already underway (e.g. the notice's own turn)
+		let badge = 0;
+		for (const n of this.unreadByConn.values()) badge += n;
+		if (badge <= 0) return;
+		const sections: Array<{ name: string; count: number; mails: MailRecord[] }> = [];
+		for (const [name, c] of this.connections) {
+			if (!c.connected) continue;
+			try {
+				const reply = await c.mailbox.inbox({ unreadOnly: true }, { limit: 8 });
+				if (reply.totalUnread > 0) sections.push({ name, count: reply.totalUnread, mails: reply.mails });
+			} catch {
+				return; // transient daemon hiccup: the next settle retries
+			}
+		}
+		if (sections.length === 0) {
+			// the badge was stale: everything got read — reset the budget
+			this.unreadReminderIds = "";
+			this.unreadReminderCount = 0;
+			return;
+		}
+		const ids = sections.flatMap((s) => s.mails.map((m) => m.id)).sort().join(",");
+		if (ids !== this.unreadReminderIds) {
+			this.unreadReminderIds = ids;
+			this.unreadReminderCount = 0;
+		}
+		if (this.unreadReminderCount >= MailboxController.UNREAD_REMINDER_CAP) return;
+		this.unreadReminderCount++;
+		try {
+			await this.host.deliver(this.composeReminder(sections));
+		} catch {
+			this.unreadReminderCount--; // a failed delivery must not burn the budget
+		}
+	}
+
+	/**
+	 * Compose the residual-unread reminder. Unlike a notice (which lists
+	 * fresh arrivals), this re-lists what is STILL unread and says why:
+	 * read the contents, do not decide from the subject line alone.
+	 */
+	private composeReminder(sections: Array<{ name: string; count: number; mails: MailRecord[] }>): string {
+		const totalUnread = sections.reduce((n, s) => n + s.count, 0);
+		const renderMails = (mails: MailRecord[]): string[] =>
+			mails.map((m) =>
+				m.from.session === "user"
+					? `  * ${m.id}: ${MailboxController.truncateSubject(m.subject)}`
+					: `  * ${m.id} from ${m.from.session}@${m.from.project}: ${MailboxController.truncateSubject(m.subject)}`,
+			);
+		const lines: string[] = [];
+		if (sections.length === 1) {
+			const s = sections[0]!;
+			lines.push(`[mailbox] Reminder: ${s.count} mail(s) are still unread.`);
+			lines.push(...renderMails(s.mails));
+		} else {
+			lines.push(`[mailbox] Reminder: ${totalUnread} mail(s) across ${sections.length} mailboxes are still unread.`);
+			for (const s of sections) {
+				lines.push(`In '${s.name}' (${s.count} unread):`);
+				lines.push(...renderMails(s.mails));
+			}
+		}
+		lines.push(
+			"Do not decide from the subject line alone that a mail needs no action: read its contents with mailbox_list and mailbox_read, then handle or reply to it.",
+		);
+		return lines.join("\n");
+	}
+
 	/** Stop every connection and timer. Idempotent; the ONLY permanent stop. */
 	stop(): void {
 		this.stopped = true;
 		if (this.flushTimer !== null) clearTimeout(this.flushTimer);
 		this.flushTimer = null;
+		if (this.reminderTimer !== null) clearTimeout(this.reminderTimer);
+		this.reminderTimer = null;
 		for (const c of this.connections.values()) void c.stop();
 		this.connections.clear();
 		this.current = null;

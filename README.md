@@ -126,6 +126,16 @@ below.
   replied to immediately, large ones get a brief acknowledgment now and a
   full reply after the current work. After reconnect, the unread count is
   backfilled through the same path.
+- Residual-unread reminder: when a run fully settles with unread mail
+  still in the mailbox and NOTHING queued that would surface it (no
+  pending notice, no steer riding a next turn), the agent finished
+  without reading — often a subject-line-only "done". One explicit
+  reminder follows (it re-lists what is STILL unread and says to read the
+  contents with `mailbox_list` / `mailbox_read`, not to judge by the
+  subject line). It is bounded: at most two reminders per unchanged
+  unread set (after that the unread badge is the only nag), the budget
+  resets when the set changes (new mail or reads), aborted runs never
+  remind, and anything the arrival pipeline still owns is skipped.
 - herdr wake (opt-out): when a send targets an offline session that runs on
   this machine and [herdr](https://herdr.dev) is up, the sender's extension
   wakes it instead of waiting for its next connection: it finds (or creates)

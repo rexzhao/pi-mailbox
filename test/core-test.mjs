@@ -505,6 +505,52 @@ try {
 		await c.stop();
 	}
 
+	// 7f. residual-unread reminder: a settled run with unread mail and
+	//     nothing queued fires one explicit "read the contents" reminder,
+	//     capped per unchanged unread set; aborted settles never remind
+	{
+		const h = fakeHost({ sessionId: "core-sess-remind" });
+		const c = new MailboxController(h.host);
+		await c.login({ as: "core-remind" });
+		const toolsR = Object.fromEntries(c.tools.map((t) => [t.name, t]));
+
+		// idle arrival: the normal notice delivers (not a reminder)
+		await peer.mailbox.sendMail({ project: peer.mailbox.project, session: "core-remind" }, "must read me", "body");
+		const notice = await poll(5000, () => h.state.delivered.find((t) => t.includes("must read me")));
+		assert(notice !== undefined && !notice.includes("Reminder"), "the arrival notice delivers (not a reminder)");
+
+		// the agent never reads it: each settled run reminds, capped at 2
+		c.onAgentSettled();
+		const rem1 = await poll(5000, () => h.state.delivered.find((t) => t.includes("Reminder")));
+		assert(rem1 !== undefined && rem1.includes("must read me") && rem1.includes("mailbox_read"), "a settled run with residual unread fires the reminder (lists the mail, says to read it)");
+		c.onAgentSettled();
+		await poll(5000, () => h.state.delivered.filter((t) => t.includes("Reminder")).length === 2);
+		c.onAgentSettled();
+		await new Promise((r) => setTimeout(r, 900));
+		assert(h.state.delivered.filter((t) => t.includes("Reminder")).length === 2, "the reminder is capped per unchanged unread set");
+
+		// aborted settles never remind
+		c.onAgentSettled({ aborted: true });
+		await new Promise((r) => setTimeout(r, 900));
+		assert(h.state.delivered.filter((t) => t.includes("Reminder")).length === 2, "an aborted settle fires no reminder");
+
+		// reading the mail clears the condition
+		const listR = await toolsR["mailbox_list"].execute("tr1", {});
+		const mailId = listR.structuredContent.mails.find((m) => m.subject === "must read me").id;
+		await toolsR["mailbox_read"].execute("tr2", { mail: mailId });
+		c.onAgentSettled();
+		await new Promise((r) => setTimeout(r, 900));
+		assert(h.state.delivered.filter((t) => t.includes("Reminder")).length === 2, "no reminder after the mail is read");
+
+		// a NEW mail resets the budget (the unread set changed)
+		await peer.mailbox.sendMail({ project: peer.mailbox.project, session: "core-remind" }, "second wave", "body");
+		await poll(5000, () => h.state.delivered.find((t) => t.includes("second wave")));
+		c.onAgentSettled();
+		const rem3 = await poll(5000, () => h.state.delivered.filter((t) => t.includes("Reminder")).length === 3);
+		assert(rem3 !== undefined, "a changed unread set resets the reminder budget");
+		await c.stop();
+	}
+
 	// 8. daemon isolation: everything lived under the temp PI_MAILBOXD_DIR
 	assert(existsSync(join(home, "mailboxd.json")), "the daemon registry stayed inside PI_MAILBOXD_DIR");
 

@@ -151,9 +151,14 @@ export class MailboxManager {
 					return;
 				}
 				if (event.type !== "turn/end") return;
+				// DSH's turn/end is the agent's run boundary (the agent goes
+				// idle): flush held notices, then arm the residual-unread
+				// reminder — its isBusy guard makes the same-boundary call a
+				// no-op when the notice's own follow-up turn is starting.
 				void binding.controller.onTurnEnd().catch((err) => {
 					this.log("warn", `turn-end flush failed for ${session.id}: ${describeError(err)}`);
 				});
+				binding.controller.onAgentSettled();
 			}),
 		);
 		this.disposers.push(this.ctx.commands.register(this.command()));
