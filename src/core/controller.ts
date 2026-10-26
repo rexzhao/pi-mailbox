@@ -160,7 +160,6 @@ export interface MailboxHost {
 // ---------------------------------------------------------------------------
 
 const FORCE_GATE_TTL_MS = 5 * 60 * 1000;
-const SUBJECT_MAX = 80;
 
 export interface ConnectionStatus {
 	address: string;
@@ -436,17 +435,14 @@ export class MailboxController {
 
 	/**
 	 * Compose the residual-unread reminder. Unlike a notice (which lists
-	 * fresh arrivals), this re-lists what is STILL unread and says why:
-	 * read the contents, do not decide from the subject line alone.
+	 * fresh arrivals), this re-lists what is STILL unread — by id and
+	 * sender only, same subjectless rule — and says why: read the
+	 * contents, do not decide from the subject line alone.
 	 */
 	private composeReminder(sections: Array<{ name: string; count: number; mails: MailRecord[] }>): string {
 		const totalUnread = sections.reduce((n, s) => n + s.count, 0);
 		const renderMails = (mails: MailRecord[]): string[] =>
-			mails.map((m) =>
-				m.from.session === "user"
-					? `  * ${m.id}: ${MailboxController.truncateSubject(m.subject)}`
-					: `  * ${m.id} from ${m.from.session}@${m.from.project}: ${MailboxController.truncateSubject(m.subject)}`,
-			);
+			mails.map((m) => (m.from.session === "user" ? `  * ${m.id}` : `  * ${m.id} from ${m.from.session}@${m.from.project}`));
 		const lines: string[] = [];
 		if (sections.length === 1) {
 			const s = sections[0]!;
@@ -1034,30 +1030,30 @@ export class MailboxController {
 		}
 	}
 
-	private static truncateSubject(s: string): string {
-		// normalize whitespace: a subject containing newlines must not be able
-		// to forge extra lines inside the injected notification
-		const norm = s.replace(/\s+/g, " ").trim();
-		if (norm.length === 0) return "(no subject)";
-		return norm.length > SUBJECT_MAX ? `${norm.slice(0, SUBJECT_MAX - 1)}…` : norm;
-	}
-
 	/**
 	 * Compose the injected notification. A single identity renders in the
-	 * historical byte-identical format; multiple identities group their
-	 * unread under per-mailbox headings.
+	 * single-mailbox format; multiple identities group their unread under
+	 * per-mailbox headings. Mails are named by id and sender only — see
+	 * the comment inside.
 	 */
 	private composeNotification(sections: Array<{ name: string; count: number; fresh: MailRecord[] }>): string {
 		const totalUnread = sections.reduce((n, s) => n + s.count, 0);
 		const busy = this.host.isBusy();
-		const tail = busy ? "Finish your current task, then check with mailbox_list." : "Use mailbox_list to read them.";
+		// Subjects are deliberately omitted from the notice: an agent that
+		// sees a subject tends to decide from the subject line alone. The
+		// notice names each mail by id and sender only — reading the CONTENTS
+		// (mailbox_list, then mailbox_read) is the only way to know what it
+		// says.
+		const tail = busy
+			? "Finish your current task, then list them with mailbox_list and read each one with mailbox_read."
+			: "List them with mailbox_list and read each one with mailbox_read.";
 		const renderMails = (fresh: MailRecord[]): string[] => {
 			const userMails = fresh.filter((m) => m.from.session === "user");
 			const agentMails = fresh.filter((m) => m.from.session !== "user");
 			const lines: string[] = [];
 			if (userMails.length > 0) {
 				lines.push("New mail from the user (your human operator):");
-				for (const m of userMails) lines.push(`  * ${m.id}: ${MailboxController.truncateSubject(m.subject)}`);
+				for (const m of userMails) lines.push(`  * ${m.id}`);
 				lines.push(
 					"User mail takes priority: if it is quick to handle, do it now and reply with mailbox_reply; " +
 						"if it is a large task, briefly acknowledge it now, finish your current work, then handle it and reply when done.",
@@ -1065,7 +1061,7 @@ export class MailboxController {
 			}
 			if (agentMails.length > 0) {
 				lines.push("New mail:");
-				for (const m of agentMails) lines.push(`  * ${m.id} from ${m.from.session}@${m.from.project}: ${MailboxController.truncateSubject(m.subject)}`);
+				for (const m of agentMails) lines.push(`  * ${m.id} from ${m.from.session}@${m.from.project}`);
 			}
 			return lines;
 		};

@@ -167,13 +167,14 @@ try {
 	const send = a.tools.get("mailbox_send");
 	const sent = await send.execute({ address: "dsh-beta", subject: "first-mail", body: "hello beta" }, { callId: "call-1" });
 	assert(typeof sent === "string" && sent.startsWith("sent: "), `mailbox_send returns the core's text result (${sent})`);
+	const sentId = sent.split("/").pop();
 
 	await waitFor(5000, () => b.state.followups.length === 1);
 	assert(b.state.followups.length === 1, "the recipient receives exactly one notification");
 	const delivered = b.state.followups[0];
 	assert(delivered.role === "user" && delivered.source.kind === "mailbox", "the notification is a user-role message sourced as mailbox");
 	assert(delivered.source.form === "notice" && typeof delivered.source.summary === "string", "the message carries a bounded notice summary");
-	assert(delivered.content[0].text.includes("first-mail"), "the notification names the new subject");
+	assert(delivered.content[0].text.includes(sentId) && delivered.content[0].text.includes("from dsh-alpha@") && !delivered.content[0].text.includes("first-mail"), "the notification names the mail by id + sender, not by subject");
 	assert(typeof delivered.id === "string" && delivered.id.length > 0, "the injected message has a fresh identity");
 
 	// busy: nothing is delivered mid-step; the STEP boundary coalesces everything
@@ -187,7 +188,7 @@ try {
 	assert(b.state.followups.length === 2, "the step boundary delivers the held notices");
 	assert(b.state.steered === 1, "the step-boundary notice is delivered with steer");
 	const coalesced = b.state.followups[1].content[0].text;
-	assert(coalesced.includes("second-mail") && coalesced.includes("third-mail"), "all arrivals in the step are coalesced into ONE notice");
+	assert(coalesced.includes("unread mail(s)") && !coalesced.includes("second-mail") && !coalesced.includes("third-mail"), "all arrivals in the step are coalesced into ONE (subjectless) notice");
 	host.emit("session/event", { id: "session-dsh-b" }, { type: "turn/end" });
 	await sleep(400);
 	assert(b.state.followups.length === 2, "the turn boundary does not duplicate a delivered notice");

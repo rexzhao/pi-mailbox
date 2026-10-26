@@ -264,7 +264,10 @@ instead of reconnecting:
 
 - `mailbox_list [unreadOnly] [since] [limit] [cursor] [as]` — list this
   session's mail, newest first, paginated (default page 20, max 100); the
-  reply carries a `cursor` token to fetch older mails
+  reply carries a `cursor` token to fetch older mails. The list is an
+  index only: the tool description and the text output both tell the
+  agent to READ each mail with `mailbox_read` before acting on it — the
+  subject alone is not enough
 - `mailbox_read <mail> [session] [project] [as]` — read a mail by triple
 - `mailbox_send <session> <subject> [body] [refs] [wake] [as]` — send to a
   registered session (online or offline)

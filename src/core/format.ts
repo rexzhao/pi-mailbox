@@ -84,13 +84,16 @@ export function formatMailRef(ref: { project: string; session: string; mail: str
 
 export function formatMailList(mails: MailRecord[]): string {
 	if (mails.length === 0) return "mailbox is empty";
-	return mails
-		.map((m) => {
-			const read = m.readAt ? " " : "*";
-			const from = `${m.from.session}@${m.from.project}`;
-			return `[${read}] ${m.id}  from ${from}  ${m.subject}`;
-		})
-		.join("\n");
+	const lines = mails.map((m) => {
+		const read = m.readAt ? " " : "*";
+		const from = `${m.from.session}@${m.from.project}`;
+		return `[${read}] ${m.id}  from ${from}  ${m.subject}`;
+	});
+	// the nudge matters as much as the listing: the list is an index, and
+	// an agent that stops at the subject line tends to "finish" mail it
+	// never read
+	lines.push("", "(the list is an index only: read each mail with mailbox_read before acting on it \u2014 the subject alone is not enough)");
+	return lines.join("\n");
 }
 
 export function formatMail(mail: MailRecord, ref?: MailRef): string {

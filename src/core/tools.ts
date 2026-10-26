@@ -193,8 +193,9 @@ export function buildToolDefinitions(controller: MailboxController): MailboxTool
 			namespace: MAILBOX_NAMESPACE,
 			annotations: READ_ONLY,
 			description:
-				"List mails in this session's mailbox, newest first, paginated. Reading a mail with " +
-				"mailbox_read marks it read. Optional: unreadOnly, since (ISO timestamp, only mails " +
+				"List mails in this session's mailbox, newest first, paginated. The list is an " +
+				"index only: read a mail with mailbox_read before acting on it \u2014 the subject alone is not " +
+				"enough. Reading marks it read. Optional: unreadOnly, since (ISO timestamp, only mails " +
 				"created after it), limit (page size, default 20, max 100), cursor (continuation " +
 				"token from a previous call to fetch older mails), as (a held identity for multi-login).",
 			parameters: Type.Object({

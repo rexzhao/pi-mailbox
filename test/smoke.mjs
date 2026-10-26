@@ -736,11 +736,11 @@ try {
 	// print: the injection MUST fire
 	await sessionStart({}, modeCtx("print"));
 	sentUserMessages.length = 0;
-	await peerSends("print-mode notify test");
+	const refPrint = await peerSends("print-mode notify test");
 	let printInjected = false;
 	for (let i = 0; i < 40 && !printInjected; i++) {
 		await new Promise((r) => setTimeout(r, 100));
-		printInjected = sentUserMessages.some((s) => String(s.msg).includes("print-mode notify test"));
+		printInjected = sentUserMessages.some((s) => String(s.msg).includes(refPrint.mail));
 	}
 	assert(printInjected, "print mode: new-mail injection reaches the host");
 	assert(

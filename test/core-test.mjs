@@ -204,20 +204,21 @@ try {
 		onDisconnected: () => peerLog.disconnected++,
 	}, { login: { as: "core-peer" } });
 	await peer.start();
-	await peer.mailbox.sendMail({ project: connA.mailbox.project, session: "core-alpha" }, "to alpha", "x");
-	await peer.mailbox.sendMail({ project: connA.mailbox.project, session: "core-beta" }, "to beta", "x");
-	const grouped = await poll(5000, () => a.state.delivered.find((t) => t.includes("to alpha") && t.includes("to beta")));
+	const refA = await peer.mailbox.sendMail({ project: connA.mailbox.project, session: "core-alpha" }, "to alpha", "x");
+	const refB = await peer.mailbox.sendMail({ project: connA.mailbox.project, session: "core-beta" }, "to beta", "x");
+	const grouped = await poll(5000, () => a.state.delivered.find((t) => t.includes(refA.mail) && t.includes(refB.mail)));
 	assert(grouped !== undefined, "one coalesced notification covers both identities");
 	assert(grouped.includes("across 2 mailboxes") && grouped.includes("In 'core-alpha'") && grouped.includes("In 'core-beta'"), "multi-identity notification groups per mailbox");
-	assert(a.state.delivered.filter((t) => t.includes("to alpha")).length === 1, "no duplicate delivery (announced dedup)");
+	assert(!grouped.includes("to alpha") && !grouped.includes("to beta"), "the notification names mails by id + sender only (no subjects)");
+	assert(a.state.delivered.filter((t) => t.includes(refA.mail)).length === 1, "no duplicate delivery (announced dedup)");
 
 	// 4b. F2 regression: a second mail to the same identity must not re-list
 	//     the already-announced one (dedup applies to the listing too)
 	{
-		await peer.mailbox.sendMail({ project: connA.mailbox.project, session: "core-beta" }, "beta second wave", "x");
-		const second = await poll(5000, () => a.state.delivered.find((t) => t.includes("beta second wave")));
+		const refW = await peer.mailbox.sendMail({ project: connA.mailbox.project, session: "core-beta" }, "beta second wave", "x");
+		const second = await poll(5000, () => a.state.delivered.find((t) => t.includes(refW.mail)));
 		assert(second !== undefined, "the second notification arrives");
-		assert(second.includes("beta second wave") && !second.includes(": to beta"), "the second notification lists only the NEW mail (no re-announce)");
+		assert(second.includes(refW.mail) && !second.includes(refB.mail), "the second notification lists only the NEW mail (no re-announce)");
 	}
 
 	// 4c. F1 regression: concurrent same-name logins — the failing one must
@@ -275,8 +276,8 @@ try {
 		};
 		const cc = new MailboxController(wrapped);
 		await cc.login({ as: "core-epsilon" });
-		await peer.mailbox.sendMail({ project: connA.mailbox.project, session: "core-epsilon" }, "retry me", "x");
-		const retried = await poll(6000, () => failHost.state.delivered.find((t) => t.includes("retry me")));
+		const refRetry = await peer.mailbox.sendMail({ project: connA.mailbox.project, session: "core-epsilon" }, "retry me", "x");
+		const retried = await poll(6000, () => failHost.state.delivered.find((t) => t.includes(refRetry.mail)));
 		assert(retried !== undefined && failures === 0, "a failing async deliver is retried until it succeeds");
 		await cc.stop();
 	}
@@ -422,8 +423,8 @@ try {
 		await c.restart();
 		assert(!c.isStopped && c.connected, "restart() revives the controller from the stored binding");
 		// the revived controller still works end to end: mail arrives and is announced
-		await peer.mailbox.sendMail({ project: peer.mailbox.project, session: "core-revive" }, "revived", "after restart", []);
-		const revived = await poll(5000, () => h.state.delivered.find((t) => t.includes("revived")));
+		const refRev = await peer.mailbox.sendMail({ project: peer.mailbox.project, session: "core-revive" }, "revived", "after restart", []);
+		const revived = await poll(5000, () => h.state.delivered.find((t) => t.includes(refRev.mail)));
 		assert(revived !== undefined, "the revived controller delivers notifications");
 		await c.stop();
 	}
@@ -485,23 +486,23 @@ try {
 
 		// busy: mail arrives and is held
 		h.state.busy = true;
-		await peer.mailbox.sendMail({ project: peer.mailbox.project, session: "core-abort" }, "held mail", "x");
+		const refHeld = await peer.mailbox.sendMail({ project: peer.mailbox.project, session: "core-abort" }, "held mail", "x");
 		await poll(5000, () => h.state.unread === 1);
 		await c.onTurnEnd({ aborted: true });
-		assert(!h.state.delivered.some((t) => t.includes("held mail")), "an aborted turn_end does not flush held notices");
+		assert(!h.state.delivered.some((t) => t.includes(refHeld.mail)), "an aborted turn_end does not flush held notices");
 
 		// the settle path (agent_end with busy cleared) delivers as a fresh turn
 		h.state.busy = false;
 		c.onAgentEnd();
-		const settled = await poll(5000, () => h.state.delivered.find((t) => t.includes("held mail")));
+		const settled = await poll(5000, () => h.state.delivered.find((t) => t.includes(refHeld.mail)));
 		assert(settled !== undefined, "the settle path delivers the held notice after an aborted turn");
 
 		// contrast: a normal turn_end flushes inline (the drain point picks it up)
 		h.state.busy = true;
-		await peer.mailbox.sendMail({ project: peer.mailbox.project, session: "core-abort" }, "inline mail", "x");
+		const refInline = await peer.mailbox.sendMail({ project: peer.mailbox.project, session: "core-abort" }, "inline mail", "x");
 		await poll(5000, () => h.state.unread === 2);
 		await c.onTurnEnd();
-		assert(h.state.delivered.some((t) => t.includes("inline mail")), "a normal turn_end flushes held notices inline");
+		assert(h.state.delivered.some((t) => t.includes(refInline.mail)), "a normal turn_end flushes held notices inline");
 		await c.stop();
 	}
 
@@ -515,14 +516,14 @@ try {
 		const toolsR = Object.fromEntries(c.tools.map((t) => [t.name, t]));
 
 		// idle arrival: the normal notice delivers (not a reminder)
-		await peer.mailbox.sendMail({ project: peer.mailbox.project, session: "core-remind" }, "must read me", "body");
-		const notice = await poll(5000, () => h.state.delivered.find((t) => t.includes("must read me")));
-		assert(notice !== undefined && !notice.includes("Reminder"), "the arrival notice delivers (not a reminder)");
+		const refMust = await peer.mailbox.sendMail({ project: peer.mailbox.project, session: "core-remind" }, "must read me", "body");
+		const notice = await poll(5000, () => h.state.delivered.find((t) => t.includes(refMust.mail)));
+		assert(notice !== undefined && !notice.includes("Reminder") && !notice.includes("must read me"), "the arrival notice delivers (not a reminder, no subject)");
 
 		// the agent never reads it: each settled run reminds, capped at 2
 		c.onAgentSettled();
 		const rem1 = await poll(5000, () => h.state.delivered.find((t) => t.includes("Reminder")));
-		assert(rem1 !== undefined && rem1.includes("must read me") && rem1.includes("mailbox_read"), "a settled run with residual unread fires the reminder (lists the mail, says to read it)");
+		assert(rem1 !== undefined && rem1.includes(refMust.mail) && rem1.includes("mailbox_read") && !rem1.includes("must read me"), "a settled run with residual unread fires the reminder (names the mail by id, says to read it, no subject)");
 		c.onAgentSettled();
 		await poll(5000, () => h.state.delivered.filter((t) => t.includes("Reminder")).length === 2);
 		c.onAgentSettled();
@@ -535,9 +536,7 @@ try {
 		assert(h.state.delivered.filter((t) => t.includes("Reminder")).length === 2, "an aborted settle fires no reminder");
 
 		// reading the mail clears the condition
-		const listR = await toolsR["mailbox_list"].execute("tr1", {});
-		const mailId = listR.structuredContent.mails.find((m) => m.subject === "must read me").id;
-		await toolsR["mailbox_read"].execute("tr2", { mail: mailId });
+		await toolsR["mailbox_read"].execute("tr2", { mail: refMust.mail });
 		c.onAgentSettled();
 		await new Promise((r) => setTimeout(r, 900));
 		assert(h.state.delivered.filter((t) => t.includes("Reminder")).length === 2, "no reminder after the mail is read");
