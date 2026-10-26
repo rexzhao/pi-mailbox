@@ -416,7 +416,12 @@ export default function (pi: ExtensionAPI) {
 		liveCtx = ctx;
 		installFooter(ctx.ui); // replaces the default footer with the address-aware one
 		refreshFooter();
-		void controller.autoConnect();
+		// one pi process hosts many sessions: a previous session's shutdown
+		// stopped the shared controller (terminal until revived). The next
+		// session brings the mailbox back — same identity, silent reconnect
+		// from the stored binding.
+		if (controller.isStopped) void controller.restart();
+		else void controller.autoConnect();
 	});
 
 	// renaming the session to a name that is a valid mailbox name, when

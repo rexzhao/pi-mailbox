@@ -1,6 +1,6 @@
 {
 	"name": "pi-mailbox",
-	"version": "1.1.0",
+	"version": "1.1.1",
 	"private": true,
 	"type": "module",
 	"description": "Mailbox service, pi extension, and DeepSeek Harness plugin for cross-session agent messaging, with a host-agnostic core (MailboxController) for embedding",

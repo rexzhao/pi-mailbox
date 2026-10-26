@@ -261,6 +261,9 @@ export class MailboxController {
 	 * (must be logged in), else the current one (must be connected).
 	 */
 	requireConnection(as?: string): MailboxConnection {
+		// stopped is a distinct state from disconnected (session shutdown):
+		// name it so the revive path is discoverable
+		if (this.stopped) throw new Error("mailbox: controller stopped (revive with restart())");
 		if (as !== undefined) {
 			const name = as.toLowerCase();
 			const c = this.connections.get(name);
@@ -340,6 +343,35 @@ export class MailboxController {
 	/** Alias of stop() (the pi extension wires this to session_shutdown). */
 	onShutdown(): void {
 		this.stop();
+	}
+
+	/** True after stop()/onShutdown() — the controller is dormant, not dead. */
+	get isStopped(): boolean {
+		return this.stopped;
+	}
+
+	/**
+	 * Revive a stopped controller: clears the terminal state and reconnects
+	 * every name in the stored binding (same identity derivation, silent
+	 * reconnect, same autoConnect semantics — transient failures stay
+	 * quiet, permanent login rejections surface once).
+	 *
+	 * Why this exists: in the TUI one pi process hosts many sessions, and
+	 * each session's shutdown stops the shared controller; the sessions
+	 * that follow in the same process must be able to bring the mailbox
+	 * back. Hosts that drop the controller wholesale (the web proxy, the
+	 * DSH manager) never need this — a fresh instance is their restart.
+	 */
+	async restart(): Promise<void> {
+		if (!this.stopped) return;
+		this.stopped = false;
+		// defensive: drop anything stop() might have left behind (it clears
+		// the map itself; a mid-flight login could have re-added one)
+		for (const c of this.connections.values()) void c.stop();
+		this.connections.clear();
+		this.current = null;
+		this.pushUnread();
+		await this.autoConnect();
 	}
 
 	// -- auto-connect / rename login ----------------------------------------

@@ -96,7 +96,7 @@ const poll = async (deadlineMs, fn) => {
 
 try {
 	// 0. version contract
-	assert(MAILBOX_CORE_API_VERSION === "1.1.0", `MAILBOX_CORE_API_VERSION is 1.1.0 (${MAILBOX_CORE_API_VERSION})`);
+	assert(MAILBOX_CORE_API_VERSION === "1.1.1", `MAILBOX_CORE_API_VERSION is 1.1.1 (${MAILBOX_CORE_API_VERSION})`);
 	assert(coreApiMajor() === 1, "coreApiMajor() === 1");
 	assert(MAILBOX_EXTENSION_ID === "pi-mailbox", "MAILBOX_EXTENSION_ID exported");
 
@@ -396,6 +396,36 @@ try {
 		} finally {
 			await new Promise((r) => bot.close(r));
 		}
+	}
+
+	// 7c. controller stop is revivable: session_shutdown stops the shared
+	//     controller; restart() (the next session's session_start) brings
+	//     it back from the stored binding (BUG-MAILBOX-CONTROLLER-STOP)
+	{
+		const h = fakeHost({ sessionId: "core-sess-revive" });
+		const c = new MailboxController(h.host);
+		await c.login({ as: "core-revive" });
+		assert(c.connected && !c.isStopped, "precondition: connected");
+		c.onShutdown(); // the session_shutdown path
+		assert(c.isStopped && !c.connected, "onShutdown stops the controller");
+		let threw = false;
+		try {
+			await c.requireConnection();
+		} catch (e) {
+			threw = /controller stopped/.test(String(e.message));
+		}
+		assert(threw, "a stopped controller rejects operations");
+		// autoConnect must NOT revive on its own (explicit restart only)
+		await c.autoConnect();
+		assert(c.isStopped && !c.connected, "autoConnect alone does not revive a stopped controller");
+		// restart: silent reconnect from the stored binding
+		await c.restart();
+		assert(!c.isStopped && c.connected, "restart() revives the controller from the stored binding");
+		// the revived controller still works end to end: mail arrives and is announced
+		await peer.mailbox.sendMail({ project: peer.mailbox.project, session: "core-revive" }, "revived", "after restart", []);
+		const revived = await poll(5000, () => h.state.delivered.find((t) => t.includes("revived")));
+		assert(revived !== undefined, "the revived controller delivers notifications");
+		await c.stop();
 	}
 
 	// 8. daemon isolation: everything lived under the temp PI_MAILBOXD_DIR
