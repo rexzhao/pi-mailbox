@@ -447,10 +447,20 @@ export default function (pi: ExtensionAPI) {
 	};
 	pi.on("agent_end", settle);
 	pi.on("agent_settled", settle);
-	// turn boundary: the core flushes held notifications here (steered
-	// messages are delivered right after turn_end handlers run)
-	pi.on("turn_end", () => {
-		void controller.onTurnEnd();
+	// turn boundary: the core flushes held notifications here. The handler
+	// RETURNS the flush promise (never `void` it): pi awaits event handlers,
+	// so the agent loop stays inside its turn_end emit until the notice is
+	// composed (one daemon round-trip) AND steered — the loop's steering
+	// drain, which runs right after the emit, then picks it up and the very
+	// next LLM call sees it. A fire-and-forget flush races past that drain
+	// into the settlement window, where a queued steer is orphaned (a
+	// pending "Steering:" line in the UI until the next run). Aborted turns
+	// skip the flush instead: that path has neither a drain point nor the
+	// queued-message rescue, so the core leaves the notices to the settle
+	// path's idle flush (a fresh turn once the run has wound down).
+	pi.on("turn_end", (event) => {
+		const message = (event as { message?: { stopReason?: string } } | undefined)?.message;
+		return controller.onTurnEnd({ aborted: message?.stopReason === "aborted" });
 	});
 	pi.on("session_shutdown", () => {
 		controller.onShutdown();

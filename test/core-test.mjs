@@ -96,7 +96,7 @@ const poll = async (deadlineMs, fn) => {
 
 try {
 	// 0. version contract
-	assert(MAILBOX_CORE_API_VERSION === "1.1.1", `MAILBOX_CORE_API_VERSION is 1.1.1 (${MAILBOX_CORE_API_VERSION})`);
+	assert(MAILBOX_CORE_API_VERSION === "1.2.0", `MAILBOX_CORE_API_VERSION is 1.2.0 (${MAILBOX_CORE_API_VERSION})`);
 	assert(coreApiMajor() === 1, "coreApiMajor() === 1");
 	assert(MAILBOX_EXTENSION_ID === "pi-mailbox", "MAILBOX_EXTENSION_ID exported");
 
@@ -425,6 +425,83 @@ try {
 		await peer.mailbox.sendMail({ project: peer.mailbox.project, session: "core-revive" }, "revived", "after restart", []);
 		const revived = await poll(5000, () => h.state.delivered.find((t) => t.includes("revived")));
 		assert(revived !== undefined, "the revived controller delivers notifications");
+		await c.stop();
+	}
+
+	// 7d. onNameLost: structured loss events for host claim bookkeeping
+	//     (the MAILBOX-PROXY claim-revocation requirement)
+	{
+		const h = fakeHost({ sessionId: "core-sess-lost" });
+		const lost = [];
+		h.host.onNameLost = (info) => lost.push(info);
+		const c = new MailboxController(h.host);
+
+		// (i) a manual (non-binding) rejection never fires: the session
+		//     never held the name, so there is no claim to revoke
+		const hHolder = fakeHost({ sessionId: "core-sess-lost-holder" });
+		const cHolder = new MailboxController(hHolder.host);
+		await cHolder.login({ as: "core-taken" }); // the online holder
+		let rejected = false;
+		try {
+			await c.login({ as: "core-taken" });
+		} catch (e) {
+			rejected = /mailbox_in_use/.test(String(e.message));
+		}
+		assert(rejected, "an online-held name rejects a manual login (mailbox_in_use)");
+		assert(lost.length === 0, "a manual login rejection fires no onNameLost (the name was never held)");
+
+		// (ii) binding auto-reconnect displacement: cause login-rejected +
+		//     the daemon's code, and the binding is pruned
+		h.host.loginStore.writeLogin({ names: ["core-taken"], current: "core-taken" });
+		await c.autoConnect();
+		assert(lost.length === 1 && lost[0].cause === "login-rejected" && lost[0].code === "mailbox_in_use" && lost[0].name === "core-taken", `displacement at reconnect fires structured onNameLost (${JSON.stringify(lost[0])})`);
+		assert(bindingFromEntries(h.state.entries).login === null, "the displaced name is pruned from the binding");
+
+		// (iii) live same-origin displacement: the daemon's 4000/replaced
+		//      signal (the real session taking its name back from a host proxy)
+		await c.login({ as: "core-lostname" });
+		assert(c.isHeld("core-lostname"), "precondition: holding core-lostname");
+		const kicker = new MailboxConnection("local", projectDir, null, "core-sess-lost", "core-test", {
+			onNotify: () => {},
+			onConnected: () => {},
+			onDisconnected: () => {},
+		}, { login: { as: "core-lostname" } });
+		await kicker.start(); // same identity+origin: the daemon replaces c's connection (close 4000)
+		const replacedInfo = await poll(5000, () => lost.find((i) => i.cause === "replaced"));
+		assert(replacedInfo !== undefined && replacedInfo.name === "core-lostname", `a same-origin displacement fires cause=replaced (${JSON.stringify(lost)})`);
+		assert(!c.isHeld("core-lostname"), "the replaced connection is gone from the controller");
+		await kicker.stop();
+		await cHolder.stop();
+		await c.stop();
+	}
+
+	// 7e. onTurnEnd({aborted}): an aborted turn boundary must NOT flush —
+	//     pi's abort path has no steering drain point, so a flush there
+	//     would orphan the steer; the settle path delivers instead
+	{
+		const h = fakeHost({ sessionId: "core-sess-abort" });
+		const c = new MailboxController(h.host);
+		await c.login({ as: "core-abort" });
+
+		// busy: mail arrives and is held
+		h.state.busy = true;
+		await peer.mailbox.sendMail({ project: peer.mailbox.project, session: "core-abort" }, "held mail", "x");
+		await poll(5000, () => h.state.unread === 1);
+		await c.onTurnEnd({ aborted: true });
+		assert(!h.state.delivered.some((t) => t.includes("held mail")), "an aborted turn_end does not flush held notices");
+
+		// the settle path (agent_end with busy cleared) delivers as a fresh turn
+		h.state.busy = false;
+		c.onAgentEnd();
+		const settled = await poll(5000, () => h.state.delivered.find((t) => t.includes("held mail")));
+		assert(settled !== undefined, "the settle path delivers the held notice after an aborted turn");
+
+		// contrast: a normal turn_end flushes inline (the drain point picks it up)
+		h.state.busy = true;
+		await peer.mailbox.sendMail({ project: peer.mailbox.project, session: "core-abort" }, "inline mail", "x");
+		await poll(5000, () => h.state.unread === 2);
+		await c.onTurnEnd();
+		assert(h.state.delivered.some((t) => t.includes("inline mail")), "a normal turn_end flushes held notices inline");
 		await c.stop();
 	}
 

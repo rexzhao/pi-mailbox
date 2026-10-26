@@ -7,7 +7,7 @@
  * wire protocol) are invisible to a host. A host must refuse to enable
  * the core on a major-version mismatch.
  */
-export const MAILBOX_CORE_API_VERSION = "1.1.1";
+export const MAILBOX_CORE_API_VERSION = "1.2.0";
 
 /** Major version of MAILBOX_CORE_API_VERSION (the compatibility gate). */
 export function coreApiMajor(version: string = MAILBOX_CORE_API_VERSION): number {

@@ -15,6 +15,7 @@ export {
 	type MailboxLoginStore,
 	type WakeTarget,
 	type WakeResult,
+	type NameLostInfo,
 	type NotifyLevel,
 	type ConnectionStatus,
 } from "./controller.ts";

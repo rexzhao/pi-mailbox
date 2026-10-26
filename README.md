@@ -502,8 +502,8 @@ const controller = new MailboxController({
   deliver: async (text) => { /* into the agent's input stream */ },
   isBusy: () => boolean,
   // optional: notify, setUnread(total, byName?), canDeliver, helloMeta,
-  //           onConnectionChanged, wake, findLiveSession, switchSession,
-  //           openUrl, sessionDir
+  //           onConnectionChanged, onNameLost, wake, findLiveSession,
+  //           switchSession, openUrl, sessionDir
 });
 
 await controller.login({ as: "worker" });   // multi-login: repeat to add names
@@ -521,9 +521,20 @@ Host-facing surface:
 - `controller.executeCommand(arg)` / `completeCommand(prefix)` — the
   `/mailbox` command, output via `host.notify`.
 - Event entry points: `onAgentStart` / `onAgentEnd` / `onAgentSettled` /
-  `onTurnEnd` / `onSessionNameChanged` — forward them from your agent
-  runtime; silence never disconnects (the controller stops only on
-  `stop()`).
+  `onTurnEnd({ aborted })` / `onSessionNameChanged` — forward them from
+  your agent runtime; silence never disconnects (the controller stops only
+  on `stop()`). Pass `aborted: true` on a turn that ended in an
+  abort/error: the core skips that boundary's flush (pi's abort path has
+  no steering drain point) and lets the settle path deliver instead.
+- `onNameLost({ name, claimed, cause, code?, message })` — the optional
+  host callback for claim bookkeeping: it fires exactly when the core
+  permanently loses a held name, either at reconnect (`cause:
+  "login-rejected"` with the daemon's code — `mailbox_in_use` /
+  `name_held` mean displaced by another holder, and the binding is pruned)
+  or live (`cause: "replaced"` — the daemon's close-4000 signal: the
+  same session identity connected elsewhere and took the name back).
+  Transient failures never fire it (the connection stays armed and
+  retries): **no callback means the name is still yours**.
 - `deliver` may be async — the notification pipeline awaits it and
   retries later on failure (a host can open a session on demand).
 - `readLoginBinding(sessionFile)` — read a pi session file's full binding

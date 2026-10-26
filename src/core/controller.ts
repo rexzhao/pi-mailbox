@@ -82,6 +82,20 @@ export type WakeResult =
 
 export type NotifyLevel = "info" | "warning" | "error";
 
+/** A held name was permanently lost, structured for host claim bookkeeping. */
+export interface NameLostInfo {
+	/** Canonical (lowercase) name that was lost. */
+	name: string;
+	/** Last-known claimed spelling (display case). */
+	claimed: string;
+	/** How it was lost: a stored-binding login was permanently rejected, or the live connection was displaced. */
+	cause: "login-rejected" | "replaced";
+	/** The daemon's error code for login-rejected (mailbox_in_use, name_held, ...); absent for replaced. */
+	code?: string;
+	/** Human-readable explanation (the same text the core surfaces to the user). */
+	message: string;
+}
+
 /**
  * Everything the core needs from its environment. Optional members have
  * defaults; a host that omits them simply loses the corresponding feature
@@ -110,6 +124,17 @@ export interface MailboxHost {
 	flushAtStepBoundary?(): boolean;
 	/** Notification gate (pi json mode is a pure event stream); default true. */
 	canDeliver?(): boolean;
+	/**
+	 * A held name was permanently lost: a stored-binding login was
+	 * rejected (cause "login-rejected" — displaced by another holder, or
+	 * another permanent rejection such as bad_name) or a live connection
+	 * was displaced (cause "replaced" — the daemon's close-4000 signal:
+	 * the same session identity connected elsewhere, e.g. the real agent
+	 * session taking its name back from a host proxy). Transient failures
+	 * never fire this (the connection stays armed and retries): no
+	 * callback means the name is still yours. Optional.
+	 */
+	onNameLost?(info: NameLostInfo): void;
 	/** Human-facing notices (/mailbox command output, warnings). */
 	notify?(message: string, level?: NotifyLevel): void;
 	/** Unread badge: total plus per-identity detail. null = disconnected. */
@@ -325,7 +350,15 @@ export class MailboxController {
 	// handlers run, so a notification flushed here is seen by the very next
 	// LLM call — and everything that arrived during the finished turn is
 	// coalesced into that single message
-	async onTurnEnd(): Promise<void> {
+	// An ABORTED turn is skipped: pi's loop exits the abort path without
+	// polling the steering queue and the abort path skips the queued-message
+	// rescue, so a notice flushed here would queue a steer that nothing
+	// consumes until the next run (an orphaned "Steering:" line in the UI).
+	// Leaving the pending notices armed is correct: the settle path
+	// (agent_end / agent_settled) schedules the idle flush, which delivers
+	// as a fresh turn once the run has fully wound down.
+	async onTurnEnd(opts?: { aborted?: boolean }): Promise<void> {
+		if (opts?.aborted === true) return;
 		if (this.pendingUnread.size > 0) await this.flushNotifications();
 	}
 
@@ -500,10 +533,13 @@ export class MailboxController {
 						this.connections.delete(name);
 						if (this.current === name) this.current = this.firstConnectedName();
 						this.persistBinding();
-						this.host.notify?.(
-							"mailbox: this session's mailbox was taken over by another connection — is this session open in two places? Close the other one, then reconnect with /mailbox start service",
-							"warning",
-						);
+						const message =
+							"this session's mailbox was taken over by another connection — is this session open in two places? Close the other one, then reconnect with /mailbox start service";
+						this.host.notify?.(`mailbox: ${message}`, "warning");
+						// structured loss for the host's claim bookkeeping (same
+						// invariant as the notify above: the name is gone from the
+						// binding too)
+						this.host.onNameLost?.({ name, claimed: connection.mailboxId, cause: "replaced", message });
 					}
 					this.pushUnread();
 					this.host.onConnectionChanged?.();
@@ -564,11 +600,23 @@ export class MailboxController {
 			// not die on it forever, and say what happened.
 			if (fromBinding && err instanceof MailboxError && (err.code === "mailbox_in_use" || err.code === "name_held")) {
 				this.removeFromBinding(name);
-				throw new MailboxError(
-					err.code,
+				const message =
 					`you were displaced from '${opts.as}' by another session (${err.message}); ` +
-						"log in again with /mailbox login <name> (add --force to take it back if the new holder is offline and the user confirms)",
-				);
+					"log in again with /mailbox login <name> (add --force to take it back if the new holder is offline and the user confirms)";
+				this.host.onNameLost?.({ name, claimed: opts.as, cause: "login-rejected", code: err.code, message });
+				throw new MailboxError(err.code, message);
+			}
+			// any other permanent rejection of a stored-binding name: the
+			// host's claim is equally dead, but the binding keeps the name
+			// (the next restart retries); the host decides per code
+			if (fromBinding && isFatalLoginError(err)) {
+				this.host.onNameLost?.({
+					name,
+					claimed: opts.as,
+					cause: "login-rejected",
+					code: err instanceof MailboxError ? err.code : undefined,
+					message: err instanceof Error ? err.message : String(err),
+				});
 			}
 			// every end state here (restored previous identity included) must
 			// repaint, which reads the final state live
